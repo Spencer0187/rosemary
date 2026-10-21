@@ -1357,29 +1357,70 @@ mod tests {
         assert_eq!(local_warp_point((420.0, 310.0), (100, 50)), (320.0, 260.0));
     }
 
-    #[test]
-    fn redundant_mouse_association_preserves_camera_recentring() {
-        use std::sync::atomic::Ordering;
+    /// Serialises the tests that touch the process-wide pointer state, and
+    /// puts it back even when one fails.
+    struct MouseState {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        associated: bool,
+        recentring: Option<Recentring>,
+    }
 
-        let prior_associated = ASSOCIATED.swap(true, Ordering::AcqRel);
-        let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
-        let prior_recentring = state.replace(Recentring {
+    impl MouseState {
+        fn take(associated: bool, recentring: Option<Recentring>) -> Self {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            let lock = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                _lock: lock,
+                associated: ASSOCIATED.swap(associated, std::sync::atomic::Ordering::AcqRel),
+                recentring: std::mem::replace(
+                    &mut *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()),
+                    recentring,
+                ),
+            }
+        }
+    }
+
+    impl Drop for MouseState {
+        fn drop(&mut self) {
+            *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = self.recentring;
+            ASSOCIATED.store(self.associated, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn camera_recentre(at: std::time::Instant) -> Option<Recentring> {
+        Some(Recentring {
             window: 0,
             target: (420.0, 300.0),
-            at: std::time::Instant::now(),
+            at,
             moved: true,
             active: true,
-        });
-        drop(state);
+        })
+    }
 
+    #[test]
+    fn redundant_mouse_association_preserves_camera_recentring() {
+        let _state = MouseState::take(true, camera_recentre(std::time::Instant::now()));
         assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(1) }, 0);
         assert!(
             recentring(),
-            "a duplicate association must preserve relative mode"
+            "a reasserted association dropped the recentre"
         );
+    }
 
-        *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = prior_recentring;
-        ASSOCIATED.store(prior_associated, Ordering::Release);
+    #[test]
+    fn mouse_association_releases_an_idle_recentre() {
+        let stale = std::time::Instant::now() - 2 * RECENTRE_IDLE;
+        let _state = MouseState::take(true, camera_recentre(stale));
+        assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(1) }, 0);
+        assert!(!recentring(), "an idle recentre outlived the association");
+    }
+
+    #[test]
+    fn disassociating_takes_over_from_a_recentre() {
+        let _state = MouseState::take(true, camera_recentre(std::time::Instant::now()));
+        assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(0) }, 0);
+        assert!(!mouse_is_associated());
+        assert!(!recentring(), "disassociation left the recentre in charge");
     }
 }
 
@@ -1663,16 +1704,13 @@ pub(crate) fn forget_recentring() {
 /// unavailable rather than running without capture.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32 {
-    // Reasserting the current association must not drop an active camera
-    // recenter or reset SDL relative mode. Focus regain reapplies separately.
-    if mouse_is_associated() == (connected != 0) {
-        return 0;
-    }
+    let was = ASSOCIATED.swap(connected != 0, std::sync::atomic::Ordering::AcqRel);
     // The cursor stops where it is, which is what the guest is told from here.
-    if connected == 0 && mouse_is_associated() {
+    if connected == 0 && was {
         crate::event::settle_pointer();
     }
-    ASSOCIATED.store(connected != 0, std::sync::atomic::Ordering::Release);
+    // Reapplied even when unchanged: games reassert every frame, and that is
+    // what puts back a window that lost relative mode without a focus event.
     apply_mouse_association();
     0
 }
@@ -1853,9 +1891,25 @@ fn end_edge_hold() {
 /// Called again when a window takes focus, because SDL leaves the mode when
 /// focus goes and a window made after the guest disassociated never had it.
 pub fn apply_mouse_association() {
-    *EDGE_HOLD.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let relative = !mouse_is_associated();
+    // While associated, a live recentre or edge hold owns its window's
+    // relative mode: Studio reasserts association mid-drag, and dropping the
+    // recentre there turns each camera warp into real cursor movement. A
+    // recentre gone idle is stale, so it is released like any other.
+    let (held, recentred) = {
+        let mut hold = EDGE_HOLD.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+        if relative || state.is_some_and(|r| r.active && r.at.elapsed() > RECENTRE_IDLE) {
+            *state = None;
+        }
+        if relative {
+            *hold = None;
+        }
+        (
+            hold.map(|h| h.id),
+            state.filter(|r| r.active).map(|r| r.window),
+        )
+    };
     // Disassociating is not hiding: on macOS the cursor stays on screen where
     // it was, and only `+[NSCursor hide]` takes it away - which this tree
     // already counts in `crate::cursor`. SDL's relative mode hides the pointer
@@ -1863,7 +1917,9 @@ pub fn apply_mouse_association() {
     sdl3::video::set_hint(sdl3::video::HINT_RELATIVE_CURSOR_VISIBLE, c"1");
     let mut changed = false;
     for window in crate::window::sdl_windows() {
-        if sdl3::video::relative_mouse_mode(window) != relative {
+        let owned =
+            held == Some(sdl3::video::window_id(window)) || recentred == Some(window as usize);
+        if !owned && sdl3::video::relative_mouse_mode(window) != relative {
             if !relative {
                 // Reset both positions on release. The in-window warp supplies
                 // SDL's restore point; the global warp after disabling reaches
