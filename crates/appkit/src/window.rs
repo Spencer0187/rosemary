@@ -1034,6 +1034,14 @@ unsafe extern "C" fn mouse_location_outside_of_event_stream(receiver: Id, _sel: 
     pointer_location(receiver)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// A pointer in base coordinates that wins over every real source, so a
+    /// test does not depend on where the host's mouse happens to be.
+    pub(crate) static TEST_POINTER: std::cell::Cell<Option<NSPoint>> =
+        const { std::cell::Cell::new(None) };
+}
+
 /// Where the pointer is in a window's base coordinates, for the cursor
 /// rectangles as well as for the method above: [`crate::cursor`] has to decide
 /// which rectangle holds the pointer, and asking through `objc_msgSend` would
@@ -1041,6 +1049,10 @@ unsafe extern "C" fn mouse_location_outside_of_event_stream(receiver: Id, _sel: 
 pub fn pointer_location(window: Id) -> NSPoint {
     if window.is_null() {
         return NSPoint::default();
+    }
+    #[cfg(test)]
+    if let Some(point) = TEST_POINTER.get() {
+        return point;
     }
     let point = match crate::script::pointer().or_else(crate::event::frozen_pointer) {
         Some((x, y)) => crate::geometry::point_from_sdl(x as f64, y as f64),

@@ -779,12 +779,12 @@ pub unsafe extern "C" fn fstatat(
 /// Darwin's `AT_RESOLVE_BENEATH`, which fails a lookup that would leave the
 /// directory it starts from, by `..`, an absolute path or a symlink. Safe
 /// archive extraction (`unzip`) relies on it, so it is kept rather than dropped.
-mod beneath {
+pub(crate) mod beneath {
     use super::Stat;
     #[cfg(target_os = "linux")]
     use super::{Found, as_seen};
     #[cfg(target_os = "linux")]
-    use std::ffi::CStr;
+    use std::ffi::{CStr, CString};
     use std::ffi::{c_char, c_int};
 
     /// The `AT_` flag where the host can honour it, and no bits elsewhere, so
@@ -874,6 +874,60 @@ mod beneath {
 
     #[cfg(not(target_os = "linux"))]
     pub unsafe fn fstatat(_: c_int, _: *const c_char, _: *mut Stat, _: bool) -> c_int {
+        unreachable!("SUPPORTED is zero here, so nothing asks for it")
+    }
+
+    /// `unlinkat` beneath `dirfd`: the parent opened with `RESOLVE_BENEATH`,
+    /// then the last component removed from it. The last component is not
+    /// followed, so only the parent's lookup can escape.
+    ///
+    /// # Safety
+    ///
+    /// `path` is a NUL-terminated host path.
+    #[cfg(target_os = "linux")]
+    pub unsafe fn unlinkat(dirfd: c_int, path: *const c_char, flags: c_int) -> c_int {
+        // SAFETY: the caller's NUL-terminated path.
+        let bytes = unsafe { CStr::from_ptr(path) }.to_bytes();
+        // Trailing slashes stay on the name, where they mean "a directory".
+        let end = bytes
+            .iter()
+            .rposition(|b| *b != b'/')
+            .map_or(0, |at| at + 1);
+        let start = bytes[..end]
+            .iter()
+            .rposition(|b| *b == b'/')
+            .map(|at| at + 1);
+        let (parent, name) = match start {
+            Some(start) => (&bytes[..start - 1], &bytes[start..]),
+            None => (&b"."[..], bytes),
+        };
+        // An absolute path or a last `..` leaves `dirfd` without a lookup
+        // the host could refuse. FIXME (ACCURACY): EXDEV, as in `fstatat`.
+        if bytes.first() == Some(&b'/') || bytes[start.unwrap_or(0)..end] == *b".." {
+            crate::errno::set(libc::EXDEV);
+            return -1;
+        }
+        let (Ok(parent), Ok(name)) = (CString::new(parent), CString::new(name)) else {
+            crate::errno::set(libc::EINVAL);
+            return -1;
+        };
+        let flags_parent = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated path this call built.
+        let fd = unsafe { open(dirfd, parent.as_ptr(), flags_parent, 0) };
+        if fd < 0 {
+            return -1;
+        }
+        // SAFETY: an `O_PATH` directory descriptor this call owns.
+        let rc = unsafe { libc::unlinkat(fd, name.as_ptr(), flags) };
+        let saved = crate::errno::get();
+        // SAFETY: closed exactly once.
+        unsafe { libc::close(fd) };
+        crate::errno::set(saved);
+        rc
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub unsafe fn unlinkat(_: c_int, _: *const c_char, _: c_int) -> c_int {
         unreachable!("SUPPORTED is zero here, so nothing asks for it")
     }
 }

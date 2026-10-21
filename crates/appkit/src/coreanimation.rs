@@ -1456,6 +1456,18 @@ fn draw_contents(
         if area.is_empty() {
             return;
         }
+        // A pixel-aligned, unscaled BGRA image needs no nearest-neighbour
+        // coordinate calculation. Opaque rows can be copied directly.
+        if !source.swap
+            && (x - x.round()).abs() < 1e-9
+            && (y - y.round()).abs() < 1e-9
+            && width == source.width as f64
+            && height == source.height as f64
+            && opacity >= 1.0
+        {
+            composite_identity_bgra(store, &source, area, x.round() as i64, y.round() as i64);
+            return;
+        }
         let columns: Vec<usize> = (area.x..area.x + area.width)
             .map(|column| {
                 let u = (column as f64 + 0.5 - x) / width;
@@ -1488,6 +1500,43 @@ fn draw_contents(
             }
         }
     });
+}
+
+/// Draw a pixel-aligned BGRA source at native scale, clipping to `area`.
+fn composite_identity_bgra(store: &mut Store, source: &Source<'_>, area: Rect, x: i64, y: i64) {
+    for row in area.y..area.y + area.height {
+        let from = (row - y) as usize * source.stride + (area.x - x) as usize * 4;
+        let length = area.width as usize * 4;
+        let source_row = &source.bytes[from..from + length];
+        let to = (row as usize * store.width as usize + area.x as usize) * 4;
+        let target_row = &mut store.pixels[to..to + length];
+        if source_row
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|pixel| pixel[3] == 255)
+        {
+            target_row.copy_from_slice(source_row);
+        } else {
+            for (target, src) in target_row
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(source_row.as_chunks::<4>().0)
+            {
+                if src[3] == 255 {
+                    *target = *src;
+                } else {
+                    let keep = 255 - u32::from(src[3]);
+                    for channel in 0..4 {
+                        let blended =
+                            u32::from(src[channel]) + u32::from(target[channel]) * keep / 255;
+                        target[channel] = blended.min(255) as u8;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Which part of a view's layer tree [`render`] draws: the root layer's own
@@ -1890,6 +1939,66 @@ mod tests {
             objc::arc::release(object);
         }
         objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn identity_bgra_contents_match_per_pixel_blending_and_clip() {
+        let mut store = Store::for_tests(5, 4);
+        store.pixels.fill(17);
+        let mut source_bytes = vec![0u8; 4 * 4 * 4];
+        for (i, pixel) in source_bytes.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *pixel = [
+                ((i * 7) % 256) as u8,
+                40,
+                100,
+                if i % 5 == 0 { 128 } else { 255 },
+            ];
+        }
+        let source = Source {
+            width: 4,
+            height: 4,
+            stride: 16,
+            bytes: &source_bytes,
+            swap: false,
+        };
+        composite_identity_bgra(
+            &mut store,
+            &source,
+            Rect {
+                x: 2,
+                y: 1,
+                width: 3,
+                height: 3,
+            },
+            1,
+            0,
+        );
+        for row in 0..4usize {
+            for col in 0..5usize {
+                let mut expected = [17u8; 4];
+                if (1..4).contains(&row) && (2..5).contains(&col) {
+                    let sy = row;
+                    let sx = col - 1;
+                    let src: [u8; 4] = source_bytes[(sy * 4 + sx) * 4..(sy * 4 + sx + 1) * 4]
+                        .try_into()
+                        .unwrap();
+                    if src[3] == 255 {
+                        expected = src;
+                    } else {
+                        let keep = 255 - u32::from(src[3]);
+                        for c in 0..4 {
+                            expected[c] = (u32::from(src[c]) + u32::from(expected[c]) * keep / 255)
+                                .min(255) as u8;
+                        }
+                    }
+                }
+                assert_eq!(
+                    &store.pixels[(row * 5 + col) * 4..(row * 5 + col + 1) * 4],
+                    &expected,
+                    "pixel {col},{row}"
+                );
+            }
+        }
     }
 
     #[test]

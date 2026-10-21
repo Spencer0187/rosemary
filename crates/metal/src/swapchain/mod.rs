@@ -274,6 +274,49 @@ pub(crate) fn retire_copied() {
     }
 }
 
+/// [`retire_copied`], waiting up to `timeout` for a copy still running when
+/// none has finished yet, because nothing signals the drawable cache when one
+/// does. Whether there was a copy to retire or wait for, so that the caller
+/// knows to look at its ring again before waiting on anything else. Must not
+/// be called with the drawable cache locked.
+pub(crate) fn wait_copied(timeout: std::time::Duration) -> bool {
+    let mut guard = SWAPCHAINS.lock().expect("window swapchains");
+    let mut retired = false;
+    let mut copying: Option<(&'static Gpu, Vec<vk::Fence>)> = None;
+    for swapchain in guard.iter_mut().flat_map(|all| all.values_mut()) {
+        retired |= swapchain.retire_copied();
+        let fences = swapchain.copying();
+        if fences.is_empty() {
+            continue;
+        }
+        let (gpu, all) = copying.get_or_insert_with(|| (swapchain.gpu, Vec::new()));
+        // One wait covers one device's fences; another device's copies are
+        // waited for by a later call.
+        if std::ptr::eq(*gpu, swapchain.gpu) {
+            all.extend(fences);
+        }
+    }
+    if retired {
+        return true;
+    }
+    let Some((gpu, fences)) = copying else {
+        return false;
+    };
+    // The lock is held across the wait, as presenting holds it across its own
+    // fence waits: a rebuild or a forgotten window destroys these fences.
+    // SAFETY: fences of this device's, each attached to a submission.
+    let waited = unsafe {
+        gpu.device
+            .wait_for_fences(&fences, false, timeout.as_nanos() as u64)
+    };
+    for swapchain in guard.iter_mut().flat_map(|all| all.values_mut()) {
+        swapchain.retire_copied();
+    }
+    // A wait that failed outright did not wait, and the caller must not take
+    // it as having done so or it spins on a lost device.
+    matches!(waited, Ok(()) | Err(vk::Result::TIMEOUT))
+}
+
 fn finish_source(source: Option<usize>) {
     if let Some(source) = source {
         crate::present::presentation_complete(source);
@@ -614,8 +657,10 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Finish the source of every submitted frame whose fence has signalled.
-    fn retire_copied(&mut self) {
+    /// Finish the source of every submitted frame whose fence has signalled,
+    /// and say whether there was one.
+    fn retire_copied(&mut self) -> bool {
+        let mut retired = false;
         for frame in &mut self.frames {
             if frame.source.is_none() || !frame.submitted {
                 continue;
@@ -624,8 +669,19 @@ impl Swapchain {
             // last submission.
             if unsafe { self.gpu.device.get_fence_status(frame.done) }.unwrap_or(false) {
                 finish_source(frame.source.take());
+                retired = true;
             }
         }
+        retired
+    }
+
+    /// The fences of the submitted frames still holding a source.
+    fn copying(&self) -> Vec<vk::Fence> {
+        self.frames
+            .iter()
+            .filter(|frame| frame.submitted && frame.source.is_some())
+            .map(|frame| frame.done)
+            .collect()
     }
 
     /// Wait for every frame in flight and rebuild at `extent`.

@@ -535,8 +535,9 @@ struct Installed {
     holds: bool,
 }
 
-/// Every area in a view tree, in drawing order - parents before children and
-/// siblings in order - so the last one holding the pointer is the topmost.
+/// Every area in a view tree, in drawing order: parents before children,
+/// siblings in order, and a view's areas in the order they were added.
+/// [`installed`] reverses it.
 ///
 /// Areas on hidden views are listed as holding nothing: a view that is hidden
 /// with the pointer inside it is one the pointer has left.
@@ -570,7 +571,10 @@ unsafe fn installed_in(view: Id, key: bool, first: Id, out: &mut Vec<Installed>)
     }
 }
 
-/// The areas of `window`'s content view, retained; see [`Installed`].
+/// The areas of `window`'s content view, retained, frontmost first: children
+/// before parents, later siblings before earlier ones, and a view's newest area
+/// before its older ones. That is the order AppKit delivers tracking events in,
+/// so the first area holding the pointer is the topmost. See [`Installed`].
 fn installed(window: Id) -> Vec<Installed> {
     let key = crate::window::key_window() == window;
     let first = match key {
@@ -584,6 +588,7 @@ fn installed(window: Id) -> Vec<Installed> {
     let mut out = Vec::new();
     // SAFETY: null or the content view, which this crate made.
     unsafe { installed_in(crate::window::content_view_of(window), key, first, &mut out) };
+    out.reverse();
     out
 }
 
@@ -595,7 +600,8 @@ fn installed(window: Id) -> Vec<Installed> {
 /// takes its state with it, and a new one at the same address starts clean.
 ///
 /// - `NSTrackingMouseEnteredAndExited`: `-mouseEntered:` and `-mouseExited:` to
-///   the owner of every area the pointer crosses, exits first.
+///   the owner of every area the pointer crosses, exits first, each frontmost
+///   first.
 /// - `NSTrackingCursorUpdate`: `-cursorUpdate:` when the topmost such area
 ///   changes, to its owner; leaving the last one sends it to the view under the
 ///   pointer, whose inherited method walks up to the window and puts the arrow
@@ -645,7 +651,7 @@ pub fn update_tracking(window: Id, dragging: bool) {
         .iter()
         .filter(wants_cursor)
         .filter(|e| e.active && e.holds)
-        .rfind(|e| area_of(e.area).is_some_and(|a| !held_by_drag(a.options, dragging)))
+        .find(|e| area_of(e.area).is_some_and(|a| !held_by_drag(a.options, dragging)))
         .map(|e| e.area);
     let previous = areas
         .iter()
@@ -688,7 +694,8 @@ pub fn update_tracking(window: Id, dragging: bool) {
 
 /// The areas of `window` that `-mouseMoved:` goes to for a move with no
 /// button held: active, holding the pointer, and made with
-/// `NSTrackingMouseMoved`. Retained, for the caller to release.
+/// `NSTrackingMouseMoved`. Retained, for the caller to release, and frontmost
+/// first, which is the order AppKit sends the moves in.
 ///
 /// AppKit sends those moves to each area's owner, which is the only place Qt
 /// listens for them: its `QNSView` gives a helper object the area, and the
@@ -1256,6 +1263,82 @@ mod tests {
         assert!(held_by_drag(ACTIVE_ALWAYS, true));
         assert!(!held_by_drag(ACTIVE_ALWAYS, false));
         assert!(!held_by_drag(ENABLED_DURING_MOUSE_DRAG, true));
+    }
+
+    /// Overlapping areas get `-mouseMoved:` frontmost first, as on macOS:
+    /// later siblings before earlier ones, children before parents, and a
+    /// view's newest area before its older ones.
+    #[test]
+    fn overlapping_mouse_moves_reach_frontmost_views_first() {
+        crate::bootstrap();
+        // SAFETY: each cast matches the method's declared prototype.
+        let send: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let new_view = || {
+            let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            let rect = NSRect {
+                origin: NSPoint::default(),
+                size: NSSize {
+                    width: 100.0,
+                    height: 100.0,
+                },
+            };
+            unsafe {
+                let init: unsafe extern "C" fn(Id, Sel, NSRect) -> Id =
+                    std::mem::transmute(objc::msg::entry());
+                init(view, objc::sel::get("initWithFrame:"), rect)
+            }
+        };
+        let add_area = |view: Id| {
+            let area =
+                objc::object::create_instance(objc::class::lookup(c"NSTrackingArea").unwrap(), 0);
+            unsafe {
+                init_tracking_area(
+                    area,
+                    objc::sel::get("initWithRect:options:owner:userInfo:"),
+                    NSRect::default(),
+                    tracking::MOUSE_MOVED | tracking::ACTIVE_ALWAYS | tracking::IN_VISIBLE_RECT,
+                    view,
+                    std::ptr::null_mut(),
+                );
+                send(view, objc::sel::get("addTrackingArea:"), area);
+            }
+            // The view holds it now.
+            objc::arc::release(area);
+            area
+        };
+
+        // root
+        // |- back      (one area, and a child with one)
+        // |  `- inner
+        // `- front     (two areas)
+        // A window without an SDL handle keeps this fixture headless.
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        let [root, back, inner, front] = [new_view(), new_view(), new_view(), new_view()];
+        unsafe {
+            send(window, objc::sel::get("setContentView:"), root);
+            send(root, objc::sel::get("addSubview:"), back);
+            send(back, objc::sel::get("addSubview:"), inner);
+            send(root, objc::sel::get("addSubview:"), front);
+        }
+        for view in [root, back, inner, front] {
+            objc::arc::release(view);
+        }
+        let root_area = add_area(root);
+        let back_area = add_area(back);
+        let inner_area = add_area(inner);
+        let front_older = add_area(front);
+        let front_newer = add_area(front);
+
+        crate::window::TEST_POINTER.set(Some(NSPoint { x: 10.0, y: 10.0 }));
+        let delivered = mouse_moved_areas(window);
+        crate::window::TEST_POINTER.set(None);
+        assert_eq!(
+            delivered,
+            vec![front_newer, front_older, inner_area, back_area, root_area]
+        );
+        delivered.into_iter().for_each(objc::arc::release);
+        objc::arc::release(window);
     }
 
     /// `NSTrackingAssumeInside` starts an area inside, so the first move that

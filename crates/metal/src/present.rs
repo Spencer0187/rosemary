@@ -84,8 +84,9 @@ struct Cached {
     slots: Vec<CachedSlot>,
 }
 
-static CACHE: (std::sync::Mutex<Vec<Cached>>, std::sync::Condvar) =
-    (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
+type DrawableCache = (std::sync::Mutex<Vec<Cached>>, std::sync::Condvar);
+
+static CACHE: DrawableCache = (std::sync::Mutex::new(Vec::new()), std::sync::Condvar::new());
 
 /// `-[CAMetalLayer nextDrawable]`.
 unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
@@ -181,13 +182,44 @@ unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
             && (entry.width, entry.height, entry.pixel_format) == (width, height, pixel_format)
     };
     debug_assert!(matches(&cache[at]));
+    let Some((_cache, drawable)) = vend(
+        &CACHE,
+        cache,
+        matches,
+        || crate::swapchain::wait_copied(RECLAIM_POLL),
+        RECLAIM_POLL,
+    ) else {
+        return std::ptr::null_mut();
+    };
+    // Under the lock, which keeps the slot from being reclaimed as dropped
+    // before it is retained. The cache's own reference is not the caller's
+    // to spend.
+    objc::arc::autorelease(objc::arc::retain(drawable as Id))
+}
+
+/// Mark a slot of the ring `matches` picks out vended, waiting for one while
+/// the ring is full, and hand it back with the lock still held. `None` once
+/// the ring has been retired. `retire` returns presented drawables whose
+/// copies are done, saying whether there was a copy to retire or wait for.
+fn vend<'a>(
+    pair: &'a DrawableCache,
+    mut cache: std::sync::MutexGuard<'a, Vec<Cached>>,
+    matches: impl Fn(&Cached) -> bool,
+    mut retire: impl FnMut() -> bool,
+    poll: std::time::Duration,
+) -> Option<(std::sync::MutexGuard<'a, Vec<Cached>>, usize)> {
+    // Whether the swapchain had no copy left to retire or wait for, so that
+    // only another thread can free a slot. Not on the first pass: a copy may
+    // have finished, or still be running, since the caller last retired.
+    let mut idle = false;
     loop {
+        // Every pass checks the ring under the lock it may then wait with, so
+        // a slot returned while the lock was given up is found here rather
+        // than waited for.
         reclaim_dropped(&mut cache);
         // Looked up again each time round: the lock is given up below, and
         // the ring may have been retired meanwhile.
-        let Some(entry) = cache.iter_mut().find(|entry| matches(entry)) else {
-            return std::ptr::null_mut();
-        };
+        let entry = cache.iter_mut().find(|entry| matches(entry))?;
         if let Some(slot) = entry
             .slots
             .iter_mut()
@@ -195,27 +227,25 @@ unsafe extern "C" fn next_drawable(receiver: Id, _sel: Sel) -> Id {
         {
             slot.state = SlotState::Vended;
             crate::stats::count(crate::stats::Counter::DrawableVended);
-            // The cache's own reference is not the caller's to spend.
-            return objc::arc::autorelease(objc::arc::retain(slot.drawable as Id));
+            let drawable = slot.drawable;
+            return Some((cache, drawable));
         }
         crate::stats::count(crate::stats::Counter::DrawablePressure);
+        if idle {
+            // Timed, because a guest dropping a drawable it never presented
+            // does not signal the condition variable.
+            cache = pair.1.wait_timeout(cache, poll).expect("drawable cache").0;
+        }
         // A presented drawable whose copy is done comes back through the
         // swapchain, which locks the cache to return it.
         drop(cache);
-        crate::swapchain::retire_copied();
-        cache = CACHE.0.lock().expect("drawable cache");
-        // Timed, because neither a finished copy nor a guest dropping a
-        // drawable it never presented signals the condition variable.
-        cache = CACHE
-            .1
-            .wait_timeout(cache, RECLAIM_POLL)
-            .expect("drawable cache")
-            .0;
+        idle = !retire();
+        cache = pair.0.lock().expect("drawable cache");
     }
 }
 
 /// How often a `nextDrawable` waiting on a full ring looks for a drawable the
-/// guest has let go of.
+/// guest has let go of, which is also as long as it waits on a copy at a time.
 const RECLAIM_POLL: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Return to its ring every vended drawable the guest no longer holds.
@@ -1104,5 +1134,108 @@ mod drawable_pool_tests {
         };
         assert!(!slot.submit());
         assert_eq!(slot.state, SlotState::Submitted);
+    }
+
+    /// Long enough that a test which waits it out has failed.
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(60);
+
+    fn full_ring() -> DrawableCache {
+        let ring = Cached {
+            layer: 7,
+            width: 128,
+            height: 128,
+            pixel_format: 80,
+            stale: false,
+            slots: vec![CachedSlot {
+                drawable: 1,
+                state: SlotState::Submitted,
+            }],
+        };
+        (std::sync::Mutex::new(vec![ring]), std::sync::Condvar::new())
+    }
+
+    fn ring_of_layer_7(entry: &Cached) -> bool {
+        !entry.stale && entry.layer == 7
+    }
+
+    fn finish_copy(pair: &DrawableCache) {
+        pair.0.lock().unwrap()[0].slots[0].complete();
+        pair.1.notify_all();
+    }
+
+    #[test]
+    fn vends_a_drawable_retired_while_the_lock_was_given_up() {
+        let pair = full_ring();
+        let started = std::time::Instant::now();
+        let mut retirements = 0;
+        // The completion's notification goes to nobody, and the swapchain
+        // has no further copy, so only a recheck finds the slot.
+        let vended = vend(
+            &pair,
+            pair.0.lock().unwrap(),
+            ring_of_layer_7,
+            || {
+                retirements += 1;
+                finish_copy(&pair);
+                false
+            },
+            NEVER,
+        );
+        assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
+        assert_eq!(retirements, 1);
+        assert!(started.elapsed() < NEVER / 2);
+    }
+
+    #[test]
+    fn retires_again_without_waiting_while_a_copy_is_in_flight() {
+        let pair = full_ring();
+        let started = std::time::Instant::now();
+        let mut retirements = 0;
+        let vended = vend(
+            &pair,
+            pair.0.lock().unwrap(),
+            ring_of_layer_7,
+            || {
+                retirements += 1;
+                if retirements == 2 {
+                    finish_copy(&pair);
+                }
+                true
+            },
+            NEVER,
+        );
+        assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
+        assert_eq!(retirements, 2);
+        assert!(started.elapsed() < NEVER / 2);
+    }
+
+    #[test]
+    fn wakes_for_a_drawable_returned_by_another_thread() {
+        let pair = full_ring();
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            let guard = pair.0.lock().unwrap();
+            // Blocks on the lock until the vend below waits and gives it up.
+            scope.spawn(|| finish_copy(&pair));
+            let vended = vend(&pair, guard, ring_of_layer_7, || false, NEVER);
+            assert_eq!(vended.map(|(_, drawable)| drawable), Some(1));
+        });
+        assert!(started.elapsed() < NEVER / 2);
+    }
+
+    #[test]
+    fn gives_up_when_the_ring_is_retired_while_waiting() {
+        let pair = full_ring();
+        let vended = vend(
+            &pair,
+            pair.0.lock().unwrap(),
+            ring_of_layer_7,
+            || {
+                pair.0.lock().unwrap()[0].stale = true;
+                true
+            },
+            NEVER,
+        );
+        assert!(vended.is_none());
     }
 }

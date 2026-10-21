@@ -2797,6 +2797,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // Answered honestly rather than usefully.
     sig!("mincore", I32, P, U64, P),
     sig!("mkdir", I32, P, U32),
+    sig!("mkdirat", I32, I32, P, U16),
     sig!("mkdtemp", P, P),
     sig!("mknod", I32, P, U32, I32),
     sig!("mkstemp", I32, P),
@@ -3336,6 +3337,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("ungetc", I32, I32, P),
     sig!("ungetwc", I32, I32, P),
     sig!("unlink", I32, P),
+    sig!("unlinkat", I32, I32, P, I32),
     sig!("undelete", I32, P),
     sig!("unsetenv", I32, P),
     sig!("unvis", I32, P, I32, P, I32),
