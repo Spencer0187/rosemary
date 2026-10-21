@@ -1356,6 +1356,31 @@ mod tests {
     fn a_global_warp_is_translated_to_window_coordinates() {
         assert_eq!(local_warp_point((420.0, 310.0), (100, 50)), (320.0, 260.0));
     }
+
+    #[test]
+    fn redundant_mouse_association_preserves_camera_recentring() {
+        use std::sync::atomic::Ordering;
+
+        let prior_associated = ASSOCIATED.swap(true, Ordering::AcqRel);
+        let mut state = RECENTRING.lock().unwrap_or_else(|e| e.into_inner());
+        let prior_recentring = state.replace(Recentring {
+            window: 0,
+            target: (420.0, 300.0),
+            at: std::time::Instant::now(),
+            moved: true,
+            active: true,
+        });
+        drop(state);
+
+        assert_eq!(unsafe { CGAssociateMouseAndMouseCursorPosition(1) }, 0);
+        assert!(
+            recentring(),
+            "a duplicate association must preserve relative mode"
+        );
+
+        *RECENTRING.lock().unwrap_or_else(|e| e.into_inner()) = prior_recentring;
+        ASSOCIATED.store(prior_associated, Ordering::Release);
+    }
 }
 
 /// `CGError CGWarpMouseCursorPosition(CGPoint)` - move the pointer, in global
@@ -1638,6 +1663,11 @@ pub(crate) fn forget_recentring() {
 /// unavailable rather than running without capture.
 #[allow(non_snake_case)]
 pub unsafe extern "C" fn CGAssociateMouseAndMouseCursorPosition(connected: u32) -> i32 {
+    // Reasserting the current association must not drop an active camera
+    // recenter or reset SDL relative mode. Focus regain reapplies separately.
+    if mouse_is_associated() == (connected != 0) {
+        return 0;
+    }
     // The cursor stops where it is, which is what the guest is told from here.
     if connected == 0 && mouse_is_associated() {
         crate::event::settle_pointer();
