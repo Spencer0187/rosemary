@@ -63,6 +63,9 @@ struct Swapchain {
     /// Where layers accumulate when the window has more than one. `None`
     /// while a single layer covers the window, which needs no accumulator.
     composite: Option<GpuImage>,
+    /// The latest full-window opaque drawable, retained until a later direct
+    /// frame replaces it or a second layer needs it as a GPU snapshot.
+    direct: Option<DirectLayer>,
     /// The layers which have presented to this window. Its length is what
     /// decides whether the composite is needed.
     layers: Vec<usize>,
@@ -178,6 +181,62 @@ struct PreparedComposite {
     source: PresentSource,
     prepared: PreparedPresent,
     request: AcquireRequest,
+    direct: bool,
+}
+
+/// A directly presented drawable stays available for a later layer to join.
+/// Its WSI-copy fence protects release if another frame supersedes it.
+// Store SDL's opaque window handle as an integer, as the other worker state
+// does. Reconstruct the Frame only under the window's presenting mutex.
+#[derive(Clone, Copy)]
+struct DirectFrame {
+    window: usize,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    window_width: u32,
+    window_height: u32,
+}
+
+impl DirectFrame {
+    fn from_frame(frame: &appkit::view::Frame) -> Self {
+        Self {
+            window: frame.window as usize,
+            x: frame.x,
+            y: frame.y,
+            width: frame.width,
+            height: frame.height,
+            window_width: frame.window_width,
+            window_height: frame.window_height,
+        }
+    }
+
+    fn frame(self) -> appkit::view::Frame {
+        appkit::view::Frame {
+            window: self.window as sdl3::Window,
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+            window_width: self.window_width,
+            window_height: self.window_height,
+        }
+    }
+}
+
+struct DirectLayer {
+    frame: DirectFrame,
+    source: PresentSource,
+    owner: Option<usize>,
+    submitted_slot: Option<usize>,
+    queued_at: Instant,
+}
+
+impl Drop for DirectLayer {
+    fn drop(&mut self) {
+        finish_source(self.owner.take());
+    }
 }
 
 enum CompositorAcquire {
@@ -1147,17 +1206,53 @@ fn present_impl(
             swapchain.extent.width,
             swapchain.extent.height,
         ));
+        // A single opaque Metal drawable can be copied straight into the WSI
+        // image by the same window worker, without an offscreen full-frame copy.
+        // The retained drawable also supplies the initial snapshot if a second
+        // layer joins later. Other cases must stage into the GPU accumulator.
+        let direct = fast_direct_layer(
+            swapchain.present_mode,
+            swapchain.layers.len(),
+            frame,
+            regions.as_deref(),
+            swapchain.corners.is_some(),
+            owner.0.is_some(),
+        );
+        let converting = !direct && swapchain.direct.is_some();
+        let converted = if converting {
+            swapchain.stage_direct_snapshot(true)
+        } else {
+            Ok(None)
+        };
         // Keep the submitted drawable's additional retained reference until
         // staging actually transfers it to a GPU fence. Error paths must not
         // release the ring slot before the dispatcher decides to retry.
-        let staged = swapchain.stage_composite(frame, source, regions.as_deref(), &mut owner, true);
+        let converted_staged = matches!(converted, Ok(Some(true)));
+        let staged = match converted {
+            Ok(_) if direct => {
+                swapchain.queue_direct(frame, PresentSource::from(source), &mut owner);
+                Ok(Some(true))
+            }
+            // A busy GPU staging slot cannot yet preserve the previous
+            // full-window drawable. Defer the incoming layer rather than
+            // presenting an incomplete window image over that drawable.
+            Ok(None) if converting => Ok(None),
+            Ok(None) | Ok(Some(true)) => {
+                swapchain.stage_composite(frame, source, regions.as_deref(), &mut owner, true)
+            }
+            Ok(Some(false)) => unreachable!(),
+            Err(error) => Err(error),
+        };
         let typed_device_loss =
             swapchain.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
         let refresh_store = composite_first_stage_needs_store(joined, &staged, layer, window);
-        if matches!(staged, Ok(Some(true))) {
-            wake_compositor_worker(&window_swapchain);
-        } else if joined {
+        if !matches!(staged, Ok(Some(true))) && joined {
+            // A saved background snapshot does not mean the new layer's own
+            // frame was staged: keep the layer unknown until that succeeds.
             swapchain.layers.retain(|&known| known != layer);
+        }
+        if matches!(staged, Ok(Some(true))) || converted_staged {
+            wake_compositor_worker(&window_swapchain);
         }
         drop(swapchain);
         drop(presenting);
@@ -1245,6 +1340,41 @@ fn compositor_batch_delay(mode: vk::PresentModeKHR, rate: f32) -> Duration {
     }
 }
 
+/// Only a full-window opaque drawable with a retained lifetime may bypass
+/// offscreen composition. FIFO retains its previous batching behavior.
+fn fast_direct_layer(
+    mode: vk::PresentModeKHR,
+    layers: usize,
+    frame: &appkit::view::Frame,
+    regions: Option<&[Region]>,
+    corners: bool,
+    owned: bool,
+) -> bool {
+    matches!(
+        mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) && layers == 1
+        && frame.covers_window()
+        && regions.is_none()
+        && !corners
+        && owned
+}
+
+/// Direct opaque presents have nothing to coalesce, so they do not wait for
+/// the multi-layer Core Animation batching heuristic.
+fn pending_batch_delay(swapchain: &Swapchain) -> Duration {
+    if swapchain.direct.is_some() {
+        Duration::ZERO
+    } else {
+        swapchain.compositor_batch_delay
+    }
+}
+
+// A static window must not permanently reserve one of a CAMetalLayer's three
+// drawable slots. Only idle windows snapshot once; active direct frames never
+// pay the extra full-frame GPU transfer.
+const DIRECT_IDLE_SNAPSHOT_DELAY: Duration = Duration::from_millis(100);
+
 /// One presentation worker per window prevents an occluded window from
 /// stalling other windows and decouples Metal drawables from WSI acquisitions.
 fn ensure_layer_compositor_worker(window: usize, entry: &Arc<WindowSwapchain>) {
@@ -1276,10 +1406,25 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             // The idle worker must not retain a window or device after
             // terminal loss. Unlike Condvar notification, unpark's token is
             // retained when a loss races the transition to sleep.
+            let snapshot_wait = state.direct.as_ref().and_then(|direct| {
+                direct.submitted_slot.and_then(|_| {
+                    DIRECT_IDLE_SNAPSHOT_DELAY.checked_sub(direct.queued_at.elapsed())
+                })
+            });
+            if state.direct.as_ref().is_some_and(|direct| {
+                direct.submitted_slot.is_some()
+                    && direct.queued_at.elapsed() >= DIRECT_IDLE_SNAPSHOT_DELAY
+            }) {
+                break;
+            }
             #[cfg(test)]
             TEST_COMPOSITOR_IDLE_PARKED.store(window, Ordering::Release);
             drop(state);
-            std::thread::park();
+            if let Some(wait) = snapshot_wait {
+                std::thread::park_timeout(wait);
+            } else {
+                std::thread::park();
+            }
             #[cfg(test)]
             TEST_COMPOSITOR_IDLE_PARKED.store(0, Ordering::Release);
             state = entry.state.lock().expect("window swapchain");
@@ -1290,9 +1435,34 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         {
             return;
         }
+        if !state.composite_dirty {
+            drop(state);
+            let _presenting = PresentingGuard {
+                held: Some(entry.presenting.lock().expect("window presentation")),
+                gpu: entry.gpu,
+            };
+            let mut state = entry.state.lock().expect("window swapchain");
+            match state.snapshot_idle_direct() {
+                Ok(_) => {}
+                Err(error) => {
+                    let device_lost = state.last_wsi_error.take()
+                        == Some(vk::Result::ERROR_DEVICE_LOST)
+                        || error.contains("ERROR_DEVICE_LOST");
+                    drop(state);
+                    drop(_presenting);
+                    if device_lost {
+                        record_device_loss(entry.gpu);
+                        return;
+                    }
+                    gpu::trace(format!("idle direct snapshot failed: {error}"));
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            continue;
+        }
         if let Some(remaining) = state
             .composite_dirty_since
-            .and_then(|since| state.compositor_batch_delay.checked_sub(since.elapsed()))
+            .and_then(|since| pending_batch_delay(&state).checked_sub(since.elapsed()))
         {
             let _wait = entry
                 .wake
@@ -1440,6 +1610,87 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
 }
 
 impl Swapchain {
+    /// Move an obsolete direct drawable to its WSI submit fence so that a
+    /// source cannot be released while the GPU is still copying from it.
+    fn retire_direct(&mut self) {
+        let Some(mut direct) = self.direct.take() else {
+            return;
+        };
+        if let Some(slot) = direct.submitted_slot {
+            if self.frames[slot].submitted {
+                debug_assert!(self.frames[slot].source.is_none());
+                self.frames[slot].source = direct.owner.take();
+            }
+        }
+        // An unsubmitted drawable or a completed WSI copy is safe to release.
+    }
+
+    fn queue_direct(
+        &mut self,
+        frame: &appkit::view::Frame,
+        source: PresentSource,
+        owner: &mut SourceOwner,
+    ) {
+        self.retire_direct();
+        self.direct = Some(DirectLayer {
+            frame: DirectFrame::from_frame(frame),
+            source,
+            owner: owner.take(),
+            submitted_slot: None,
+            queued_at: Instant::now(),
+        });
+        self.composite_dirty = true;
+        self.composite_dirty_since = Some(Instant::now());
+    }
+
+    /// Materialize the last directly displayed layer only when another layer
+    /// actually joins. This preserves a static underlying layer while avoiding
+    /// a full-frame intermediate copy in the steady-state single-layer case.
+    fn stage_direct_snapshot(&mut self, nonblocking: bool) -> Result<Option<bool>, String> {
+        let Some(mut direct) = self.direct.take() else {
+            return Ok(None);
+        };
+        let mut owner = SourceOwner(direct.owner.take());
+        let result = self.stage_composite_source(
+            &direct.frame.frame(),
+            direct.source,
+            None,
+            &mut owner,
+            nonblocking,
+        );
+        if !matches!(result, Ok(Some(true))) {
+            direct.owner = owner.take();
+            self.direct = Some(direct);
+        }
+        result
+    }
+
+    /// After an idle window is already on screen, snapshot it once and return
+    /// its drawable to the guest. No extra WSI present is needed for this copy.
+    /// Called only under the window presentation mutex, on the worker thread.
+    fn snapshot_idle_direct(&mut self) -> Result<bool, String> {
+        if self.composite_dirty
+            || !self.direct.as_ref().is_some_and(|direct| {
+                direct.submitted_slot.is_some()
+                    && direct.queued_at.elapsed() >= DIRECT_IDLE_SNAPSHOT_DELAY
+            })
+        {
+            return Ok(false);
+        }
+        let slot = self.frame % self.frames.len();
+        if !matches!(self.stage_direct_snapshot(false)?, Some(true)) {
+            return Ok(false);
+        }
+        // This is an idle-only transfer: waiting on the compositor worker
+        // returns the retained drawable immediately without delaying AppKit.
+        self.gpu.wait(self.frames[slot].done)?;
+        self.frames[slot].submitted = false;
+        finish_source(self.frames[slot].source.take());
+        self.composite_dirty = false;
+        self.composite_dirty_since = None;
+        Ok(true)
+    }
+
     /// Copy a guest layer into the window accumulator without making the
     /// compositor display an intermediate image. The regular Metal drawable
     /// ownership/fence lifetime still applies to this submission.
@@ -1456,6 +1707,23 @@ impl Swapchain {
             self.last_wsi_error = Some(error);
             return Err(format!("injected composite staging failure: {error:?}"));
         }
+        self.stage_composite_source(
+            frame,
+            PresentSource::from(source),
+            regions,
+            owner,
+            nonblocking,
+        )
+    }
+
+    fn stage_composite_source(
+        &mut self,
+        frame: &appkit::view::Frame,
+        source: PresentSource,
+        regions: Option<&[Region]>,
+        owner: &mut SourceOwner,
+        nonblocking: bool,
+    ) -> Result<Option<bool>, String> {
         let slot = self.frame % self.frames.len().max(1);
         let this = &self.frames[slot];
         let (command_buffer, done) = (this.command_buffer, this.done);
@@ -1582,27 +1850,32 @@ impl Swapchain {
         if self.retired {
             self.rebuild(self.requested)?;
         }
-        let source =
-            PresentSource::from(self.composite.as_ref().expect("window layer accumulator"));
-        let frame = appkit::view::Frame {
-            window,
-            x: 0,
-            y: 0,
-            width: self.extent.width,
-            height: self.extent.height,
-            window_width: self.requested.width,
-            window_height: self.requested.height,
+        let direct = self.direct.is_some();
+        let (frame, source) = if let Some(single) = self.direct.as_ref() {
+            (single.frame.frame(), single.source)
+        } else {
+            (
+                appkit::view::Frame {
+                    window,
+                    x: 0,
+                    y: 0,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    window_width: self.requested.width,
+                    window_height: self.requested.height,
+                },
+                PresentSource::from(self.composite.as_ref().expect("window layer accumulator")),
+            )
         };
-        // The accumulator already includes all layers; this blits the
-        // composite once into the WSI image, with the corner mask applied.
         let (prepared, request) = self
-            .prepare_present(&frame, Some(&[]), false)?
+            .prepare_present(&frame, if direct { None } else { Some(&[]) }, false)?
             .ok_or("layer compositor failed to reserve present frame")?;
         Ok(PreparedComposite {
             frame,
             source,
             prepared,
             request,
+            direct,
         })
     }
 
@@ -1612,13 +1885,20 @@ impl Swapchain {
         acquired: Result<Option<(u32, bool)>, vk::Result>,
     ) -> Result<Option<vk::Result>, String> {
         let before = self.handle;
+        let frame_before = self.frame;
+        let direct_slot = ready.prepared.slot;
         let result = self.finish_present(
             &ready.frame,
             ready.source,
-            Some(&[]),
+            if ready.direct { None } else { Some(&[]) },
             ready.prepared,
             acquired,
         );
+        if ready.direct && self.frame != frame_before {
+            if let Some(single) = self.direct.as_mut() {
+                single.submitted_slot = Some(direct_slot);
+            }
+        }
         if self.acquired_unsubmitted.is_some() {
             // A failed WSI copy must consume the acquisition semaphore and
             // retire the acquired image before another compositor acquisition.
@@ -1952,6 +2232,7 @@ impl Swapchain {
             blitted: Vec::new(),
             presented: Vec::new(),
             composite: None,
+            direct: None,
             layers: Vec::new(),
             corners,
             pool: pool.take(),
@@ -2172,6 +2453,7 @@ impl Swapchain {
         let keep_fifo = uses_layer_compositor(self.present_mode)
             && uses_layer_compositor(present_mode)
             && self.composite.is_some();
+        let keep_direct = self.direct.is_some() && uses_layer_compositor(present_mode);
         let replace_composite = if keep_fifo {
             let old = self.composite.as_ref().expect("existing window snapshot");
             // The corners pass keeps the composite in its own format, never
@@ -2222,9 +2504,9 @@ impl Swapchain {
         self.acquired_unsubmitted = None;
         self.retired = false;
         self.present_mode = present_mode;
-        self.composite_dirty = keep_fifo;
+        self.composite_dirty = keep_fifo || keep_direct;
         self.composite_shape = None;
-        self.composite_dirty_since = keep_fifo.then(Instant::now);
+        self.composite_dirty_since = (keep_fifo || keep_direct).then(Instant::now);
         self.format = chosen.format;
         self.extent = extent;
         self.images = images;
@@ -2295,6 +2577,17 @@ impl Swapchain {
 
     fn rebuild(&mut self, extent: vk::Extent2D) -> Result<(), String> {
         self.idle();
+        if self.direct.is_some() && extent != self.requested {
+            // Preserve the last direct layer's unscaled top-left pixels as a
+            // static window snapshot before the swapchain changes size. A
+            // direct blit using the old frame's geometry would stretch it.
+            let slot = self.frame % self.frames.len();
+            if matches!(self.stage_direct_snapshot(false)?, Some(true)) {
+                self.gpu.wait(self.frames[slot].done)?;
+                self.frames[slot].submitted = false;
+                finish_source(self.frames[slot].source.take());
+            }
+        }
         self.build(extent)
     }
 
@@ -2416,7 +2709,7 @@ impl Swapchain {
         // The corners pass reads the composite, so a window with it always
         // has one.
         let direct = self.layers.len() <= 1
-            && frame.covers_window()
+            && (frame.covers_window() || self.direct.is_some())
             && regions.is_none()
             && self.corners.is_none();
         let composite = match direct {

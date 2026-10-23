@@ -137,6 +137,43 @@ fn layer_compositing_batch_delay_distinguishes_wsi_modes() {
 }
 
 #[test]
+fn single_layer_fast_path_requires_an_owned_opaque_full_window() {
+    let frame = appkit::view::Frame {
+        window: std::ptr::null_mut(),
+        x: 0,
+        y: 0,
+        width: 320,
+        height: 240,
+        window_width: 320,
+        window_height: 240,
+    };
+    for mode in [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX] {
+        assert!(fast_direct_layer(mode, 1, &frame, None, false, true));
+        assert!(!fast_direct_layer(mode, 1, &frame, None, false, false));
+        assert!(!fast_direct_layer(mode, 2, &frame, None, false, true));
+        assert!(!fast_direct_layer(mode, 1, &frame, None, true, true));
+        assert!(!fast_direct_layer(
+            mode,
+            1,
+            &frame,
+            Some(&[Region {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32
+            }]),
+            false,
+            true,
+        ));
+        let shifted = appkit::view::Frame { x: 1, ..frame };
+        assert!(!fast_direct_layer(mode, 1, &shifted, None, false, true));
+    }
+    for mode in [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::FIFO_RELAXED] {
+        assert!(!fast_direct_layer(mode, 1, &frame, None, false, true));
+    }
+}
+
+#[test]
 fn mailbox_presentation_is_preferred_when_available() {
     assert_eq!(
         choose_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]),
@@ -1423,6 +1460,249 @@ fn v10_fifo_fixture() -> Option<(
         window_height: 120,
     };
     Some((window, gpu, state, image, frame))
+}
+
+/// Exercises actual Vulkan acquisition and WSI presentation on the direct
+/// worker path, including the lazy transition to multi-layer composition.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer() {
+    let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    // A requested unavailable WSI mode is not real validation of that mode.
+    assert_eq!(
+        state.present_mode, expected_mode,
+        "the host did not select the requested WSI mode"
+    );
+    state.layers.push(8);
+    // Reuse every WSI image, acquisition semaphore and presentation fence
+    // repeatedly; the first few images alone do not exercise retirement.
+    for _ in 0..(FRAMES_IN_FLIGHT * 3 + 2) {
+        state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+        assert_eq!(pending_batch_delay(&state), Duration::ZERO);
+        assert!(
+            state.composite.is_none(),
+            "direct path allocated an intermediate image"
+        );
+        state
+            .flush_composite(window)
+            .expect("single-layer direct WSI presentation");
+        assert!(
+            state.composite.is_none(),
+            "direct path copied into an accumulator"
+        );
+        assert!(!state.composite_dirty);
+    }
+    let prev_slot = state.direct.as_ref().unwrap().submitted_slot;
+    assert!(prev_slot.is_some());
+    state.layers.push(9);
+    assert_eq!(state.stage_direct_snapshot(false), Ok(Some(true)));
+    assert!(state.direct.is_none());
+    assert!(
+        state.composite.is_some(),
+        "second layer must retain prior full-window content"
+    );
+    assert_eq!(
+        state.stage_composite(
+            &appkit::view::Frame {
+                x: 12,
+                y: 15,
+                width: 80,
+                height: 60,
+                ..frame
+            },
+            &image,
+            None,
+            &mut SourceOwner(None),
+            false,
+        ),
+        Ok(Some(true)),
+    );
+    state.flush_composite(window).expect("two-layer WSI frame");
+    assert!(!state.composite_dirty);
+    state
+        .rebuild(state.requested)
+        .expect("recreate multi-layer WSI");
+    assert!(state.composite_dirty);
+    state
+        .flush_composite(window)
+        .expect("static multi-layer replay");
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn direct_layer_resize_preserves_unscaled_static_window_image() {
+    let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    assert_eq!(state.present_mode, expected_mode);
+    state.layers.push(8);
+    state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+    state
+        .flush_composite(window)
+        .expect("first direct WSI presentation");
+    assert!(state.composite.is_none());
+    assert!(sdl3::video::set_window_size(window, 208, 144));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        sdl3::pump();
+        let caps = unsafe {
+            crate::vulkan::surface_api()
+                .expect("WSI surface API")
+                .get_physical_device_surface_capabilities(gpu.physical, state.surface)
+        }
+        .expect("WSI capabilities");
+        if caps.current_extent.width == u32::MAX
+            || (caps.current_extent.width, caps.current_extent.height) == (208, 144)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "Vulkan surface did not resize");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    state
+        .rebuild(vk::Extent2D {
+            width: 208,
+            height: 144,
+        })
+        .expect("direct WSI resize");
+    assert!(
+        state.direct.is_none(),
+        "old geometry must not be stretched as a direct frame"
+    );
+    let saved = state
+        .composite
+        .as_ref()
+        .expect("resized snapshot of static layer");
+    assert_eq!(
+        (saved.width, saved.height),
+        (state.extent.width, state.extent.height)
+    );
+    assert!(state.composite_dirty);
+    state
+        .flush_composite(window)
+        .expect("static layer replay without guest redraw");
+    assert!(!state.composite_dirty);
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
+}
+
+/// Idle direct frames are snapshotted only after they are on screen, then
+/// their drawable can be returned without queuing another WSI presentation.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn idle_direct_frame_snapshots_once_and_releases_the_source_fence() {
+    let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    assert_eq!(state.present_mode, expected_mode);
+    state.layers.push(8);
+    state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+    assert!(
+        !state
+            .snapshot_idle_direct()
+            .expect("dirty direct cannot snapshot")
+    );
+    state.flush_composite(window).expect("direct presentation");
+    assert!(state.direct.is_some());
+    assert!(
+        !state
+            .snapshot_idle_direct()
+            .expect("recent direct cannot snapshot")
+    );
+    state.direct.as_mut().unwrap().queued_at = Instant::now() - DIRECT_IDLE_SNAPSHOT_DELAY;
+    let before_stage = state.frame;
+    assert!(state.snapshot_idle_direct().expect("snapshot idle direct"));
+    assert_eq!(state.frame, before_stage + 1, "one GPU staging copy");
+    assert!(state.direct.is_none());
+    assert!(state.composite.is_some());
+    assert!(
+        !state.composite_dirty,
+        "already-presented image must not re-enter WSI"
+    );
+    let snapshot_slot = before_stage % state.frames.len();
+    assert!(!state.frames[snapshot_slot].submitted);
+    assert!(state.frames[snapshot_slot].source.is_none());
+    assert!(
+        !state
+            .snapshot_idle_direct()
+            .expect("only one idle snapshot")
+    );
+    state.layers.push(9);
+    assert_eq!(
+        state.stage_composite(
+            &appkit::view::Frame {
+                x: 4,
+                y: 3,
+                width: 20,
+                height: 40,
+                ..frame
+            },
+            &image,
+            None,
+            &mut SourceOwner(None),
+            false,
+        ),
+        Ok(Some(true)),
+    );
+    state
+        .flush_composite(window)
+        .expect("present new layer atop preserved idle snapshot");
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
+}
+
+/// Acquired-image recovery must preserve the direct source, not silently
+/// consume its drawable on an out-of-date or failed submission.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn direct_single_layer_replays_after_failed_submit() {
+    let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    assert_eq!(state.present_mode, expected_mode);
+    state.layers.push(8);
+    state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+    state.injected_queue_submit_error = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+    state
+        .flush_composite(window)
+        .expect("recover direct acquire after failed submit");
+    assert!(state.composite_dirty);
+    assert!(state.direct.is_some());
+    state
+        .flush_composite(window)
+        .expect("replay direct without new drawable");
+    assert!(!state.composite_dirty);
+    assert!(state.composite.is_none());
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
 }
 
 #[test]
