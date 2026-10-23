@@ -15,11 +15,11 @@ use vk::Handle;
 
 use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
 
-/// How many frames may be recorded before one has to have finished.
+/// How many compositor updates can be queued before one has to finish.
 ///
-/// FIFO coalesces several independent Core Animation layer updates into
-/// one window presentation. The accumulator submissions must not reuse their
-/// command buffers while those small copies are still in the GPU queue.
+/// Independent Core Animation layers are staged before a window presentation.
+/// The accumulator submissions must not reuse their command buffers while
+/// those small copies are still in the GPU queue.
 const FRAMES_IN_FLIGHT: usize = 8;
 
 /// The per-window state presentation goes through.
@@ -73,12 +73,12 @@ struct Swapchain {
     frames: Vec<Frame>,
     frame: usize,
     present_mode: vk::PresentModeKHR,
-    /// FIFO layers accumulate in an offscreen image, not the Vulkan WSI
-    /// queue. The presentation worker drains that image once per display.
-    fifo_dirty: bool,
-    fifo_shape: Option<corners::Shape>,
-    fifo_dirty_since: Option<Instant>,
-    fifo_batch_delay: Duration,
+    /// Metal layers accumulate in an offscreen image independently of Vulkan
+    /// WSI pacing. The presentation worker publishes the latest window image.
+    composite_dirty: bool,
+    composite_shape: Option<corners::Shape>,
+    composite_dirty_since: Option<Instant>,
+    compositor_batch_delay: Duration,
     last_wsi_error: Option<vk::Result>,
     #[cfg(test)]
     injected_build_vk_error: Option<vk::Result>,
@@ -87,14 +87,12 @@ struct Swapchain {
     #[cfg(test)]
     injected_queue_present_error: Option<vk::Result>,
     #[cfg(test)]
-    injected_unsignaled_present_fence: bool,
     #[cfg(test)]
     injected_queue_submit_error: Option<vk::Result>,
     /// vkAcquireNextImageKHR succeeded, but its semaphore wait has not yet
     /// been submitted. Failure requires retiring this swapchain, not simply
     /// resetting a fence and reusing the signaled acquisition semaphore.
     acquired_unsubmitted: Option<(vk::Semaphore, vk::Fence)>,
-    deferred_owned: bool,
     #[cfg(test)]
     injected_recovery_error: Option<vk::Result>,
     #[cfg(test)]
@@ -134,11 +132,9 @@ struct WindowSwapchain {
     resize_worker_started: AtomicBool,
     resize_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 0 = healthy, 1 = surface lost, 2 = device/unknown terminal failure.
-    fifo_failure: std::sync::atomic::AtomicU8,
+    present_failure: std::sync::atomic::AtomicU8,
     #[cfg(test)]
     injected_acquire_error: Mutex<Option<vk::Result>>,
-    #[cfg(test)]
-    injected_nonfifo_acquire_error: Mutex<Option<vk::Result>>,
 }
 
 struct PreparedPresent {
@@ -177,23 +173,28 @@ impl From<&GpuImage> for PresentSource {
 
 /// The compositor keeps its image and DMA fence alive across a WSI acquire.
 /// The Vulkan acquire itself must not hold the swapchain-state mutex.
-struct PreparedFifo {
+struct PreparedComposite {
     frame: appkit::view::Frame,
     source: PresentSource,
     prepared: PreparedPresent,
     request: AcquireRequest,
 }
 
-enum FifoAcquire {
+enum CompositorAcquire {
     Ready(Option<(u32, bool)>),
     TimedOut,
     Terminal(vk::Result),
 }
 
-/// Wake an idle FIFO worker without losing a wake issued immediately
+/// Wake an idle compositor worker without losing a wake issued immediately
 /// before it parks. Condvar still covers the bounded batch-delay wait.
-fn wake_fifo_worker(entry: &WindowSwapchain) {
-    if let Some(worker) = entry.worker.lock().expect("FIFO worker").as_ref() {
+fn wake_compositor_worker(entry: &WindowSwapchain) {
+    if let Some(worker) = entry
+        .worker
+        .lock()
+        .expect("layer compositor worker")
+        .as_ref()
+    {
         worker.thread().unpark();
     }
     entry.wake.notify_all();
@@ -221,7 +222,7 @@ fn resize_worker(window: usize, entry: Arc<WindowSwapchain>) {
     loop {
         if !entry.alive.load(Ordering::Acquire)
             || entry.gpu.lost.load(Ordering::Acquire)
-            || entry.fifo_failure.load(Ordering::Acquire) != 0
+            || entry.present_failure.load(Ordering::Acquire) != 0
         {
             return;
         }
@@ -274,16 +275,16 @@ fn resize_worker(window: usize, entry: Arc<WindowSwapchain>) {
         match rebuilt {
             Ok(()) => {
                 state.pending_rebuild = None;
-                let fifo = is_fifo_mode(state.present_mode) && state.fifo_dirty;
+                let dirty = uses_layer_compositor(state.present_mode) && state.composite_dirty;
                 drop(state);
                 drop(presenting);
-                if fifo {
-                    ensure_fifo_presentation_worker(window, &entry);
-                    wake_fifo_worker(&entry);
+                if dirty {
+                    ensure_layer_compositor_worker(window, &entry);
+                    wake_compositor_worker(&entry);
                 }
                 appkit::backing::present_again(window as sdl3::Window);
             }
-            Err(reason) if recoverable_fifo_rebuild_failure(&reason) => {
+            Err(reason) if recoverable_composite_rebuild_failure(&reason) => {
                 drop(state);
                 drop(presenting);
                 std::thread::sleep(Duration::from_millis(80));
@@ -297,8 +298,8 @@ fn resize_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 if device_lost {
                     record_device_loss(entry.gpu);
                 } else {
-                    entry.fifo_failure.store(2, Ordering::Release);
-                    wake_fifo_worker(&entry);
+                    entry.present_failure.store(2, Ordering::Release);
+                    wake_compositor_worker(&entry);
                 }
                 return;
             }
@@ -310,15 +311,15 @@ pub(crate) fn record_device_loss(gpu: &Gpu) {
     if gpu.lost.swap(true, Ordering::AcqRel) {
         return;
     }
-    gpu::trace("Vulkan logical device lost; stopping all associated FIFO windows");
+    gpu::trace("Vulkan logical device lost; stopping all associated composited windows");
     let registry = SWAPCHAINS.lock().expect("window swapchains");
     if let Some(entries) = registry.as_ref() {
         for entry in entries
             .values()
             .filter(|entry| std::ptr::eq(entry.gpu, gpu))
         {
-            entry.fifo_failure.store(2, Ordering::Release);
-            wake_fifo_worker(entry);
+            entry.present_failure.store(2, Ordering::Release);
+            wake_compositor_worker(entry);
             wake_resize_worker(entry);
         }
     }
@@ -329,14 +330,14 @@ fn handle_terminal_error(gpu: &'static Gpu, entry: &WindowSwapchain, error: vk::
         record_device_loss(gpu);
     } else {
         entry
-            .fifo_failure
-            .store(terminal_fifo_failure(error), Ordering::Release);
+            .present_failure
+            .store(terminal_present_failure(error), Ordering::Release);
     }
 }
 
 // Zero extent and out-of-date surfaces need a later retry, not a terminal
 // failure. A minimized window may remain in this state indefinitely.
-fn recoverable_fifo_rebuild_failure(reason: &str) -> bool {
+fn recoverable_composite_rebuild_failure(reason: &str) -> bool {
     reason.contains("the window has no area to present into")
         || reason.contains("ERROR_OUT_OF_DATE_KHR")
         || reason.contains("SUBOPTIMAL_KHR")
@@ -346,7 +347,7 @@ fn recoverable_fifo_rebuild_failure(reason: &str) -> bool {
 // Converted SDL windows cannot use SDL_GetWindowSurface as fallback.
 // Terminal allocation/device failures stop the window, while transient
 // staging failures leave the Metal drawable queued for a later retry.
-fn terminal_fifo_staging_failure(reason: &str) -> bool {
+fn terminal_composite_staging_failure(reason: &str) -> bool {
     reason.contains("ERROR_DEVICE_LOST")
         || reason.contains("ERROR_OUT_OF_HOST_MEMORY")
         || reason.contains("ERROR_OUT_OF_DEVICE_MEMORY")
@@ -354,7 +355,7 @@ fn terminal_fifo_staging_failure(reason: &str) -> bool {
 
 /// CPU backing-store damage is needed only once the *first* frame of a new
 /// Metal layer has actually entered the Vulkan window accumulator.
-fn fifo_first_stage_needs_store(
+fn composite_first_stage_needs_store(
     joined: bool,
     staged: &Result<Option<bool>, String>,
     layer: usize,
@@ -363,7 +364,7 @@ fn fifo_first_stage_needs_store(
     joined && layer != window && matches!(staged, Ok(Some(true)))
 }
 
-fn terminal_fifo_failure(error: vk::Result) -> u8 {
+fn terminal_present_failure(error: vk::Result) -> u8 {
     if error == vk::Result::ERROR_SURFACE_LOST_KHR {
         1
     } else {
@@ -533,7 +534,7 @@ pub(crate) fn wait_for_test_retirements() {
     sdl3::video::vulkan::service_surface_requests();
 }
 #[cfg(test)]
-static TEST_FIFO_IDLE_PARKED: std::sync::atomic::AtomicUsize =
+static TEST_COMPOSITOR_IDLE_PARKED: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 static TEST_FAIL_FIRST_CREATE_WINDOW: std::sync::atomic::AtomicUsize =
@@ -576,21 +577,6 @@ impl Drop for SourceOwner {
     }
 }
 
-// After a successful WSI acquisition, we cannot hand the drawable to SDL
-// readback if Vulkan recording/submission fails. Complete its drawable slot
-// on every early return unless a successful submission took ownership.
-struct AcquiredSource(Option<usize>);
-impl AcquiredSource {
-    fn take(&mut self) -> Option<usize> {
-        self.0.take()
-    }
-}
-impl Drop for AcquiredSource {
-    fn drop(&mut self) {
-        finish_source(self.0.take());
-    }
-}
-
 /// Drop everything held for an SDL window that is about to be destroyed.
 ///
 /// `appkit` remakes a window when what it is changes - a hidden dialog shown
@@ -619,7 +605,7 @@ pub(crate) fn forget_window(window: sdl3::Window) {
         // Cancellation cannot wait for that lock on the AppKit thread.
         entry.alive.store(false, Ordering::Release);
         entry.wake.notify_all();
-        wake_fifo_worker(entry);
+        wake_compositor_worker(entry);
         wake_resize_worker(entry);
     }
     let removed = SWAPCHAINS
@@ -639,10 +625,10 @@ pub(crate) fn forget_window(window: sdl3::Window) {
         std::thread::Builder::new()
             .name("rosemary-wsi-retire".into())
             .spawn(move || {
-                let fifo = entry.worker.lock().expect("FIFO worker").take();
-                if let Some(fifo) = fifo {
-                    fifo.thread().unpark();
-                    let _ = fifo.join();
+                let worker = entry.worker.lock().expect("layer compositor worker").take();
+                if let Some(worker) = worker {
+                    worker.thread().unpark();
+                    let _ = worker.join();
                 }
                 let resize = entry.resize_worker.lock().expect("resize worker").take();
                 if let Some(resize) = resize {
@@ -711,7 +697,7 @@ pub(crate) fn window_rendering_disabled(window: sdl3::Window) -> bool {
         .and_then(|all| all.get(&(window as usize)))
         .is_some_and(|entry| {
             entry.gpu.lost.load(Ordering::Acquire)
-                || entry.fifo_failure.load(Ordering::Acquire) != 0
+                || entry.present_failure.load(Ordering::Acquire) != 0
         })
 }
 
@@ -760,7 +746,7 @@ pub(crate) fn window_has_active_swapchain(window: sdl3::Window) -> bool {
         .is_some_and(|entry| {
             entry.alive.load(Ordering::Acquire)
                 && !entry.gpu.lost.load(Ordering::Acquire)
-                && entry.fifo_failure.load(Ordering::Acquire) == 0
+                && entry.present_failure.load(Ordering::Acquire) == 0
         })
 }
 
@@ -774,7 +760,7 @@ pub(crate) fn window_presenting_busy(window: sdl3::Window) -> bool {
 }
 
 /// A backing-store presentation must never block AppKit's event pump on a
-/// FIFO worker's image acquisition. `None` means keep the store dirty.
+/// Window compositor's image acquisition. `None` keeps the store dirty.
 pub(crate) fn present_nonblocking(
     gpu: &'static Gpu,
     layer: usize,
@@ -990,8 +976,8 @@ fn present_impl(
                         let rate = sdl3::video::cached_window_refresh_rate(window as sdl3::Window)
                             .unwrap_or(60.0)
                             .max(30.0);
-                        swapchain.fifo_batch_delay =
-                            Duration::from_secs_f32((0.65 / rate).min(0.004));
+                        swapchain.compositor_batch_delay =
+                            compositor_batch_delay(swapchain.present_mode, rate);
                         registry.get_or_insert_with(HashMap::new).insert(
                             window,
                             Arc::new(WindowSwapchain {
@@ -1004,11 +990,9 @@ fn present_impl(
                                 worker: Mutex::new(None),
                                 resize_worker_started: AtomicBool::new(false),
                                 resize_worker: Mutex::new(None),
-                                fifo_failure: std::sync::atomic::AtomicU8::new(0),
+                                present_failure: std::sync::atomic::AtomicU8::new(0),
                                 #[cfg(test)]
                                 injected_acquire_error: Mutex::new(None),
-                                #[cfg(test)]
-                                injected_nonfifo_acquire_error: Mutex::new(None),
                             }),
                         );
                     }
@@ -1093,7 +1077,7 @@ fn present_impl(
         finish_source(owner.take());
         return Ok(Some(true));
     }
-    match window_swapchain.fifo_failure.load(Ordering::Acquire) {
+    match window_swapchain.present_failure.load(Ordering::Acquire) {
         1 => {
             // SDL_GetWindowSurface is incompatible with a window converted to
             // Vulkan. A lost surface stays unavailable until window teardown;
@@ -1146,20 +1130,19 @@ fn present_impl(
             &holes,
         )),
     };
-    // Core Animation combines independently rendered layers into one
-    // window frame. FIFO cannot queue every layer separately: each queued
-    // image consumes an entire vblank. Keep the updates in a GPU accumulator
-    // and let the FIFO presentation worker display the latest composite.
-    if is_fifo_mode(swapchain.present_mode) {
+    // Core Animation combines independent layers into one window image.
+    // Host WSI presentation mode only determines how that completed image
+    // reaches the display; never enqueue one host present per Metal layer.
+    if uses_layer_compositor(swapchain.present_mode) {
         // The main event pump refreshes this snapshot when the display or its
         // mode changes. Never call main-thread-only SDL APIs from Metal.
         let rate = sdl3::video::cached_window_refresh_rate(frame.window)
             .unwrap_or(60.0)
             .max(30.0);
-        swapchain.fifo_batch_delay = Duration::from_secs_f32((0.65 / rate).min(0.004));
+        swapchain.compositor_batch_delay = compositor_batch_delay(swapchain.present_mode, rate);
         #[cfg(not(test))]
-        ensure_fifo_presentation_worker(window, &window_swapchain);
-        swapchain.fifo_shape = Some(corners::Shape::of(
+        ensure_layer_compositor_worker(window, &window_swapchain);
+        swapchain.composite_shape = Some(corners::Shape::of(
             frame.window,
             swapchain.extent.width,
             swapchain.extent.height,
@@ -1167,12 +1150,12 @@ fn present_impl(
         // Keep the submitted drawable's additional retained reference until
         // staging actually transfers it to a GPU fence. Error paths must not
         // release the ring slot before the dispatcher decides to retry.
-        let staged = swapchain.stage_fifo(frame, source, regions.as_deref(), &mut owner, true);
+        let staged = swapchain.stage_composite(frame, source, regions.as_deref(), &mut owner, true);
         let typed_device_loss =
             swapchain.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
-        let refresh_store = fifo_first_stage_needs_store(joined, &staged, layer, window);
+        let refresh_store = composite_first_stage_needs_store(joined, &staged, layer, window);
         if matches!(staged, Ok(Some(true))) {
-            wake_fifo_worker(&window_swapchain);
+            wake_compositor_worker(&window_swapchain);
         } else if joined {
             swapchain.layers.retain(|&known| known != layer);
         }
@@ -1186,13 +1169,13 @@ fn present_impl(
         return match staged {
             Ok(staged) => Ok(staged),
             Err(reason) if sdl3::video::vulkan::owns_window(frame.window) => {
-                gpu::trace(format!("converted FIFO staging failed: {reason}"));
-                if typed_device_loss || terminal_fifo_staging_failure(&reason) {
+                gpu::trace(format!("converted layer staging failed: {reason}"));
+                if typed_device_loss || terminal_composite_staging_failure(&reason) {
                     if typed_device_loss || reason.contains("ERROR_DEVICE_LOST") {
                         record_device_loss(gpu);
                     } else {
-                        window_swapchain.fifo_failure.store(2, Ordering::Release);
-                        wake_fifo_worker(&window_swapchain);
+                        window_swapchain.present_failure.store(2, Ordering::Release);
+                        wake_compositor_worker(&window_swapchain);
                     }
                     finish_source(owner.take());
                     Ok(Some(true))
@@ -1205,111 +1188,10 @@ fn present_impl(
             Err(reason) => Err(reason),
         };
     }
-    let prepared = swapchain.prepare_present(frame, regions.as_deref(), true);
-    if joined && !matches!(prepared, Ok(Some(_))) {
-        swapchain.layers.retain(|&known| known != layer);
-    }
-    drop(swapchain);
-    let Some((prepared, request)) = prepared? else {
-        return Ok(None);
-    };
-    #[cfg(test)]
-    let injected = window_swapchain
-        .injected_nonfifo_acquire_error
-        .lock()
-        .expect("non-FIFO injection")
-        .take();
-    #[cfg(not(test))]
-    let injected: Option<vk::Result> = None;
-    let acquired = match injected {
-        // Real vkAcquireNextImageKHR out-of-date is normalized to Ok(None).
-        // Fault injection must use the same recovery path.
-        Some(vk::Result::ERROR_OUT_OF_DATE_KHR) => Ok(None),
-        Some(error) => Err(error),
-        None => crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
-            acquire_image(gpu, request, true)
-        }),
-    };
-    if matches!(acquired, Err(vk::Result::TIMEOUT | vk::Result::NOT_READY)) {
-        // The acquire semaphore was never signaled. Do not block AppKit on a
-        // window whose presentation engine has no image ready.
-        if joined {
-            window_swapchain
-                .state
-                .lock()
-                .expect("window swapchain")
-                .layers
-                .retain(|&known| known != layer);
-        }
-        return Ok(None);
-    }
-    let mut swapchain = window_swapchain.state.lock().expect("window swapchain");
-    let owned_drawable = owner.0.is_some();
-    let frame_before = swapchain.frame;
-    let presented = swapchain.finish_present(
-        frame,
-        PresentSource::from(source),
-        regions.as_deref(),
-        owner.take(),
-        prepared,
-        acquired,
-        true,
-    );
-    // A compositor can invalidate WSI without changing requested geometry.
-    // Never let either acquired-image or queue-present recovery rebuild on
-    // AppKit's nonblocking backing-store path.
-    if swapchain.pending_rebuild.is_some() {
-        let retry_owned = std::mem::take(&mut swapchain.deferred_owned);
-        if joined && swapchain.frame == frame_before {
-            // No frame from this newly joined layer was staged.
-            swapchain.layers.retain(|&known| known != layer);
-        }
-        ensure_resize_worker(window, &window_swapchain);
-        wake_resize_worker(&window_swapchain);
-        drop(swapchain);
-        drop(presenting);
-        return Ok(if retry_owned {
-            None
-        } else if owned_drawable {
-            Some(true)
-        } else {
-            None
-        });
-    }
-    if swapchain.acquired_unsubmitted.is_some() {
-        // Consuming an unsubmitted WSI acquisition and retiring its image can
-        // block on the GPU. Leave that to the resize worker too.
-        swapchain.pending_rebuild = Some(swapchain.requested);
-        ensure_resize_worker(window, &window_swapchain);
-        wake_resize_worker(&window_swapchain);
-        drop(swapchain);
-        drop(presenting);
-        return Ok(if owned_drawable { Some(true) } else { None });
-    }
-    drop(swapchain);
-    drop(presenting);
-    if let Ok(Some(error)) = &presented {
-        handle_terminal_error(gpu, &window_swapchain, *error);
-    }
-    // A layer's first frame starts the window's accumulator, which holds
-    // nothing of the window's store yet: the store may have gone straight to
-    // the screen before there was a layer to leave room for. Have it
-    // presented again, around the layer this time.
-    if joined && layer != window {
-        appkit::backing::present_again(frame.window);
-    }
-    // Once a Vulkan swapchain exists, SDL readback is not a legal fallback.
-    // A successful submission may still hold the Metal drawable even if a
-    // later WSI operation or swapchain rebuild failed. Never send that same
-    // drawable to the CPU path and complete its ring slot a second time.
-    match presented {
-        Ok(_) => Ok(Some(true)),
-        Err(reason) if sdl3::video::vulkan::owns_window(frame.window) => {
-            gpu::trace(format!("converted window presentation deferred: {reason}"));
-            Ok(if owned_drawable { Some(true) } else { None })
-        }
-        Err(reason) => Err(reason),
-    }
+    Err(format!(
+        "unsupported Vulkan window presentation mode {:?}",
+        swapchain.present_mode
+    ))
 }
 
 /// Some Gamescope WSI versions omit a present-fence signal when
@@ -1329,76 +1211,93 @@ fn present_fence_will_signal(result: &Result<bool, vk::Result>, gamescope_wsi: b
     )
 }
 
-/// Both vblank-queued modes need layer coalescing. MAILBOX/IMMEDIATE do not.
-fn is_fifo_mode(mode: vk::PresentModeKHR) -> bool {
+/// Core Animation composites Metal layers into a window independently of
+/// when the host display scans out the latest completed composition.
+/// All supported WSI modes share that compositing path.
+fn uses_layer_compositor(mode: vk::PresentModeKHR) -> bool {
     matches!(
         mode,
-        vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+        vk::PresentModeKHR::FIFO
+            | vk::PresentModeKHR::FIFO_RELAXED
+            | vk::PresentModeKHR::MAILBOX
+            | vk::PresentModeKHR::IMMEDIATE
     )
 }
 
-fn frame_slots(mode: vk::PresentModeKHR) -> usize {
-    if is_fifo_mode(mode) {
-        FRAMES_IN_FLIGHT
+/// Bound source-copy work independently of WSI's own image count. A guest
+/// drawing multiple layers per frame should not wait for each WSI image.
+fn frame_slots(_mode: vk::PresentModeKHR) -> usize {
+    FRAMES_IN_FLIGHT
+}
+
+/// In immediate mode the compositor publishes promptly, while FIFO's longer
+/// window batch gathers a full refresh's independent layer changes. Neither
+/// timer changes the guest's command-buffer ordering or source completion.
+fn compositor_batch_delay(mode: vk::PresentModeKHR, rate: f32) -> Duration {
+    let rate = rate.max(30.0);
+    if matches!(
+        mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) {
+        Duration::from_secs_f32((0.35 / rate).min(0.002))
     } else {
-        2
+        Duration::from_secs_f32((0.65 / rate).min(0.004))
     }
 }
 
-/// One sleeping presenter per window prevents a blocked/occluded window from
-/// stalling unrelated windows. It is started lazily, also after a rebuild
-/// changes a window's presentation mode to FIFO.
-fn ensure_fifo_presentation_worker(window: usize, entry: &Arc<WindowSwapchain>) {
+/// One presentation worker per window prevents an occluded window from
+/// stalling other windows and decouples Metal drawables from WSI acquisitions.
+fn ensure_layer_compositor_worker(window: usize, entry: &Arc<WindowSwapchain>) {
     if entry.worker_started.swap(true, Ordering::AcqRel) {
         return;
     }
     let worker_entry = Arc::clone(entry);
     let handle = std::thread::Builder::new()
-        .name("rosemary-fifo-present".into())
-        .spawn(move || fifo_presentation_worker(window, worker_entry))
-        .expect("FIFO presenter thread");
+        .name("rosemary-layer-present".into())
+        .spawn(move || layer_compositor_worker(window, worker_entry))
+        .expect("layer presenter thread");
     // Started under the window presentation mutex, so forget_window cannot
     // run between launching the worker and recording its join handle.
-    *entry.worker.lock().expect("FIFO worker") = Some(handle);
+    *entry.worker.lock().expect("layer compositor worker") = Some(handle);
 }
 
-fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
+fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
     let mut prepare_failures = 0u32;
     let mut acquire_timeouts = 0u32;
     loop {
-        // Wait without polling when clean. The writer sets fifo_dirty under
+        // Wait without polling when clean. The writer sets composite_dirty under
         // the same mutex before signaling us, so notifications are not lost.
         let mut state = entry.state.lock().expect("window swapchain");
-        while !state.fifo_dirty
+        while !state.composite_dirty
             && entry.alive.load(Ordering::Acquire)
             && !entry.gpu.lost.load(Ordering::Acquire)
-            && entry.fifo_failure.load(Ordering::Acquire) == 0
+            && entry.present_failure.load(Ordering::Acquire) == 0
         {
             // The idle worker must not retain a window or device after
             // terminal loss. Unlike Condvar notification, unpark's token is
             // retained when a loss races the transition to sleep.
             #[cfg(test)]
-            TEST_FIFO_IDLE_PARKED.store(window, Ordering::Release);
+            TEST_COMPOSITOR_IDLE_PARKED.store(window, Ordering::Release);
             drop(state);
             std::thread::park();
             #[cfg(test)]
-            TEST_FIFO_IDLE_PARKED.store(0, Ordering::Release);
+            TEST_COMPOSITOR_IDLE_PARKED.store(0, Ordering::Release);
             state = entry.state.lock().expect("window swapchain");
         }
         if !entry.alive.load(Ordering::Acquire)
             || entry.gpu.lost.load(Ordering::Acquire)
-            || entry.fifo_failure.load(Ordering::Acquire) != 0
+            || entry.present_failure.load(Ordering::Acquire) != 0
         {
             return;
         }
         if let Some(remaining) = state
-            .fifo_dirty_since
-            .and_then(|since| state.fifo_batch_delay.checked_sub(since.elapsed()))
+            .composite_dirty_since
+            .and_then(|since| state.compositor_batch_delay.checked_sub(since.elapsed()))
         {
             let _wait = entry
                 .wake
                 .wait_timeout(state, remaining)
-                .expect("FIFO batch wait");
+                .expect("compositor batch wait");
             continue;
         }
         drop(state);
@@ -1413,10 +1312,10 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
         let mut state = entry.state.lock().expect("window swapchain");
         // A resize may have reset the accumulator while we acquired the
         // presentation lock. Do not try to submit a retired image.
-        if !is_fifo_mode(state.present_mode) || !state.fifo_dirty {
+        if !uses_layer_compositor(state.present_mode) || !state.composite_dirty {
             continue;
         }
-        let prepared = state.prepare_fifo(window as sdl3::Window);
+        let prepared = state.prepare_composite(window as sdl3::Window);
         let typed_device_loss = state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
         let gpu = state.gpu;
         drop(state);
@@ -1428,7 +1327,7 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     record_device_loss(gpu);
                     return;
                 }
-                if recoverable_fifo_rebuild_failure(&error) {
+                if recoverable_composite_rebuild_failure(&error) {
                     prepare_failures = 0;
                     drop(_presenting);
                     std::thread::sleep(Duration::from_millis(80));
@@ -1437,9 +1336,9 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 prepare_failures += 1;
                 if prepare_failures >= 3 {
                     gpu::trace(format!(
-                        "FIFO disabled after persistent preparation failures: {error}"
+                        "presentation disabled after persistent preparation failures: {error}"
                     ));
-                    entry.fifo_failure.store(2, Ordering::Release);
+                    entry.present_failure.store(2, Ordering::Release);
                     return;
                 }
                 drop(_presenting);
@@ -1456,28 +1355,28 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
         #[cfg(not(test))]
         let injected: Option<vk::Result> = None;
         let acquired = match injected {
-            Some(error) => FifoAcquire::Terminal(error),
+            Some(error) => CompositorAcquire::Terminal(error),
             None => crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
-                acquire_fifo_image(gpu, prepared.request, acquire_timeouts == 0)
+                acquire_compositor_image(gpu, prepared.request, acquire_timeouts == 0)
             }),
         };
-        if matches!(acquired, FifoAcquire::TimedOut) {
+        if matches!(acquired, CompositorAcquire::TimedOut) {
             // Retain the dirty accumulator. Only this window waits; another
             // window's presenter is completely independent. Wait with the
             // presentation lock released: a minimized or occluded window can
             // time out indefinitely, and every producer needs that lock.
             acquire_timeouts = acquire_timeouts.saturating_add(1);
             drop(_presenting);
-            std::thread::sleep(fifo_acquire_backoff(acquire_timeouts));
+            std::thread::sleep(compositor_acquire_backoff(acquire_timeouts));
             continue;
         }
         acquire_timeouts = 0;
         let ready = match acquired {
-            FifoAcquire::Ready(frame) => frame,
-            FifoAcquire::TimedOut => unreachable!(),
-            FifoAcquire::Terminal(error) => {
+            CompositorAcquire::Ready(frame) => frame,
+            CompositorAcquire::TimedOut => unreachable!(),
+            CompositorAcquire::Terminal(error) => {
                 gpu::trace(format!(
-                    "FIFO disabled after terminal WSI acquire error: {error:?}"
+                    "presentation disabled after terminal WSI acquire error: {error:?}"
                 ));
                 drop(_presenting);
                 handle_terminal_error(gpu, &entry, error);
@@ -1486,7 +1385,7 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
         };
         let mut state = entry.state.lock().expect("window swapchain");
         let old_swapchain = state.handle;
-        match state.complete_fifo(prepared, Ok(ready)) {
+        match state.complete_composite(prepared, Ok(ready)) {
             Ok(None) => {
                 prepare_failures = 0;
                 if state.handle != old_swapchain {
@@ -1500,7 +1399,7 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
             }
             Ok(Some(error)) => {
                 gpu::trace(format!(
-                    "FIFO disabled after terminal queue presentation error: {error:?}"
+                    "presentation disabled after terminal queue presentation error: {error:?}"
                 ));
                 drop(state);
                 drop(_presenting);
@@ -1516,7 +1415,7 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     record_device_loss(gpu);
                     return;
                 }
-                if recoverable_fifo_rebuild_failure(&error) {
+                if recoverable_composite_rebuild_failure(&error) {
                     prepare_failures = 0;
                     drop(state);
                     drop(_presenting);
@@ -1526,12 +1425,12 @@ fn fifo_presentation_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 prepare_failures += 1;
                 if prepare_failures >= 3 {
                     gpu::trace(format!(
-                        "FIFO disabled after persistent presentation failures: {error}"
+                        "presentation disabled after persistent presentation failures: {error}"
                     ));
-                    entry.fifo_failure.store(2, Ordering::Release);
+                    entry.present_failure.store(2, Ordering::Release);
                     return;
                 }
-                gpu::trace(format!("FIFO composite presentation failed: {error}"));
+                gpu::trace(format!("window composite presentation failed: {error}"));
                 drop(state);
                 drop(_presenting);
                 std::thread::sleep(Duration::from_millis(10));
@@ -1544,7 +1443,7 @@ impl Swapchain {
     /// Copy a guest layer into the window accumulator without making the
     /// compositor display an intermediate image. The regular Metal drawable
     /// ownership/fence lifetime still applies to this submission.
-    fn stage_fifo(
+    fn stage_composite(
         &mut self,
         frame: &appkit::view::Frame,
         source: &GpuImage,
@@ -1555,7 +1454,7 @@ impl Swapchain {
         #[cfg(test)]
         if let Some(error) = self.injected_stage_vk_error.take() {
             self.last_wsi_error = Some(error);
-            return Err(format!("injected FIFO staging failure: {error:?}"));
+            return Err(format!("injected composite staging failure: {error:?}"));
         }
         let slot = self.frame % self.frames.len().max(1);
         let this = &self.frames[slot];
@@ -1670,20 +1569,21 @@ impl Swapchain {
         self.frames[slot].submitted = true;
         self.frames[slot].source = owner.take();
         self.frame = self.frame.wrapping_add(1);
-        if !self.fifo_dirty {
-            self.fifo_dirty_since = Some(Instant::now());
+        if !self.composite_dirty {
+            self.composite_dirty_since = Some(Instant::now());
         }
-        self.fifo_dirty = true;
+        self.composite_dirty = true;
         Ok(Some(true))
     }
 
-    /// Present the *whole* accumulator once, instead of putting one FIFO
-    /// entry into the scanout queue for every CAMetalLayer in the window.
-    fn prepare_fifo(&mut self, window: sdl3::Window) -> Result<PreparedFifo, String> {
+    /// Present the whole layer accumulator once instead of placing one
+    /// WSI entry in the display queue for each Metal layer update.
+    fn prepare_composite(&mut self, window: sdl3::Window) -> Result<PreparedComposite, String> {
         if self.retired {
             self.rebuild(self.requested)?;
         }
-        let source = PresentSource::from(self.composite.as_ref().expect("FIFO accumulator"));
+        let source =
+            PresentSource::from(self.composite.as_ref().expect("window layer accumulator"));
         let frame = appkit::view::Frame {
             window,
             x: 0,
@@ -1697,8 +1597,8 @@ impl Swapchain {
         // composite once into the WSI image, with the corner mask applied.
         let (prepared, request) = self
             .prepare_present(&frame, Some(&[]), false)?
-            .ok_or("FIFO worker failed to reserve present frame")?;
-        Ok(PreparedFifo {
+            .ok_or("layer compositor failed to reserve present frame")?;
+        Ok(PreparedComposite {
             frame,
             source,
             prepared,
@@ -1706,9 +1606,9 @@ impl Swapchain {
         })
     }
 
-    fn complete_fifo(
+    fn complete_composite(
         &mut self,
-        ready: PreparedFifo,
+        ready: PreparedComposite,
         acquired: Result<Option<(u32, bool)>, vk::Result>,
     ) -> Result<Option<vk::Result>, String> {
         let before = self.handle;
@@ -1716,30 +1616,30 @@ impl Swapchain {
             &ready.frame,
             ready.source,
             Some(&[]),
-            None,
             ready.prepared,
             acquired,
-            false,
         );
         if self.acquired_unsubmitted.is_some() {
             // A failed WSI copy must consume the acquisition semaphore and
-            // retire the acquired image before another FIFO acquisition.
+            // retire the acquired image before another compositor acquisition.
             if let Err(error) = &result {
-                gpu::trace(format!("FIFO submission dropped after acquire: {error}"));
+                gpu::trace(format!(
+                    "window presentation submission dropped after acquire: {error}"
+                ));
             }
             if let Err(error) = self.recover_unsubmitted_acquire() {
                 // Never retry with unresolved WSI synchronization.
-                gpu::trace(format!("FIFO acquire recovery failed: {error}"));
+                gpu::trace(format!("window acquire recovery failed: {error}"));
                 return Ok(Some(vk::Result::ERROR_UNKNOWN));
             }
             return Ok(None);
         }
         let failed = result?;
-        // An out-of-date rebuild retained the previous FIFO snapshot.
+        // An out-of-date rebuild retained the previous composite snapshot.
         // Clear dirty only when that snapshot reached the new swapchain.
         if failed.is_none() && self.handle == before {
-            self.fifo_dirty = false;
-            self.fifo_dirty_since = None;
+            self.composite_dirty = false;
+            self.composite_dirty_since = None;
         }
         Ok(failed)
     }
@@ -1747,13 +1647,13 @@ impl Swapchain {
     /// Deterministic WSI integration-test entry point. The production worker
     /// has a bounded acquire and does not hold the swapchain-state lock.
     #[cfg(test)]
-    fn flush_fifo(&mut self, window: sdl3::Window) -> Result<(), String> {
-        if !self.fifo_dirty {
+    fn flush_composite(&mut self, window: sdl3::Window) -> Result<(), String> {
+        if !self.composite_dirty {
             return Ok(());
         }
-        let ready = self.prepare_fifo(window)?;
+        let ready = self.prepare_composite(window)?;
         let acquired = acquire_image(self.gpu, ready.request, false);
-        match self.complete_fifo(ready, acquired)? {
+        match self.complete_composite(ready, acquired)? {
             None => Ok(()),
             Some(error) => Err(format!("terminal queue presentation error: {error:?}")),
         }
@@ -2058,10 +1958,10 @@ impl Swapchain {
             frames: frames.take(),
             frame: 0,
             present_mode: vk::PresentModeKHR::FIFO,
-            fifo_dirty: false,
-            fifo_shape: None,
-            fifo_dirty_since: None,
-            fifo_batch_delay: Duration::from_millis(4),
+            composite_dirty: false,
+            composite_shape: None,
+            composite_dirty_since: None,
+            compositor_batch_delay: Duration::from_millis(4),
             last_wsi_error: None,
             #[cfg(test)]
             injected_build_vk_error: None,
@@ -2070,11 +1970,9 @@ impl Swapchain {
             #[cfg(test)]
             injected_queue_present_error: None,
             #[cfg(test)]
-            injected_unsignaled_present_fence: false,
             #[cfg(test)]
             injected_queue_submit_error: None,
             acquired_unsubmitted: None,
-            deferred_owned: false,
             #[cfg(test)]
             injected_recovery_error: None,
             #[cfg(test)]
@@ -2144,7 +2042,7 @@ impl Swapchain {
             return Err("the window has no area to present into".into());
         }
         // DXVK requests the surface minimum for IMMEDIATE and min+1 for
-        // queued modes. Do not expand FIFO's queue to hide per-layer vblanks.
+        // queued modes. Do not expand WSI's queue to hide extra host presents.
         let count = desired_image_count(
             present_mode,
             capabilities.min_image_count,
@@ -2270,12 +2168,12 @@ impl Swapchain {
 
         drop(wsi);
         // A static Metal layer cannot be redrawn by the host after a
-        // resize. Preserve the FIFO GPU accumulator across the replacement.
-        let keep_fifo = is_fifo_mode(self.present_mode)
-            && is_fifo_mode(present_mode)
+        // resize. Preserve the window's GPU composite across the replacement.
+        let keep_fifo = uses_layer_compositor(self.present_mode)
+            && uses_layer_compositor(present_mode)
             && self.composite.is_some();
         let replace_composite = if keep_fifo {
-            let old = self.composite.as_ref().expect("existing FIFO snapshot");
+            let old = self.composite.as_ref().expect("existing window snapshot");
             // The corners pass keeps the composite in its own format, never
             // the swapchain's, so compare with what would be made.
             let description =
@@ -2324,9 +2222,9 @@ impl Swapchain {
         self.acquired_unsubmitted = None;
         self.retired = false;
         self.present_mode = present_mode;
-        self.fifo_dirty = keep_fifo;
-        self.fifo_shape = None;
-        self.fifo_dirty_since = keep_fifo.then(Instant::now);
+        self.composite_dirty = keep_fifo;
+        self.composite_shape = None;
+        self.composite_dirty_since = keep_fifo.then(Instant::now);
         self.format = chosen.format;
         self.extent = extent;
         self.images = images;
@@ -2338,7 +2236,7 @@ impl Swapchain {
             let old = self
                 .composite
                 .replace(replacement)
-                .expect("old FIFO snapshot");
+                .expect("old window snapshot");
             self.gpu.destroy_image(old);
         }
         // A surface that cannot show premultiplied alpha is presented
@@ -2393,15 +2291,6 @@ impl Swapchain {
         // still owns its acquired image until the swapchain is retired.
         self.acquired_unsubmitted = None;
         self.rebuild(self.requested)
-    }
-
-    fn rebuild_or_defer(&mut self, defer: bool) -> Result<(), String> {
-        if defer {
-            self.pending_rebuild = Some(self.requested);
-            Ok(())
-        } else {
-            self.rebuild(self.requested)
-        }
     }
 
     fn rebuild(&mut self, extent: vk::Extent2D) -> Result<(), String> {
@@ -2587,46 +2476,27 @@ impl Swapchain {
         )))
     }
 
-    fn defer_acquired_image(&mut self, owner: &mut AcquiredSource) {
-        self.pending_rebuild = Some(self.requested);
-        if let Some(duplicate) = owner.take() {
-            // The per-device presenter retains the queued drawable itself.
-            // Release only present_owned's additional retained reference;
-            // do not complete the drawable ring before staging a frame.
-            objc::arc::release(duplicate as objc::object::Id);
-            self.deferred_owned = true;
-        }
-    }
-
     /// Finish a prepared frame after the presentation engine returns an image.
     fn finish_present(
         &mut self,
         frame: &appkit::view::Frame,
         source: PresentSource,
         regions: Option<&[Region]>,
-        owner: Option<usize>,
         prepared: PreparedPresent,
         acquired: Result<Option<(u32, bool)>, vk::Result>,
-        defer_rebuild: bool,
     ) -> Result<Option<vk::Result>, String> {
-        let mut owner = AcquiredSource(owner);
-        self.deferred_owned = false;
         // An unsuccessful acquire did not submit this frame. Report its
         // raw Vulkan status to the caller so it can propagate DEVICE_LOST
         // across the logical device and mark SURFACE_LOST window-local.
         let acquired = match acquired {
             Ok(acquired) => acquired,
-            Err(error) => {
-                finish_source(owner.take());
-                return Ok(Some(error));
-            }
+            Err(error) => return Ok(Some(error)),
         };
         let Some((index, _suboptimal)) = acquired else {
             // The swapchain was rebuilt underneath the acquisition. The frame
             // the guest drew is gone, which is what a resize costs; the next
             // one lands in the new swapchain.
-            self.rebuild_or_defer(defer_rebuild)?;
-            finish_source(owner.take());
+            self.rebuild(self.requested)?;
             return Ok(None);
         };
         let PreparedPresent {
@@ -2647,26 +2517,11 @@ impl Swapchain {
         // presentation engine, so the presentation which last waited on this
         // semaphore is finished.
         let blitted = self.blitted[index as usize];
-        #[cfg(test)]
-        if defer_rebuild && std::mem::take(&mut self.injected_unsignaled_present_fence) {
-            // Simulate an unsignaled prior-present fence on drivers which
-            // do not expose VK_EXT_swapchain_maintenance1. The successful
-            // acquired image must remain owned until worker recovery.
-            self.defer_acquired_image(&mut owner);
-            return Ok(None);
-        }
         let present_fence = if let Some(present) = self.presented.get_mut(index as usize) {
             if present.pending {
-                // Acquisition may precede the prior presentation's completion.
-                // Keep its acquired image/semaphore pending for worker-side
-                // retirement instead of waiting indefinitely in AppKit.
-                if defer_rebuild && !self.gpu.wait_fence_timeout(present.fence, 0)? {
-                    self.defer_acquired_image(&mut owner);
-                    return Ok(None);
-                }
-                if !defer_rebuild {
-                    self.gpu.wait(present.fence)?;
-                }
+                // The presentation worker, never the AppKit event pump,
+                // waits for previous use of this image's present fence.
+                self.gpu.wait(present.fence)?;
                 present.pending = false;
             }
             // SAFETY: the fence is either fresh or was waited above, and is
@@ -2788,7 +2643,7 @@ impl Swapchain {
                     }
                     let shown = match &self.corners {
                         Some(corners) => {
-                            let shape = self.fifo_shape.unwrap_or_else(|| {
+                            let shape = self.composite_shape.unwrap_or_else(|| {
                                 corners::Shape::of(
                                     frame.window,
                                     self.extent.width,
@@ -2869,7 +2724,7 @@ impl Swapchain {
         // The acquire semaphore is consumed only after vkQueueSubmit succeeds.
         self.acquired_unsubmitted = None;
         self.frames[slot].submitted = true;
-        self.frames[slot].source = owner.take();
+        self.frames[slot].source = None;
         self.frame = self.frame.wrapping_add(1);
 
         let result = crate::stats::timed(crate::stats::Counter::QueuePresentMicros, || {
@@ -2893,17 +2748,17 @@ impl Swapchain {
                 if suboptimal {
                     // The image still reached the window; the next frame is
                     // the one that gets a swapchain matching it.
-                    self.rebuild_or_defer(defer_rebuild)?;
+                    self.rebuild(self.requested)?;
                 }
                 Ok(None)
             }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                self.rebuild_or_defer(defer_rebuild)?;
+                self.rebuild(self.requested)?;
                 Ok(None)
             }
             Err(error) => {
                 // The blit submission owns its source until the frame fence,
-                // but the FIFO worker must see the terminal error and stop.
+                // but the compositor worker must see terminal errors and stop.
                 gpu::trace(format!("vkQueuePresentKHR failed with {error:?}"));
                 Ok(Some(error))
             }
@@ -2917,15 +2772,19 @@ impl Swapchain {
 /// semaphore untouched, and the dirty accumulator remains pending.
 /// Waits up to a frame for an image when `wait`, and otherwise only polls:
 /// the caller holds the window's presentation lock throughout.
-fn acquire_fifo_image(gpu: &'static Gpu, request: AcquireRequest, wait: bool) -> FifoAcquire {
+fn acquire_compositor_image(
+    gpu: &'static Gpu,
+    request: AcquireRequest,
+    wait: bool,
+) -> CompositorAcquire {
     const TIMEOUT_NS: u64 = 20_000_000;
     let Some(api) = gpu.swapchain_api() else {
-        return FifoAcquire::Terminal(vk::Result::ERROR_DEVICE_LOST);
+        return CompositorAcquire::Terminal(vk::Result::ERROR_DEVICE_LOST);
     };
     let timeout = if wait { TIMEOUT_NS } else { 0 };
     // SAFETY: the live window swapchain and its unused acquisition semaphore
     // remain owned by the worker while it holds the presentation mutex.
-    classify_fifo_acquire(unsafe {
+    classify_compositor_acquire(unsafe {
         api.acquire_next_image(request.handle, timeout, request.semaphore, request.fence)
     })
 }
@@ -2988,21 +2847,22 @@ unsafe fn keep_top_left(
     }
 }
 
-/// How long the FIFO worker sleeps, unlocked, after its `timeouts`th
+/// How long the compositor worker sleeps, unlocked, after its `timeouts`th
 /// acquisition in a row that found no image.
-fn fifo_acquire_backoff(timeouts: u32) -> Duration {
+fn compositor_acquire_backoff(timeouts: u32) -> Duration {
     Duration::from_millis(1 << timeouts.saturating_sub(1).min(5))
 }
 
-fn classify_fifo_acquire(outcome: Result<(u32, bool), vk::Result>) -> FifoAcquire {
+fn classify_compositor_acquire(outcome: Result<(u32, bool), vk::Result>) -> CompositorAcquire {
     match outcome {
-        Ok((index, suboptimal)) => FifoAcquire::Ready(Some((index, suboptimal))),
-        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => FifoAcquire::Ready(None),
-        Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => FifoAcquire::TimedOut,
-        Err(error) => FifoAcquire::Terminal(error),
+        Ok((index, suboptimal)) => CompositorAcquire::Ready(Some((index, suboptimal))),
+        Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => CompositorAcquire::Ready(None),
+        Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => CompositorAcquire::TimedOut,
+        Err(error) => CompositorAcquire::Terminal(error),
     }
 }
 
+#[cfg(test)]
 fn acquire_image(
     gpu: &'static Gpu,
     request: AcquireRequest,
