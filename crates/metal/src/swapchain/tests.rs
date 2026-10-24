@@ -1,5 +1,41 @@
 use super::*;
 
+/// Vulkan graphical tests share SDL video ownership and a singleton GPU;
+/// synthetic failures can poison them across Rust's serial test threads.
+/// Give each scenario its own SDL/Vulkan process while leaving pure tests in
+/// this process. Exact selection prevents recursive execution of the suite.
+pub(crate) fn isolate_vulkan_graphical_test(name: &str) -> bool {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none()
+        || std::env::var_os("ROSEMARY_VULKAN_GRAPHICS_CHILD").is_some()
+    {
+        return false;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+        .arg("--exact")
+        .arg(if name.contains("::") {
+            name.to_owned()
+        } else {
+            format!("swapchain::tests::{name}")
+        })
+        .arg("--nocapture")
+        .env("ROSEMARY_VULKAN_GRAPHICS_CHILD", "1")
+        .output()
+        .expect("start isolated Vulkan graphical test");
+    assert!(
+        output.status.success(),
+        "isolated {name} failed ({:?}):\n{}\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+        "isolated {name} did not execute: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    true
+}
+
 /// Tests run without the background compositor worker, so they can prove several
 /// independent layer copies are coalesced into one actual WSI presentation.
 fn flush_if_composed(window: sdl3::Window) {
@@ -36,6 +72,9 @@ fn flush_if_composed(window: sdl3::Window) {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL main thread required")]
 fn vulkan_graphical_test_prerequisites_are_available() {
+    if isolate_vulkan_graphical_test("vulkan_graphical_test_prerequisites_are_available") {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -175,6 +214,9 @@ fn single_layer_fast_path_requires_an_owned_opaque_full_window() {
 
 #[test]
 fn mailbox_presentation_is_preferred_when_available() {
+    if isolate_vulkan_graphical_test("mailbox_presentation_is_preferred_when_available") {
+        return;
+    }
     assert_eq!(
         choose_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]),
         vk::PresentModeKHR::MAILBOX
@@ -198,6 +240,9 @@ fn mailbox_presentation_is_preferred_when_available() {
     ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
 )]
 fn a_window_is_presented_to_through_its_swapchain() {
+    if isolate_vulkan_graphical_test("a_window_is_presented_to_through_its_swapchain") {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -336,6 +381,9 @@ fn a_window_is_presented_to_through_its_swapchain() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "Cocoa needs the main thread")]
 fn two_composited_windows_present_on_independent_workers() {
+    if isolate_vulkan_graphical_test("two_composited_windows_present_on_independent_workers") {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -665,6 +713,11 @@ fn two_composited_windows_present_on_independent_workers() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL/Cocoa main thread integration")]
 fn slow_window_initialization_does_not_block_other_windows_or_teardown() {
+    if isolate_vulkan_graphical_test(
+        "slow_window_initialization_does_not_block_other_windows_or_teardown",
+    ) {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -746,6 +799,11 @@ fn slow_window_initialization_does_not_block_other_windows_or_teardown() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "Cocoa needs the main thread")]
 fn idle_compositor_worker_exits_on_device_loss_without_new_frames() {
+    if isolate_vulkan_graphical_test(
+        "idle_compositor_worker_exits_on_device_loss_without_new_frames",
+    ) {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -895,6 +953,11 @@ fn initializer_scope_guard_cannot_clear_replacement_token() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL/Cocoa main-thread integration")]
 fn device_loss_before_swapchain_create_cleans_pending_initializer() {
+    if isolate_vulkan_graphical_test(
+        "device_loss_before_swapchain_create_cleans_pending_initializer",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -995,6 +1058,11 @@ fn device_loss_before_swapchain_create_cleans_pending_initializer() {
 
 #[test]
 fn a_transferred_surface_is_retired_once_when_metadata_disappears() {
+    if isolate_vulkan_graphical_test(
+        "a_transferred_surface_is_retired_once_when_metadata_disappears",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -1039,6 +1107,11 @@ fn a_transferred_surface_is_retired_once_when_metadata_disappears() {
 
 #[test]
 fn minimized_window_retries_transient_initialization_after_restore() {
+    if isolate_vulkan_graphical_test(
+        "minimized_window_retries_transient_initialization_after_restore",
+    ) {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -1169,6 +1242,10 @@ fn backing_store_preflight_defers_until_retry_deadline() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL/Cocoa main thread integration")]
 fn unsubmitted_unsignaled_fifo_fence_does_not_stall_next_frame() {
+    if isolate_vulkan_graphical_test("unsubmitted_unsignaled_fifo_fence_does_not_stall_next_frame")
+    {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -1250,6 +1327,9 @@ fn unsubmitted_unsignaled_fifo_fence_does_not_stall_next_frame() {
 
 #[test]
 fn injected_fence_status_and_wait_device_loss_propagate() {
+    if isolate_vulkan_graphical_test("injected_fence_status_and_wait_device_loss_propagate") {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -1275,6 +1355,11 @@ fn injected_fence_status_and_wait_device_loss_propagate() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL main thread")]
 fn fifo_acquire_submit_failure_consumes_semaphore_and_retires_image() {
+    if isolate_vulkan_graphical_test(
+        "fifo_acquire_submit_failure_consumes_semaphore_and_retires_image",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -1371,6 +1456,11 @@ fn fifo_acquire_submit_failure_consumes_semaphore_and_retires_image() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL main thread")]
 fn direct_vulkan_surface_creation_registers_cpu_surface_exclusion() {
+    if isolate_vulkan_graphical_test(
+        "direct_vulkan_surface_creation_registers_cpu_surface_exclusion",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -1467,6 +1557,11 @@ fn v10_fifo_fixture() -> Option<(
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer() {
+    if isolate_vulkan_graphical_test(
+        "single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer",
+    ) {
+        return;
+    }
     let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -1548,6 +1643,10 @@ fn single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn unsignaled_prior_present_fence_does_not_block_acquired_image() {
+    if isolate_vulkan_graphical_test("unsignaled_prior_present_fence_does_not_block_acquired_image")
+    {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -1714,6 +1813,11 @@ fn wsi_effective_extent_change_preserves_direct_layer_without_new_request() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn backing_store_uploads_select_direct_wsi_without_overwriting_inflight_source() {
+    if isolate_vulkan_graphical_test(
+        "backing_store_uploads_select_direct_wsi_without_overwriting_inflight_source",
+    ) {
+        return;
+    }
     let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -1829,6 +1933,11 @@ fn backing_store_uploads_select_direct_wsi_without_overwriting_inflight_source()
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
+    if isolate_vulkan_graphical_test(
+        "backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite",
+    ) {
+        return;
+    }
     let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -1949,6 +2058,11 @@ fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn retained_backing_source_uses_direct_wsi_and_releases_after_gpu_copy() {
+    if isolate_vulkan_graphical_test(
+        "retained_backing_source_uses_direct_wsi_and_releases_after_gpu_copy",
+    ) {
+        return;
+    }
     let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -2010,6 +2124,11 @@ fn retained_backing_source_uses_direct_wsi_and_releases_after_gpu_copy() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn idle_direct_frame_snapshots_once_and_releases_the_source_fence() {
+    if isolate_vulkan_graphical_test(
+        "idle_direct_frame_snapshots_once_and_releases_the_source_fence",
+    ) {
+        return;
+    }
     let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -2086,6 +2205,9 @@ fn idle_direct_frame_snapshots_once_and_releases_the_source_fence() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn direct_single_layer_replays_after_failed_submit() {
+    if isolate_vulkan_graphical_test("direct_single_layer_replays_after_failed_submit") {
+        return;
+    }
     let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -2121,6 +2243,11 @@ fn direct_single_layer_replays_after_failed_submit() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn fifo_static_layer_survives_out_of_date_recreation_without_guest_redraw() {
+    if isolate_vulkan_graphical_test(
+        "fifo_static_layer_survives_out_of_date_recreation_without_guest_redraw",
+    ) {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -2158,6 +2285,11 @@ fn fifo_static_layer_survives_out_of_date_recreation_without_guest_redraw() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn fifo_out_of_date_acquire_replays_static_layers_without_guest_submit() {
+    if isolate_vulkan_graphical_test(
+        "fifo_out_of_date_acquire_replays_static_layers_without_guest_submit",
+    ) {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -2193,6 +2325,9 @@ fn fifo_out_of_date_acquire_replays_static_layers_without_guest_submit() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn fifo_out_of_date_queue_present_replays_static_layers() {
+    if isolate_vulkan_graphical_test("fifo_out_of_date_queue_present_replays_static_layers") {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -2221,6 +2356,9 @@ fn fifo_out_of_date_queue_present_replays_static_layers() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn fifo_window_resize_keeps_snapshot_without_new_drawable() {
+    if isolate_vulkan_graphical_test("fifo_window_resize_keeps_snapshot_without_new_drawable") {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -2290,6 +2428,11 @@ fn fifo_window_resize_keeps_snapshot_without_new_drawable() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn secondary_acquire_recovery_failure_waits_wsi_fence_on_teardown() {
+    if isolate_vulkan_graphical_test(
+        "secondary_acquire_recovery_failure_waits_wsi_fence_on_teardown",
+    ) {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -2323,6 +2466,9 @@ fn secondary_acquire_recovery_failure_waits_wsi_fence_on_teardown() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn failed_recreation_never_reuses_retired_old_swapchain() {
+    if isolate_vulkan_graphical_test("failed_recreation_never_reuses_retired_old_swapchain") {
+        return;
+    }
     let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
         return;
     };
@@ -2379,6 +2525,16 @@ fn initialization_retry_frequency_is_bounded_without_blacklisting() {
 
 #[test]
 fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
+    if isolate_vulkan_graphical_test(
+        "device_loss_during_swapchain_initialization_does_not_relock_registry",
+    ) {
+        return;
+    }
+    if isolate_vulkan_graphical_test(
+        "device_loss_during_swapchain_initialization_does_not_relock_registry",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -2477,6 +2633,9 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
     ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
 )]
 fn two_layers_in_a_window_are_composited_into_one_image() {
+    if isolate_vulkan_graphical_test("two_layers_in_a_window_are_composited_into_one_image") {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -2579,6 +2738,9 @@ fn two_layers_in_a_window_are_composited_into_one_image() {
     ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
 )]
 fn a_transparent_window_is_presented_through_the_corners_pass() {
+    if isolate_vulkan_graphical_test("a_transparent_window_is_presented_through_the_corners_pass") {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -2675,6 +2837,9 @@ fn a_transparent_window_is_presented_through_the_corners_pass() {
     ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
 )]
 fn an_opengl_window_is_refused_rather_than_converted() {
+    if isolate_vulkan_graphical_test("an_opengl_window_is_refused_rather_than_converted") {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -2757,6 +2922,11 @@ fn an_opengl_window_is_refused_rather_than_converted() {
     ignore = "Cocoa needs the main thread; use rosemary's Metal guest tests"
 )]
 fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
+    if isolate_vulkan_graphical_test(
+        "a_layer_on_a_guests_own_window_is_presented_through_a_swapchain",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -3210,6 +3380,11 @@ fn a_covering_layer_fills_a_swapchain_extent_that_lags_its_window() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "requires a Fedora X11 Vulkan window")]
 fn a_shrunken_guest_fullscreen_is_presented_through_the_vulkan_swapchain() {
+    if isolate_vulkan_graphical_test(
+        "a_shrunken_guest_fullscreen_is_presented_through_the_vulkan_swapchain",
+    ) {
+        return;
+    }
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
@@ -3452,6 +3627,11 @@ fn a_shrunken_guest_fullscreen_is_presented_through_the_vulkan_swapchain() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "requires a non-Cocoa SDL host")]
 fn a_fractional_metal_layer_samples_exactly_its_rounded_destination_edges() {
+    if isolate_vulkan_graphical_test(
+        "a_fractional_metal_layer_samples_exactly_its_rounded_destination_edges",
+    ) {
+        return;
+    }
     crate::bootstrap();
     let pool = objc::arc::pool_push();
     let class = objc::class::lookup(c"NSWindow").unwrap();
@@ -3772,6 +3952,11 @@ fn a_fifo_window_that_keeps_timing_out_backs_off_to_a_bound() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "Cocoa needs the main thread")]
 fn minimized_compositor_recovers_after_repeated_zero_extent_rebuilds() {
+    if isolate_vulkan_graphical_test(
+        "minimized_compositor_recovers_after_repeated_zero_extent_rebuilds",
+    ) {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -3883,6 +4068,11 @@ fn minimized_compositor_recovers_after_repeated_zero_extent_rebuilds() {
 
 #[test]
 fn unsupported_sdl_surface_falls_back_without_permanent_transient_blacklisting() {
+    if isolate_vulkan_graphical_test(
+        "unsupported_sdl_surface_falls_back_without_permanent_transient_blacklisting",
+    ) {
+        return;
+    }
     let permanent = sdl3::video::vulkan::SurfaceFailure {
         reason: "SDL Vulkan not supported on window surface".into(),
         transient: false,
@@ -3923,6 +4113,9 @@ fn unsupported_sdl_surface_falls_back_without_permanent_transient_blacklisting()
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "SDL/Cocoa main thread integration")]
 fn failed_async_rebuild_does_not_register_unpresented_layer() {
+    if isolate_vulkan_graphical_test("failed_async_rebuild_does_not_register_unpresented_layer") {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -4254,6 +4447,11 @@ fn v17_async_window_fixture() -> Option<(
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn stalled_resize_cannot_hold_appkit_window_destruction_or_destroy_sdl_early() {
+    if isolate_vulkan_graphical_test(
+        "stalled_resize_cannot_hold_appkit_window_destruction_or_destroy_sdl_early",
+    ) {
+        return;
+    }
     let Some((window, gpu, source, frame, entry)) = v17_async_window_fixture() else {
         return;
     };
@@ -4340,6 +4538,11 @@ impl Drop for AwaitTestWindowRetirements {
 /// rehome the guest's popup before retiring the child's old GPU swapchain.
 #[test]
 fn appkit_parent_remake_retires_gpu_backed_popup_without_dangling_nswindow() {
+    if isolate_vulkan_graphical_test(
+        "appkit_parent_remake_retires_gpu_backed_popup_without_dangling_nswindow",
+    ) {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -4489,6 +4692,11 @@ fn appkit_parent_remake_retires_gpu_backed_popup_without_dangling_nswindow() {
 /// reports completion without attempting an invalid fallback.
 #[test]
 fn converted_fifo_staging_failure_never_uses_cpu_fallback_or_dirties_first_layer() {
+    if isolate_vulkan_graphical_test(
+        "converted_fifo_staging_failure_never_uses_cpu_fallback_or_dirties_first_layer",
+    ) {
+        return;
+    }
     assert!(!composite_first_stage_needs_store(true, &Ok(None), 42, 7));
     assert!(!composite_first_stage_needs_store(
         true,
@@ -4590,6 +4798,9 @@ fn converted_fifo_staging_failure_never_uses_cpu_fallback_or_dirties_first_layer
 
 #[test]
 fn asynchronous_resize_device_loss_notifies_other_windows() {
+    if isolate_vulkan_graphical_test("asynchronous_resize_device_loss_notifies_other_windows") {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     let Some((first, gpu, first_source, _, first_entry)) = v17_async_window_fixture() else {
         return;
@@ -4637,6 +4848,11 @@ fn asynchronous_resize_device_loss_notifies_other_windows() {
 
 #[test]
 fn compositor_preparation_device_loss_wakes_other_window_workers() {
+    if isolate_vulkan_graphical_test(
+        "compositor_preparation_device_loss_wakes_other_window_workers",
+    ) {
+        return;
+    }
     let _retire_guard = AwaitTestWindowRetirements;
     let Some((first, gpu, first_source, _, first_entry)) = v17_async_window_fixture() else {
         return;

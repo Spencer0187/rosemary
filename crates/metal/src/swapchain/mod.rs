@@ -2,6 +2,8 @@ mod corners;
 mod present;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::isolate_vulkan_graphical_test;
 
 use present::*;
 

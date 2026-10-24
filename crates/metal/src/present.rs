@@ -1531,11 +1531,34 @@ fn make_blended_source(
         .map(|image| crate::swapchain::BackingImageLease::new(gpu, image))
 }
 
-/// Select a source that is not read by an outstanding compositor copy.
-/// The allocation cap applies independently to regular and blended stores.
+// A 4K BGRA8 image occupies about 31.6 MiB of pixel payload. This allowance
+// covers both reusable source pools together, not each pool independently.
+// GPU allocation requirements may exceed the payload due to alignment.
+const STORE_SOURCE_BUDGET_BYTES: u64 = 192 * 1024 * 1024;
+const MAX_IMAGES_PER_STORE_POOL: usize = 8;
+
+fn store_source_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4)
+}
+
+fn budget_allows_store_source(current_images: usize, bytes_per_image: u64) -> bool {
+    (current_images as u64)
+        .saturating_add(1)
+        .saturating_mul(bytes_per_image)
+        <= STORE_SOURCE_BUDGET_BYTES
+}
+
+/// Select an image that no compositor copy can still read. If every existing
+/// source is busy, allow another only within both the pool count and combined
+/// per-window pixel-storage allowance. Defer rather than overwriting busy GPU
+/// memory when the allowance is exhausted.
 fn reserve_backing_source(
     image: &mut std::sync::Arc<crate::swapchain::BackingImageLease>,
     spare: &mut Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
+    current_images: usize,
+    bytes_per_image: u64,
     create: impl FnOnce() -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String>,
 ) -> Result<bool, String> {
     if std::sync::Arc::strong_count(image) == 1 {
@@ -1547,8 +1570,9 @@ fn reserve_backing_source(
     let replacement = if let Some(at) = available {
         spare.swap_remove(at)
     } else {
-        const MAX_BACKING_SOURCE_IMAGES: usize = 8;
-        if spare.len() + 1 >= MAX_BACKING_SOURCE_IMAGES {
+        if spare.len() + 1 >= MAX_IMAGES_PER_STORE_POOL
+            || !budget_allows_store_source(current_images, bytes_per_image)
+        {
             return Ok(false);
         }
         create()?
@@ -1574,22 +1598,39 @@ impl StoreImage {
     /// Select an image no outstanding WSI copy can read. An occluded window
     /// can exhaust the pool; return `Ok(false)` so the store worker retries
     /// without holding up AppKit or allocating images without bound.
+    fn total_source_images(&self) -> usize {
+        1 + self.spare.len() + usize::from(self.blended.is_some()) + self.blended_spare.len()
+    }
+
     fn reserve_upload_source(&mut self) -> Result<bool, String> {
         let (width, height) = (self.image.width, self.image.height);
-        reserve_backing_source(&mut self.image, &mut self.spare, || {
-            make_backing_source(self.gpu, width, height)
-        })
+        let current_images = self.total_source_images();
+        reserve_backing_source(
+            &mut self.image,
+            &mut self.spare,
+            current_images,
+            store_source_bytes(width, height),
+            || make_backing_source(self.gpu, width, height),
+        )
     }
 
     fn reserve_blended_source(&mut self) -> Result<bool, String> {
         let (width, height) = (self.image.width, self.image.height);
         if self.blended.is_none() {
+            // At very large extents the first source for each of the two
+            // formats is mandatory for forward progress. These two sources
+            // may exceed the soft per-window pixel-payload allowance.
             self.blended = Some(make_blended_source(self.gpu, width, height)?);
         }
+        let current_images = self.total_source_images();
         let blended = self.blended.as_mut().expect("made above");
-        reserve_backing_source(blended, &mut self.blended_spare, || {
-            make_blended_source(self.gpu, width, height)
-        })
+        reserve_backing_source(
+            blended,
+            &mut self.blended_spare,
+            current_images,
+            store_source_bytes(width, height),
+            || make_blended_source(self.gpu, width, height),
+        )
     }
 
     /// Every presentation that could name one of its images has finished.
@@ -1598,6 +1639,120 @@ impl StoreImage {
         // All regular and blended sources have ref-counted GPU lifetimes;
         // the WSI worker may still be reading one when this store retires.
     }
+}
+
+#[cfg(test)]
+#[test]
+fn backing_store_budget_adapts_to_resolution_across_both_pools() {
+    let image4k = store_source_bytes(3840, 2160);
+    assert_eq!(image4k, 33_177_600);
+    assert!(budget_allows_store_source(5, image4k));
+    assert!(!budget_allows_store_source(6, image4k));
+    assert!(budget_allows_store_source(
+        23,
+        store_source_bytes(1920, 1080)
+    ));
+    assert!(!budget_allows_store_source(
+        24,
+        store_source_bytes(1920, 1080)
+    ));
+    let image8k = store_source_bytes(7680, 4320);
+    assert!(!budget_allows_store_source(2, image8k));
+    assert!(store_source_bytes(u32::MAX, u32::MAX) > STORE_SOURCE_BUDGET_BYTES);
+}
+
+/// Explicitly opt in to a real 4K GPU allocation stress case; it is not
+/// suitable for every CI GPU's available memory. The two pools share the same
+/// byte allowance, including when each has in-flight source leases.
+#[cfg(test)]
+#[test]
+fn real_4k_backing_and_overlay_pools_respect_combined_budget() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN_BUDGET").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .expect("Vulkan adapter")
+        .first()
+        .expect("GPU")
+        .gpu()
+        .expect("GPU device");
+    let dimensions = (3840, 2160);
+    let image = make_backing_source(gpu, dimensions.0, dimensions.1).expect("4K backing image");
+    let staging = gpu
+        .create_buffer(store_source_bytes(dimensions.0, dimensions.1))
+        .expect("4K upload buffer");
+    let mut store = StoreImage {
+        gpu,
+        image,
+        spare: Vec::new(),
+        staging,
+        blended: None,
+        blended_spare: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    store.reserve_blended_source().expect("4K blended image");
+    let mut regular_held = Vec::new();
+    let mut blended_held = Vec::new();
+    for _ in 0..2 {
+        regular_held.push(std::sync::Arc::clone(&store.image));
+        assert!(
+            store
+                .reserve_upload_source()
+                .expect("4K upload source rotation")
+        );
+        blended_held.push(std::sync::Arc::clone(store.blended.as_ref().unwrap()));
+        assert!(
+            store
+                .reserve_blended_source()
+                .expect("4K overlay source rotation")
+        );
+    }
+    assert_eq!(store.total_source_images(), 6);
+    let image_bytes = store_source_bytes(dimensions.0, dimensions.1);
+    assert_eq!(
+        store.total_source_images() as u64 * image_bytes,
+        199_065_600
+    );
+    regular_held.push(std::sync::Arc::clone(&store.image));
+    blended_held.push(std::sync::Arc::clone(store.blended.as_ref().unwrap()));
+    assert!(!store.reserve_upload_source().expect("4K combined budget"));
+    assert!(!store.reserve_blended_source().expect("4K combined budget"));
+    let allocation_millis = started.elapsed().as_millis();
+    // This is the real Vulkan memory requirement, including the driver's
+    // alignment, not merely the modeled RGBA8 pixel payload.
+    let allocated_vk_bytes: u64 = std::iter::once(&store.image)
+        .chain(store.spare.iter())
+        .chain(store.blended.iter())
+        .chain(store.blended_spare.iter())
+        .map(|lease| unsafe {
+            gpu.device
+                .get_image_memory_requirements(lease.image.image)
+                .size
+        })
+        .sum();
+    assert!(
+        allocated_vk_bytes <= STORE_SOURCE_BUDGET_BYTES,
+        "4K Vulkan image allocations exceeded the shared source allowance"
+    );
+    drop(regular_held);
+    drop(blended_held);
+    let old = std::sync::Arc::clone(&store.image);
+    assert!(
+        store
+            .reserve_upload_source()
+            .expect("reuse retired 4K source")
+    );
+    assert_eq!(store.total_source_images(), 6);
+    drop(old);
+    eprintln!(
+        "4K store allocation: {} images, {} bytes pixel payload ({} MiB), {} bytes Vulkan image memory requirements, {} ms wall clock; reused existing slot without allocating",
+        6,
+        6 * image_bytes,
+        6 * image_bytes / 1024 / 1024,
+        allocated_vk_bytes,
+        allocation_millis
+    );
+    store.destroy();
 }
 
 #[cfg(test)]
@@ -1999,6 +2154,11 @@ fn converted_vulkan_window_preserves_dirty_store_after_gpu_failure() {
 #[cfg(test)]
 #[test]
 fn lost_vulkan_gpu_retains_unconverted_window_cpu_fallback() {
+    if crate::swapchain::isolate_vulkan_graphical_test(
+        "present::lost_vulkan_gpu_retains_unconverted_window_cpu_fallback",
+    ) {
+        return;
+    }
     use appkit::backing::PresentOutcome::Fallback;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
