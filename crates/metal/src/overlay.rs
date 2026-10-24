@@ -338,10 +338,17 @@ pub(crate) struct Placement {
     pub clip_height: u32,
     /// Core Animation opacity multiplies the entire premultiplied source.
     pub opacity: f32,
+    /// Only the scene compositor uses this to clear a damaged subrectangle.
+    /// The DMA-BUF overlay path always uses source-over (false).
+    pub clear: bool,
+    /// Index and length of consecutive rounded CA ancestor masks in the
+    /// scene's per-frame GPU clip buffer (zero for ordinary overlays).
+    pub round_start: u32,
+    pub round_count: u32,
 }
 
 impl Placement {
-    pub(crate) fn bytes(&self) -> [u8; 44] {
+    pub(crate) fn bytes(&self) -> [u8; 56] {
         let words = [
             self.x as u32,
             self.y as u32,
@@ -354,8 +361,11 @@ impl Placement {
             self.clip_width,
             self.clip_height,
             self.opacity.to_bits(),
+            u32::from(self.clear),
+            self.round_start,
+            self.round_count,
         ];
-        let mut bytes = [0; 44];
+        let mut bytes = [0; 56];
         for (at, word) in words.into_iter().enumerate() {
             bytes[at * 4..at * 4 + 4].copy_from_slice(&word.to_ne_bytes());
         }
@@ -643,6 +653,9 @@ pub(crate) fn blend<'a>(
                     clip_width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
                     clip_height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
                     opacity: 1.0,
+                    clear: false,
+                    round_start: 0,
+                    round_count: 0,
                 };
                 if placement.width == 0 || placement.height == 0 {
                     continue;
@@ -818,14 +831,21 @@ unsafe fn general_barrier(
 /// }
 /// ```
 pub(crate) fn shader() -> Vec<u32> {
-    build_shader().expect("the overlay shader is well formed")
+    build_shader(false).expect("the overlay shader is well formed")
 }
 
-fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
+/// The scene shader additionally reads variable-length rounded masks. The
+/// ordinary DMA-BUF overlay shader keeps the original two bindings.
+pub(crate) fn scene_shader() -> Vec<u32> {
+    build_shader(true).expect("the rounded scene shader is well formed")
+}
+
+fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     use spirv::{Decoration, StorageClass};
     let mut b = Builder::new();
     b.set_version(1, 0);
     b.capability(spirv::Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
     b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
 
     let void = b.type_void();
@@ -862,6 +882,31 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let storage_pointer = b.type_pointer(None, StorageClass::UniformConstant, storage);
     let overlay = b.variable(sampled_pointer, None, StorageClass::UniformConstant, None);
     let target = b.variable(storage_pointer, None, StorageClass::UniformConstant, None);
+    let rounded = if scene {
+        // A runtime array of pairs of vec4: (left,top,right,bottom) and
+        // (radius,0,0,0). The GPU loop handles any number of ancestor masks.
+        let array = b.type_runtime_array(vec4);
+        b.decorate(array, Decoration::ArrayStride, [Operand::LiteralBit32(16)]);
+        let block = b.type_struct([array]);
+        b.decorate(block, Decoration::Block, []);
+        b.member_decorate(block, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+        let ptr = b.type_pointer(None, StorageClass::StorageBuffer, block);
+        let variable = b.variable(ptr, None, StorageClass::StorageBuffer, None);
+        b.decorate(
+            variable,
+            Decoration::DescriptorSet,
+            [Operand::LiteralBit32(0)],
+        );
+        b.decorate(variable, Decoration::Binding, [Operand::LiteralBit32(2)]);
+        Some(variable)
+    } else {
+        None
+    };
+    let rounded_vec_pointer = if scene {
+        Some(b.type_pointer(None, StorageClass::StorageBuffer, vec4))
+    } else {
+        None
+    };
     for (variable, binding) in [(overlay, 0), (target, 1)] {
         b.decorate(
             variable,
@@ -876,10 +921,10 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     }
 
     let placement = b.type_struct([
-        int, int, uint, uint, uint, uint, int, int, uint, uint, float,
+        int, int, uint, uint, uint, uint, int, int, uint, uint, float, uint, uint, uint,
     ]);
     b.decorate(placement, Decoration::Block, []);
-    for member in 0..11 {
+    for member in 0..14 {
         b.member_decorate(
             placement,
             member,
@@ -908,6 +953,16 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let function = b.type_function(void, []);
     let main = b.begin_function(void, None, spirv::FunctionControl::NONE, function)?;
     b.begin_block(None)?;
+    let (round_index, coverage) = if scene {
+        let uint_var = b.type_pointer(None, StorageClass::Function, uint);
+        let float_var = b.type_pointer(None, StorageClass::Function, float);
+        (
+            Some(b.variable(uint_var, None, StorageClass::Function, None)),
+            Some(b.variable(float_var, None, StorageClass::Function, None)),
+        )
+    } else {
+        (None, None)
+    };
     let member = |b: &mut Builder, at: u32, pointer: u32, ty: u32| {
         let at = b.constant_bit32(int, at);
         let address = b.access_chain(pointer, None, placement, [at])?;
@@ -925,6 +980,9 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let clip_height = member(&mut b, 9, uint_pointer, uint)?;
     let float_pointer = b.type_pointer(None, StorageClass::PushConstant, float);
     let opacity = member(&mut b, 10, float_pointer, float)?;
+    let clear = member(&mut b, 11, uint_pointer, uint)?;
+    let round_start = member(&mut b, 12, uint_pointer, uint)?;
+    let round_count = member(&mut b, 13, uint_pointer, uint)?;
     let target_width = b.bitcast(int, None, target_width)?;
     let target_height = b.bitcast(int, None, target_height)?;
     let global = b.load(uvec3, None, id, None, [])?;
@@ -950,6 +1008,22 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.branch_conditional(inside, body, merge, [])?;
 
     b.begin_block(Some(body))?;
+    // The damaged-area clear uses this same storage image and deliberately
+    // skips texture sampling. It does not need a separate Vulkan render pass.
+    let zero_uint = b.constant_bit32(uint, 0);
+    let is_clear = b.i_not_equal(boolean, None, clear, zero_uint)?;
+    let clearing = b.id();
+    let blending = b.id();
+    let complete = b.id();
+    b.selection_merge(complete, spirv::SelectionControl::NONE)?;
+    b.branch_conditional(is_clear, clearing, blending, [])?;
+    b.begin_block(Some(clearing))?;
+    let at = b.composite_construct(ivec2, None, [at_x, at_y])?;
+    let image = b.load(storage, None, target, None, [])?;
+    let transparent = b.constant_composite(vec4, [zero, zero, zero, zero]);
+    b.image_write(image, at, transparent, None, [])?;
+    b.branch(complete)?;
+    b.begin_block(Some(blending))?;
     let source_x = b.i_sub(int, None, at_x, x)?;
     let source_y = b.i_sub(int, None, at_y, y)?;
     let u = b.convert_s_to_f(float, None, source_x)?;
@@ -971,6 +1045,107 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
         [Operand::IdRef(zero)],
     )?;
     let over = b.vector_times_scalar(vec4, None, over, opacity)?;
+    let over = if let (Some(buffer), Some(ptr), Some(index_var), Some(coverage_var)) =
+        (rounded, rounded_vec_pointer, round_index, coverage)
+    {
+        let zero_uint = b.constant_bit32(uint, 0);
+        let one_uint = b.constant_bit32(uint, 1);
+        let two_uint = b.constant_bit32(uint, 2);
+        let zero_int = b.constant_bit32(int, 0);
+        b.store(index_var, zero_uint, None, [])?;
+        b.store(coverage_var, one, None, [])?;
+        let header = b.id();
+        let body = b.id();
+        let repeat = b.id();
+        let end = b.id();
+        b.branch(header)?;
+        b.begin_block(Some(header))?;
+        let index = b.load(uint, None, index_var, None, [])?;
+        let inside = b.u_less_than(boolean, None, index, round_count)?;
+        b.loop_merge(end, repeat, spirv::LoopControl::NONE, [])?;
+        b.branch_conditional(inside, body, end, [])?;
+        b.begin_block(Some(body))?;
+        let offset = b.i_add(uint, None, round_start, index)?;
+        let offset = b.i_mul(uint, None, offset, two_uint)?;
+        let next = b.i_add(uint, None, offset, one_uint)?;
+        let bounds_ptr = b.access_chain(ptr, None, buffer, [zero_int, offset])?;
+        let params_ptr = b.access_chain(ptr, None, buffer, [zero_int, next])?;
+        let bounds = b.load(vec4, None, bounds_ptr, None, [])?;
+        let params = b.load(vec4, None, params_ptr, None, [])?;
+        let left = b.composite_extract(float, None, bounds, [0])?;
+        let top = b.composite_extract(float, None, bounds, [1])?;
+        let right = b.composite_extract(float, None, bounds, [2])?;
+        let bottom = b.composite_extract(float, None, bounds, [3])?;
+        let radius = b.composite_extract(float, None, params, [0])?;
+        let cx = b.convert_s_to_f(float, None, at_x)?;
+        let cy = b.convert_s_to_f(float, None, at_y)?;
+        let cx = b.f_add(float, None, cx, half)?;
+        let cy = b.f_add(float, None, cy, half)?;
+        let left_radius = b.f_add(float, None, left, radius)?;
+        let right_radius = b.f_sub(float, None, right, radius)?;
+        let top_radius = b.f_add(float, None, top, radius)?;
+        let bottom_radius = b.f_sub(float, None, bottom, radius)?;
+        let dx1 = b.f_sub(float, None, left_radius, cx)?;
+        let dx2 = b.f_sub(float, None, cx, right_radius)?;
+        let dy1 = b.f_sub(float, None, top_radius, cy)?;
+        let dy2 = b.f_sub(float, None, cy, bottom_radius)?;
+        let dx = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dx1), Operand::IdRef(dx2)],
+        )?;
+        let dy = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dy1), Operand::IdRef(dy2)],
+        )?;
+        let dx = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dx), Operand::IdRef(zero)],
+        )?;
+        let dy = b.ext_inst(
+            float,
+            None,
+            glsl,
+            40,
+            [Operand::IdRef(dy), Operand::IdRef(zero)],
+        )?;
+        let delta = b.composite_construct(vec2, None, [dx, dy])?;
+        let distance = b.ext_inst(float, None, glsl, 66, [Operand::IdRef(delta)])?;
+        let cov = b.f_sub(float, None, radius, distance)?;
+        let cov = b.f_add(float, None, cov, half)?;
+        let cov = b.ext_inst(
+            float,
+            None,
+            glsl,
+            43,
+            [
+                Operand::IdRef(cov),
+                Operand::IdRef(zero),
+                Operand::IdRef(one),
+            ],
+        )?;
+        let aggregate = b.load(float, None, coverage_var, None, [])?;
+        let aggregate = b.f_mul(float, None, aggregate, cov)?;
+        b.store(coverage_var, aggregate, None, [])?;
+        b.branch(repeat)?;
+        b.begin_block(Some(repeat))?;
+        let next = b.i_add(uint, None, index, one_uint)?;
+        b.store(index_var, next, None, [])?;
+        b.branch(header)?;
+        b.begin_block(Some(end))?;
+        let aggregate = b.load(float, None, coverage_var, None, [])?;
+        b.vector_times_scalar(vec4, None, over, aggregate)?
+    } else {
+        over
+    };
     let at = b.composite_construct(ivec2, None, [at_x, at_y])?;
     let image = b.load(storage, None, target, None, [])?;
     let under = b.image_read(vec4, None, image, at, None, [])?;
@@ -979,6 +1154,8 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let under = b.vector_times_scalar(vec4, None, under, keep)?;
     let blended = b.f_add(vec4, None, over, under)?;
     b.image_write(image, at, blended, None, [])?;
+    b.branch(complete)?;
+    b.begin_block(Some(complete))?;
     b.branch(merge)?;
 
     b.begin_block(Some(merge))?;
@@ -1015,6 +1192,9 @@ mod tests {
             clip_width: 3,
             clip_height: 4,
             opacity: 0.5,
+            clear: false,
+            round_start: 0,
+            round_count: 0,
         };
         let bytes = placement.bytes();
         assert_eq!(&bytes[0..4], &(-3i32).to_ne_bytes());

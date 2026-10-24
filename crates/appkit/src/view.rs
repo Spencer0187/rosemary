@@ -84,7 +84,16 @@ pub const BOUNDS_DID_CHANGE: &str = "NSViewBoundsDidChangeNotification";
 
 /// A live Metal layer in bottom-to-top AppKit view order. IDs are identities,
 /// not owned Objective-C references: consumers must not dereference them.
+/// A rounded CA masksToBounds ancestor in physical window coordinates.
+/// All nested rounded masks are retained rather than collapsing them into a
+/// rectangular intersection which would reveal corner pixels incorrectly.
 #[derive(Clone, Copy)]
+pub struct RoundedSceneClip {
+    pub frame: Frame,
+    pub radius: f32,
+}
+
+#[derive(Clone)]
 pub struct MetalSceneLayer {
     pub layer: usize,
     pub frame: Frame,
@@ -92,6 +101,7 @@ pub struct MetalSceneLayer {
     pub opaque: bool,
     /// Clip from enclosing AppKit/CA bounds, expressed in physical window pixels.
     pub clip: Option<Frame>,
+    pub rounded: Vec<RoundedSceneClip>,
 }
 
 // SAFETY: a snapshot owns only integer layer identities and a copied SDL
@@ -139,6 +149,7 @@ fn capture_metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
         None,
         1.0,
         std::ptr::null_mut(),
+        &[],
         0,
     );
     Some(result)
@@ -151,6 +162,7 @@ fn visit_metal_scene(
     inherited_clip: Option<Frame>,
     inherited_layer_opacity: f32,
     parent_layer: Id,
+    inherited_rounded: &[RoundedSceneClip],
     depth: usize,
 ) {
     if depth >= 64 || !is_view(view) || view_of(view).hidden != 0 {
@@ -166,6 +178,29 @@ fn visit_metal_scene(
         return;
     }
     let layer_opacity = inherited_layer_opacity * own_layer_opacity;
+    let has_ca_mask = !layer.is_null() && crate::coreanimation::scene_masks_to_bounds(layer);
+    let current_masks = view_of(view).layer_backing & CLIPS_TO_BOUNDS != 0 || has_ca_mask;
+    let own_frame = current_masks
+        .then(|| unsafe { presentation_frame(view) })
+        .flatten();
+    let mut rounded = inherited_rounded.to_vec();
+    if has_ca_mask {
+        let radius = crate::coreanimation::scene_corner_radius(layer);
+        if radius > 0.0 {
+            if let Some(frame) = own_frame {
+                let bounds = bounds_of(view).size;
+                let scale_x = f64::from(frame.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
+                let scale_y = f64::from(frame.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
+                let physical = radius * scale_x.min(scale_y);
+                if physical.is_finite() && physical > 0.0 {
+                    rounded.push(RoundedSceneClip {
+                        frame,
+                        radius: physical.min(f64::from(frame.width.min(frame.height)) / 2.0) as f32,
+                    });
+                }
+            }
+        }
+    }
     if !layer.is_null() && crate::layer::is_metal(layer) {
         if let Some(frame) = unsafe { presentation_frame(view) } {
             if frame.window == window {
@@ -175,14 +210,13 @@ fn visit_metal_scene(
                     opacity: (effective_alpha(view) as f32) * layer_opacity,
                     opaque: crate::layer::opaque_of(layer),
                     clip: inherited_clip,
+                    rounded: rounded.clone(),
                 });
             }
         }
     }
-    let current_masks = view_of(view).layer_backing & CLIPS_TO_BOUNDS != 0
-        || (!layer.is_null() && crate::coreanimation::scene_masks_to_bounds(layer));
     let child_clip = if current_masks {
-        unsafe { presentation_frame(view) }
+        own_frame
             .map(|frame| inherited_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
     } else {
         inherited_clip
@@ -198,6 +232,7 @@ fn visit_metal_scene(
                 child_clip,
                 layer_opacity,
                 if layer.is_null() { parent_layer } else { layer },
+                &rounded,
                 depth + 1,
             );
         }
@@ -3102,6 +3137,31 @@ mod tests {
             (clip.x, clip.y, clip.width, clip.height),
             (expected.x, expected.y, expected.width, expected.height)
         );
+        // A CA rounded masksToBounds ancestor must reach the Metal scene
+        // even when neither child view nor drawable publishes new content.
+        let ca_masks: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let ca_radius: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            ca_masks(parent_layer, objc::sel::get("setMasksToBounds:"), 1);
+            ca_radius(parent_layer, objc::sel::get("setCornerRadius:"), 18.0);
+        }
+        let rounded = metal_scene(sdl).unwrap();
+        assert_eq!(rounded[1].rounded.len(), 1);
+        assert_eq!(rounded[1].rounded[0].frame.x, expected.x);
+        assert_eq!(rounded[1].rounded[0].frame.y, expected.y);
+        assert!(rounded[1].rounded[0].radius > 0.0);
+        unsafe {
+            ca_masks(second, objc::sel::get("setMasksToBounds:"), 1);
+            ca_radius(second, objc::sel::get("setCornerRadius:"), 6.0);
+        }
+        assert_eq!(metal_scene(sdl).unwrap()[1].rounded.len(), 2);
+        unsafe {
+            ca_masks(parent_layer, objc::sel::get("setMasksToBounds:"), 0);
+            ca_masks(second, objc::sel::get("setMasksToBounds:"), 0);
+        }
+        assert!(metal_scene(sdl).unwrap()[1].rounded.is_empty());
         unsafe { set_clips_to_bounds(container, objc::sel::get("setClipsToBounds:"), 0) };
         assert!(metal_scene(sdl).unwrap()[1].clip.is_none());
         unsafe { set_hidden(container, objc::sel::get("setHidden:"), 1) };

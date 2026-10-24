@@ -18,6 +18,7 @@ fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
             opacity: 1.0,
             opaque: true,
             clip: None,
+            rounded: Vec::new(),
         }]
     };
     let pending = Mutex::new(None);
@@ -2753,6 +2754,563 @@ fn read_scene_pixel(
     pixel
 }
 
+/// A single *partial* CAMetalLayer cannot use the FIFO flattened path:
+/// after a move or resize it must sample its original image-space source.
+/// Adding a second layer must not reinterpret that snapshot as a full-window
+/// source or lose its original image dimensions.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
+    if isolate_vulkan_graphical_test(
+        "partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let foreground = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 40,
+            height: 30,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("40x30 source image");
+    for (image, rgba) in [
+        (&background, [0.0, 0.0, 1.0, 1.0]),
+        (&foreground, [0.0, 1.0, 0.0, 1.0]),
+    ] {
+        gpu.one_shot(|device, cb| unsafe {
+            device.cmd_clear_color_image(
+                cb,
+                image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: rgba },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .expect("paint source image");
+    }
+    let id = 10usize;
+    let sibling = 11usize;
+    let initial = appkit::view::Frame {
+        x: 10,
+        y: 20,
+        width: 40,
+        height: 30,
+        ..whole
+    };
+    state.layers.push(id);
+    state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&initial),
+            opacity: 1.0,
+            opaque: true,
+            clip: None,
+            rounded: Vec::new(),
+        }],
+    );
+    assert_eq!(
+        state.stage_composite_layer(
+            id,
+            &initial,
+            &foreground,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(id, &initial);
+    assert_eq!(
+        state.scene_layers.len(),
+        1,
+        "a partial FIFO layer was flattened"
+    );
+    assert_eq!(
+        (
+            state.scene_layers[0].snapshot.image.width,
+            state.scene_layers[0].snapshot.image.height
+        ),
+        (40, 30)
+    );
+    state.idle();
+    let pixel = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.window_width,
+            whole.window_height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(pixel(&state, 15, 25), [0, 255, 0, 255]);
+    assert_eq!(pixel(&state, 75, 25), [0, 0, 0, 0]);
+    let moved = appkit::view::Frame {
+        x: 65,
+        y: 45,
+        ..initial
+    };
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&moved),
+            opacity: 1.0,
+            opaque: true,
+            clip: None,
+            rounded: Vec::new(),
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        pixel(&state, 15, 25),
+        [0, 0, 0, 0],
+        "old placement left a ghost"
+    );
+    assert_eq!(
+        pixel(&state, 75, 55),
+        [0, 255, 0, 255],
+        "moved source missing"
+    );
+    let resized = appkit::view::Frame {
+        x: 65,
+        y: 45,
+        width: 60,
+        height: 40,
+        ..initial
+    };
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&resized),
+            opacity: 1.0,
+            opaque: true,
+            clip: None,
+            rounded: Vec::new(),
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        pixel(&state, 119, 79),
+        [0, 255, 0, 255],
+        "resize did not sample source"
+    );
+    assert_eq!(pixel(&state, 126, 85), [0, 0, 0, 0]);
+    // A new blue background arrives underneath, while the moved foreground
+    // does not submit another drawable. It must remain sharp and correctly
+    // positioned rather than become a stretched 160x120 flattened image.
+    state.layers.push(sibling);
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[
+            ScenePlacement {
+                id: sibling,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                opaque: true,
+                clip: None,
+                rounded: Vec::new(),
+            },
+            ScenePlacement {
+                id,
+                frame: DirectFrame::from_frame(&resized),
+                opacity: 1.0,
+                opaque: true,
+                clip: None,
+                rounded: Vec::new(),
+            },
+        ]
+    ));
+    assert_eq!(
+        state.stage_composite_layer(
+            sibling,
+            &whole,
+            &background,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(sibling, &whole);
+    state.idle();
+    assert_eq!(pixel(&state, 5, 5), [0, 0, 255, 255]);
+    assert_eq!(pixel(&state, 75, 55), [0, 255, 0, 255]);
+    assert_eq!(pixel(&state, 119, 79), [0, 255, 0, 255]);
+    assert_eq!(
+        (
+            state
+                .scene_layers
+                .iter()
+                .find(|l| l.id == id)
+                .unwrap()
+                .snapshot
+                .image
+                .width,
+            state
+                .scene_layers
+                .iter()
+                .find(|l| l.id == id)
+                .unwrap()
+                .snapshot
+                .image
+                .height
+        ),
+        (40, 30)
+    );
+    drop(state);
+    gpu.destroy_image(background);
+    gpu.destroy_image(foreground);
+    sdl3::video::destroy_window(window);
+}
+
+/// Descriptor growth is per-frame and must survive 33+ independent source
+/// snapshots without recycling descriptor sets still in Vulkan submissions.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn more_than_32_retained_layers_preserve_topmost_pixels() {
+    if isolate_vulkan_graphical_test("more_than_32_retained_layers_preserve_topmost_pixels") {
+        return;
+    }
+    let Some((window, gpu, mut state, blue, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let small = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 8,
+            height: 8,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("test overlay image");
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            blue.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 1.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+        device.cmd_clear_color_image(
+            cb,
+            small.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("seed two colors");
+    state.layers.push(1);
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &blue, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(1, &whole);
+    // 33 small independently snapshotted Metal views plus a CPU-like full
+    // background: exactly the boundary where the old fixed pool failed.
+    for i in 0..33usize {
+        let id = 2 + i;
+        let small_frame = appkit::view::Frame {
+            x: (i as i32 % 11) * 12,
+            y: 10 + (i as i32 / 11) * 18,
+            width: 8,
+            height: 8,
+            ..whole
+        };
+        state.layers.push(id);
+        assert_eq!(
+            state.stage_composite_layer(
+                id,
+                &small_frame,
+                &small,
+                None,
+                &mut SourceOwner(None),
+                false
+            ),
+            Ok(Some(true)),
+            "layer id {id}"
+        );
+        state.note_scene_frame(id, &small_frame);
+    }
+    state.idle();
+    assert_eq!(state.layers.len(), 34);
+    assert!(
+        state
+            .scene_blender
+            .as_ref()
+            .unwrap()
+            .sets
+            .iter()
+            .all(|sets| sets.len() >= 34)
+    );
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 7, 7),
+        [0, 0, 255, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 4, 14),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 124, 50),
+        [0, 255, 0, 255]
+    );
+    // Updating only the first 8x8 foreground exercises damaged-rectangle
+    // clearing/composition with >32 layer descriptors. Other snapshots and
+    // the full-window backing image must retain their previous pixels.
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            small.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [1.0, 0.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("repaint small foreground");
+    let affected = appkit::view::Frame {
+        x: 0,
+        y: 10,
+        width: 8,
+        height: 8,
+        ..whole
+    };
+    assert_eq!(
+        state.stage_composite_layer(2, &affected, &small, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 4, 14),
+        [255, 0, 0, 255],
+        "damaged overlay was not repainted"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 16, 14),
+        [0, 255, 0, 255],
+        "unmodified neighboring overlay was lost"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 7, 7),
+        [0, 0, 255, 255],
+        "unchanged background outside damage was modified"
+    );
+    drop(state);
+    gpu.destroy_image(blue);
+    gpu.destroy_image(small);
+    sdl3::video::destroy_window(window);
+}
+
+/// Rounded masks from one or more ancestor CALayers multiply the Metal
+/// drawable's alpha, including its corners. No CPU surface readback or
+/// second Metal drawable is required when the CA geometry changes.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn opaque_metal_content_respects_nested_rounded_ca_clips() {
+    if isolate_vulkan_graphical_test("opaque_metal_content_respects_nested_rounded_ca_clips") {
+        return;
+    }
+    let Some((window, gpu, mut state, green, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            green.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("green full-window source");
+    let first = DirectFrame::from_frame(&appkit::view::Frame {
+        x: 10,
+        y: 10,
+        width: 120,
+        height: 100,
+        ..whole
+    });
+    let second = DirectFrame::from_frame(&appkit::view::Frame {
+        x: 30,
+        y: 25,
+        width: 80,
+        height: 65,
+        ..whole
+    });
+    let id = 22;
+    state.layers.push(id);
+    state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+            opaque: true,
+            clip: Some(first),
+            rounded: vec![scene::RoundedClip {
+                frame: first,
+                radius: 30.0,
+            }],
+        }],
+    );
+    assert_eq!(
+        state.stage_composite_layer(id, &whole, &green, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(id, &whole);
+    state.idle();
+    let pixel = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.window_width,
+            whole.window_height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(
+        pixel(&state, 10, 10),
+        [0, 0, 0, 0],
+        "round corner not removed"
+    );
+    assert_eq!(
+        pixel(&state, 70, 10),
+        [0, 255, 0, 255],
+        "straight upper edge missing"
+    );
+    assert_eq!(pixel(&state, 70, 60), [0, 255, 0, 255]);
+    assert_eq!(
+        pixel(&state, 132, 60),
+        [0, 0, 0, 0],
+        "rectangular clip failed"
+    );
+    // Introduce a nested rounded ancestor without any new Metal drawable.
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+            opaque: true,
+            clip: Some(second),
+            rounded: vec![
+                scene::RoundedClip {
+                    frame: first,
+                    radius: 30.0
+                },
+                scene::RoundedClip {
+                    frame: second,
+                    radius: 20.0
+                },
+            ],
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        pixel(&state, 30, 25),
+        [0, 0, 0, 0],
+        "nested corner not clipped"
+    );
+    assert_eq!(
+        pixel(&state, 70, 25),
+        [0, 255, 0, 255],
+        "nested straight edge missing"
+    );
+    assert_eq!(pixel(&state, 70, 60), [0, 255, 0, 255]);
+    assert_eq!(pixel(&state, 20, 50), [0, 0, 0, 0]);
+    // Five nested masks also work: no fixed-size push-constant clipping cap.
+    let nested = vec![
+        scene::RoundedClip {
+            frame: second,
+            radius: 20.0,
+        };
+        5
+    ];
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+            opaque: true,
+            clip: Some(second),
+            rounded: nested,
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(pixel(&state, 30, 25), [0, 0, 0, 0]);
+    assert_eq!(pixel(&state, 70, 60), [0, 255, 0, 255]);
+    drop(state);
+    gpu.destroy_image(green);
+    sdl3::video::destroy_window(window);
+}
+
 /// The CPU backing image, including its pixels covered by Metal, is the
 /// bottom scene source. This is not the opaque-AppKit-over-Metal mask.
 #[test]
@@ -2860,6 +3418,7 @@ fn translucent_metal_composites_over_complete_cpu_store() {
             opacity: 0.5,
             opaque: true,
             clip: None,
+            rounded: Vec::new(),
         }],
     );
     assert_eq!(
@@ -2892,6 +3451,7 @@ fn translucent_metal_composites_over_complete_cpu_store() {
             opacity: 0.25,
             opaque: true,
             clip: None,
+            rounded: Vec::new(),
         }]
     ));
     assert_eq!(state.redisplay_scene(cpu_id), Ok(true));
@@ -2979,6 +3539,7 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
             opacity: 0.5,
             opaque: true,
             clip: None,
+            rounded: Vec::new(),
         }]
     ));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
@@ -3009,6 +3570,7 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
             opacity: 1.0,
             opaque: false,
             clip: None,
+            rounded: Vec::new(),
         }]
     ));
     gpu.one_shot(|device, cb| unsafe {
@@ -3258,7 +3820,7 @@ fn benchmark_4k_static_background_with_animated_128px_foreground() {
         control_p95[(iterations * 95 / 100) as usize]
     );
     eprintln!(
-        "4K retained scene full redraw: mean_us={:.1}, p95_us={:.1}, ratio={:.2}x",
+        "4K retained scene damage-aware redraw: mean_us={:.1}, p95_us={:.1}, ratio={:.2}x",
         average(&retained_us),
         retained_p95[(iterations * 95 / 100) as usize],
         average(&retained_us) / average(&control_us)
@@ -3328,6 +3890,7 @@ fn one_layer_with_clipping_parent_keeps_outside_pixels_transparent() {
             opacity: 1.0,
             opaque: true,
             clip: Some(DirectFrame::from_frame(&clip)),
+            rounded: Vec::new(),
         }],
     );
     assert_eq!(
@@ -3581,6 +4144,7 @@ fn static_foreground_survives_repeated_background_submissions() {
                 opacity: 1.0,
                 opaque: true,
                 clip: None,
+                rounded: Vec::new(),
             },
             ScenePlacement {
                 id: 2,
@@ -3588,6 +4152,7 @@ fn static_foreground_survives_repeated_background_submissions() {
                 opacity: 0.5,
                 opaque: true,
                 clip: None,
+                rounded: Vec::new(),
             },
         ]
     ));
@@ -3645,14 +4210,16 @@ fn static_foreground_survives_repeated_background_submissions() {
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
                 opaque: true,
-                clip: None
+                clip: None,
+                rounded: Vec::new(),
             },
             ScenePlacement {
                 id: 2,
                 frame: DirectFrame::from_frame(&foreground),
                 opacity: 0.5,
                 opaque: true,
-                clip: Some(restricted)
+                clip: Some(restricted),
+                rounded: Vec::new(),
             },
         ]
     ));
@@ -3997,6 +4564,7 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
             opacity: 1.0,
             opaque: true,
             clip: None,
+            rounded: Vec::new(),
         }]
     ));
     assert_eq!(state.layers, [1]);

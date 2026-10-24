@@ -3,6 +3,7 @@
 //! image it drew must survive when another layer continues submitting frames.
 
 use super::*;
+use crate::gpu::GpuBuffer;
 
 #[derive(Clone)]
 pub(super) struct SceneLayer {
@@ -13,6 +14,7 @@ pub(super) struct SceneLayer {
     opacity: f32,
     opaque: bool,
     clip: Option<DirectFrame>,
+    rounded: Vec<RoundedClip>,
     regions: Option<Vec<Region>>,
     pub(super) ready: bool,
 }
@@ -20,6 +22,9 @@ pub(super) struct SceneLayer {
 pub(super) struct SceneWork {
     current: usize,
     previous: Option<usize>,
+    /// A safe incremental source-content update. Changes to visibility,
+    /// geometry, opacity, order and fallback staging redraw the full scene.
+    damage: Option<DirectFrame>,
     /// Pre-submission membership/source state, retained only until the VkQueue
     /// accepts the new generation. Recording errors must not poison the scene.
     prior: Option<SceneLayer>,
@@ -56,7 +61,7 @@ fn source_matches(image: &GpuImage, source: PresentSource) -> bool {
 
 // Descriptor sets are separate for every GPU in-flight frame. Reusing one
 // while an older command buffer samples it is prohibited by Vulkan.
-const MAX_SCENE_LAYERS: usize = 32;
+const INITIAL_SCENE_LAYERS: usize = 32;
 
 /// Per-window GPU source-over blending, using the same tested shader as
 /// AppKit's DMA-BUF overlays. Descriptor updates are frame-slot isolated.
@@ -65,8 +70,13 @@ pub(super) struct SceneBlender {
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     sampler: vk::Sampler,
-    pool: vk::DescriptorPool,
-    sets: Vec<vk::DescriptorSet>,
+    pools: Vec<vk::DescriptorPool>,
+    set_layout: vk::DescriptorSetLayout,
+    /// One descriptor vector per in-flight frame; growing a scene appends a
+    /// new VkDescriptorPool without invalidating any previously bound sets.
+    pub(super) sets: Vec<Vec<vk::DescriptorSet>>,
+    /// Each clip buffer belongs to one fence-protected frame slot.
+    masks: Vec<Mutex<Option<GpuBuffer>>>,
 }
 
 impl SceneBlender {
@@ -76,6 +86,7 @@ impl SceneBlender {
             &[
                 (0, vk::DescriptorType::COMBINED_IMAGE_SAMPLER),
                 (1, vk::DescriptorType::STORAGE_IMAGE),
+                (2, vk::DescriptorType::STORAGE_BUFFER),
             ],
             vk::ShaderStageFlags::COMPUTE,
             false,
@@ -92,7 +103,8 @@ impl SceneBlender {
         let layout = gpu::Guard::new(layout, |handle| unsafe {
             device.destroy_pipeline_layout(handle, None)
         });
-        let module = gpu.create_shader_module(&crate::overlay::shader(), "rosemary_scene_blend")?;
+        let module =
+            gpu.create_shader_module(&crate::overlay::scene_shader(), "rosemary_scene_blend")?;
         let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
@@ -119,7 +131,35 @@ impl SceneBlender {
         let sampler = gpu::Guard::new(sampler, |handle| unsafe {
             device.destroy_sampler(handle, None)
         });
-        let count = (FRAMES_IN_FLIGHT * MAX_SCENE_LAYERS) as u32;
+        let mut result = Self {
+            gpu,
+            layout: layout.take(),
+            pipeline: pipeline.take(),
+            sampler: sampler.take(),
+            pools: Vec::new(),
+            set_layout,
+            sets: vec![Vec::new(); FRAMES_IN_FLIGHT],
+            masks: (0..FRAMES_IN_FLIGHT).map(|_| Mutex::new(None)).collect(),
+        };
+        result.reserve_layers(INITIAL_SCENE_LAYERS)?;
+        Ok(result)
+    }
+
+    fn reserve_layers(&mut self, needed: usize) -> Result<(), String> {
+        let have = self.sets[0].len();
+        if needed <= have {
+            return Ok(());
+        }
+        // Grow geometrically so deep trees do not allocate one descriptor
+        // pool per new view. Every old pool remains live for in-flight frames.
+        let total = needed.max(have.saturating_mul(2)).max(INITIAL_SCENE_LAYERS);
+        let extra = total - have;
+        let count = u32::try_from(
+            extra
+                .checked_mul(FRAMES_IN_FLIGHT)
+                .ok_or("scene descriptor count overflow")?,
+        )
+        .map_err(|_| "scene descriptor count exceeds Vulkan u32")?;
         let sizes = [
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -127,29 +167,77 @@ impl SceneBlender {
             vk::DescriptorPoolSize::default()
                 .ty(vk::DescriptorType::STORAGE_IMAGE)
                 .descriptor_count(count),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::STORAGE_BUFFER)
+                .descriptor_count(count),
         ];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
+        let info = vk::DescriptorPoolCreateInfo::default()
             .max_sets(count)
             .pool_sizes(&sizes);
-        let pool = unsafe { device.create_descriptor_pool(&pool_info, None) }
-            .map_err(|e| format!("scene vkCreateDescriptorPool: {e:?}"))?;
-        let pool = gpu::Guard::new(pool, |handle| unsafe {
-            device.destroy_descriptor_pool(handle, None)
+        let pool = unsafe { self.gpu.device.create_descriptor_pool(&info, None) }
+            .map_err(|error| format!("scene descriptor pool growth failed: {error:?}"))?;
+        let guard = gpu::Guard::new(pool, |pool| unsafe {
+            self.gpu.device.destroy_descriptor_pool(pool, None);
         });
-        let layouts = vec![set_layout; count as usize];
-        let allocate = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(*pool)
+        let layouts = vec![self.set_layout; count as usize];
+        let alloc = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(*guard)
             .set_layouts(&layouts);
-        let sets = unsafe { device.allocate_descriptor_sets(&allocate) }
-            .map_err(|e| format!("scene vkAllocateDescriptorSets: {e:?}"))?;
-        Ok(Self {
-            gpu,
-            layout: layout.take(),
-            pipeline: pipeline.take(),
-            sampler: sampler.take(),
-            pool: pool.take(),
-            sets,
-        })
+        let additional = unsafe { self.gpu.device.allocate_descriptor_sets(&alloc) }
+            .map_err(|error| format!("scene descriptor set growth failed: {error:?}"))?;
+        for (frame, sets) in self.sets.iter_mut().enumerate() {
+            sets.extend_from_slice(&additional[frame * extra..(frame + 1) * extra]);
+        }
+        self.pools.push(guard.take());
+        Ok(())
+    }
+
+    /// Upload all rounded ancestor masks in source order. A frame slot is
+    /// fenced before this is called, including when its buffer must grow.
+    fn write_masks(
+        &self,
+        slot: usize,
+        layers: &[SceneLayer],
+    ) -> Result<Vec<(usize, u32, u32)>, String> {
+        let mut floats = Vec::<f32>::new();
+        let mut spans = Vec::with_capacity(layers.len());
+        for layer in layers {
+            let first = u32::try_from(floats.len() / 8).map_err(|_| "too many masks")?;
+            let count = u32::try_from(layer.rounded.len()).map_err(|_| "too many nested masks")?;
+            spans.push((layer.id, first, count));
+            for mask in &layer.rounded {
+                let f = mask.frame;
+                floats.extend_from_slice(&[
+                    f.x as f32,
+                    f.y as f32,
+                    (i64::from(f.x) + i64::from(f.width)) as f32,
+                    (i64::from(f.y) + i64::from(f.height)) as f32,
+                    mask.radius,
+                    0.0,
+                    0.0,
+                    0.0,
+                ]);
+            }
+        }
+        if floats.is_empty() {
+            floats.extend_from_slice(&[0.0; 8]);
+        }
+        let bytes = floats.len().checked_mul(4).ok_or("mask size overflow")?;
+        let mut guard = self.masks[slot].lock().expect("mask frame");
+        if guard
+            .as_ref()
+            .is_none_or(|buffer| buffer.length < bytes as u64)
+        {
+            let fresh = self.gpu.create_buffer(bytes as u64)?;
+            if let Some(old) = guard.replace(fresh) {
+                self.gpu.destroy_buffer(old);
+            }
+        }
+        let buffer = guard.as_ref().expect("allocated mask buffer");
+        unsafe {
+            std::ptr::copy_nonoverlapping(floats.as_ptr().cast::<u8>(), buffer.contents, bytes)
+        };
+        Ok(spans)
     }
 
     fn bind(
@@ -160,13 +248,12 @@ impl SceneBlender {
         source: &GpuImage,
         output: &GpuImage,
     ) -> Result<(), String> {
-        if scene_index >= MAX_SCENE_LAYERS {
-            return Err(format!(
-                "the scene exceeds {MAX_SCENE_LAYERS} visible Metal layers"
-            ));
-        }
+        let set = *self
+            .sets
+            .get(frame_slot)
+            .and_then(|frame| frame.get(scene_index))
+            .ok_or("scene descriptors have not been reserved for the live layer count")?;
         let device = &self.gpu.device;
-        let set = self.sets[frame_slot * MAX_SCENE_LAYERS + scene_index];
         let sampled = [vk::DescriptorImageInfo::default()
             .sampler(self.sampler)
             .image_view(source.view)
@@ -174,6 +261,12 @@ impl SceneBlender {
         let target = [vk::DescriptorImageInfo::default()
             .image_view(output.view)
             .image_layout(vk::ImageLayout::GENERAL)];
+        let masks = self.masks[frame_slot].lock().expect("mask frame");
+        let masks = masks.as_ref().ok_or("scene mask data not prepared")?;
+        let mask_info = [vk::DescriptorBufferInfo::default()
+            .buffer(masks.buffer)
+            .offset(0)
+            .range(masks.length.max(4))];
         let writes = [
             vk::WriteDescriptorSet::default()
                 .dst_set(set)
@@ -185,6 +278,11 @@ impl SceneBlender {
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                 .image_info(&target),
+            vk::WriteDescriptorSet::default()
+                .dst_set(set)
+                .dst_binding(2)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                .buffer_info(&mask_info),
         ];
         unsafe {
             device.update_descriptor_sets(&writes, &[]);
@@ -228,7 +326,14 @@ impl Drop for SceneBlender {
     fn drop(&mut self) {
         let device = &self.gpu.device;
         unsafe {
-            device.destroy_descriptor_pool(self.pool, None);
+            for pool in self.pools.drain(..) {
+                device.destroy_descriptor_pool(pool, None);
+            }
+            for slot in &self.masks {
+                if let Some(buffer) = slot.lock().expect("clip frame").take() {
+                    self.gpu.destroy_buffer(buffer);
+                }
+            }
             device.destroy_sampler(self.sampler, None);
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.layout, None);
@@ -238,13 +343,20 @@ impl Drop for SceneBlender {
 
 /// Value-only AppKit layer placement. No Objective-C object is dereferenced
 /// after a layer has been detached, hidden or deallocated.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
+pub(super) struct RoundedClip {
+    pub frame: DirectFrame,
+    pub radius: f32,
+}
+
+#[derive(Clone)]
 pub(super) struct ScenePlacement {
     pub id: usize,
     pub frame: DirectFrame,
     pub opacity: f32,
     pub opaque: bool,
     pub clip: Option<DirectFrame>,
+    pub rounded: Vec<RoundedClip>,
 }
 
 fn scene_image(gpu: &'static Gpu, source: PresentSource) -> Result<Arc<BackingImageLease>, String> {
@@ -406,11 +518,13 @@ impl Swapchain {
                     || scene.opacity != placement.opacity
                     || scene.opaque != placement.opaque
                     || scene.clip != placement.clip
+                    || scene.rounded != placement.rounded
                 {
                     scene.frame = placement.frame;
                     scene.opacity = placement.opacity;
                     scene.opaque = placement.opaque;
                     scene.clip = placement.clip;
+                    scene.rounded.clone_from(&placement.rounded);
                     changed = true;
                 }
             }
@@ -433,6 +547,13 @@ impl Swapchain {
             .iter()
             .find(|entry| entry.id == id)
             .and_then(|entry| entry.clip)
+    }
+
+    fn scene_rounded(&self, id: usize) -> &[RoundedClip] {
+        self.scene_placements
+            .iter()
+            .find(|entry| entry.id == id)
+            .map_or(&[], |entry| entry.rounded.as_slice())
     }
 
     pub(super) fn scene_opaque(&self, id: usize) -> bool {
@@ -466,18 +587,30 @@ impl Swapchain {
             .is_some_and(|clip| !scene_clip_contains(&clip.frame(), frame));
         if self.layers.len() <= 1
             && self.scene_layers.is_empty()
+            // A partial drawable is not interchangeable with the flattened
+            // full-window accumulator. Its original layer-space pixels must
+            // survive an NSView move, resize or a later sibling arrival.
+            && frame.x == 0
+            && frame.y == 0
+            && frame.width == self.extent.width
+            && frame.height == self.extent.height
+            && source.width == frame.width
+            && source.height == frame.height
+            && regions.is_none()
             && !source_is_clipped
+            && self.scene_rounded(id).is_empty()
             && self.scene_opacity(id) >= 1.0
             && self.scene_opaque(id)
         {
             return Ok(ScenePrepared::SingleLayer);
         }
-        if self.layers.len() > MAX_SCENE_LAYERS {
-            return Err(format!("more than {MAX_SCENE_LAYERS} visible Metal layers"));
-        }
         if self.scene_blender.is_none() {
             self.scene_blender = Some(SceneBlender::new(self.gpu)?);
         }
+        self.scene_blender
+            .as_mut()
+            .expect("initialized")
+            .reserve_layers(self.layers.len().saturating_add(1))?;
         // Fence-completed frames no longer own scene images, so their pool
         // slots become eligible for reuse without allocation or GPU stalls.
         self.retire_copied();
@@ -498,6 +631,25 @@ impl Swapchain {
             None
         };
         let existing = self.scene_layers.iter().position(|layer| layer.id == id);
+        // Incremental repaint is only safe when a fully committed scene and
+        // this layer's previous geometry/masking match the new submission.
+        // The output accumulator is persistent, so pixels outside this area
+        // must never be cleared on an ordinary stationary foreground update.
+        let damage = existing.and_then(|index| {
+            let old = &self.scene_layers[index];
+            (self.composite.is_some()
+                && previous.is_none()
+                && !self.scene_repaint_needed
+                && self.scene_layers.len() == self.layers.len()
+                && self.scene_layers.iter().all(|layer| layer.ready)
+                && old.frame == DirectFrame::from_frame(frame)
+                && old.regions.as_deref() == regions
+                && old.opacity == self.scene_opacity(id)
+                && old.opaque == self.scene_opaque(id)
+                && old.clip == self.scene_clip(id)
+                && old.rounded == self.scene_rounded(id))
+            .then_some(DirectFrame::from_frame(frame))
+        });
         let reused = existing.and_then(|index| {
             let layer = &self.scene_layers[index];
             if source_matches(&layer.snapshot.image, source)
@@ -566,6 +718,7 @@ impl Swapchain {
                 opacity: self.scene_opacity(old),
                 opaque: self.scene_opaque(old),
                 clip: self.scene_clip(old),
+                rounded: self.scene_rounded(old).to_vec(),
                 regions: None,
                 ready: false,
             });
@@ -573,6 +726,7 @@ impl Swapchain {
         let opacity = self.scene_opacity(id);
         let opaque = self.scene_opaque(id);
         let clip = self.scene_clip(id);
+        let rounded = self.scene_rounded(id).to_vec();
         if let Some(existing) = existing {
             let layer = &mut self.scene_layers[existing];
             if !Arc::ptr_eq(&layer.snapshot, &fresh) {
@@ -597,6 +751,7 @@ impl Swapchain {
             layer.opacity = opacity;
             layer.opaque = opaque;
             layer.clip = clip;
+            layer.rounded.clone_from(&rounded);
             layer.regions = regions.map(|r| r.to_vec());
             layer.ready = false;
         } else {
@@ -608,6 +763,7 @@ impl Swapchain {
                 opacity,
                 opaque,
                 clip,
+                rounded,
                 regions: regions.map(|r| r.to_vec()),
                 ready: false,
             });
@@ -616,6 +772,7 @@ impl Swapchain {
             current: id,
             previous,
             prior,
+            damage,
         }))
     }
 
@@ -753,6 +910,7 @@ impl Swapchain {
             .as_ref()
             .ok_or("retained scene blend pipeline absent")?;
         let slot = self.frame % self.frames.len().max(1);
+        let mask_spans = blender.write_masks(slot, &self.scene_layers)?;
         let clear = vk::ClearColorValue { float32: [0.0; 4] };
         let range = vk::ImageSubresourceRange {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -761,36 +919,114 @@ impl Swapchain {
             base_array_layer: 0,
             layer_count: 1,
         };
-        unsafe {
-            scene_sync(
-                device,
+        let damage = pending
+            .and_then(|work| work.damage)
+            .map(|frame| frame.frame());
+        if let Some(damage) = damage {
+            // A scene layer submission does not invalidate the whole window:
+            // clear only the source's previous bounds, then recompose every
+            // layer intersecting those pixels in the original stacking order.
+            // A dedicated extra descriptor avoids overwriting sets referenced
+            // by subsequent source-over dispatches in the same command buffer.
+            unsafe {
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    &[(
+                        composite,
+                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )],
+                );
+            }
+            let first = self
+                .scene_layers
+                .iter()
+                .find(|scene| scene.ready || pending.is_some_and(|work| scene.id == work.current))
+                .ok_or("damaged scene has no ready source")?;
+            blender.bind(
                 command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                &[(
+                slot,
+                self.layers.len(),
+                &first.snapshot.image,
+                output,
+            )?;
+            let bounded = intersection_for_scene(
+                &damage,
+                &appkit::view::Frame {
+                    x: 0,
+                    y: 0,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    ..damage
+                },
+            );
+            blender.draw(
+                command_buffer,
+                &crate::overlay::Placement {
+                    x: bounded.x,
+                    y: bounded.y,
+                    width: bounded.width,
+                    height: bounded.height,
+                    target_width: self.extent.width,
+                    target_height: self.extent.height,
+                    clip_x: bounded.x,
+                    clip_y: bounded.y,
+                    clip_width: bounded.width,
+                    clip_height: bounded.height,
+                    opacity: 1.0,
+                    clear: true,
+                    round_start: 0,
+                    round_count: 0,
+                },
+            );
+            unsafe {
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    &[(
+                        composite,
+                        vk::AccessFlags::SHADER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )],
+                );
+            }
+        } else {
+            unsafe {
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    &[(
+                        composite,
+                        vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+                device.cmd_clear_color_image(
+                    command_buffer,
                     composite,
-                    vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                )],
-            );
-            device.cmd_clear_color_image(
-                command_buffer,
-                composite,
-                vk::ImageLayout::GENERAL,
-                &clear,
-                &[range],
-            );
-            scene_sync(
-                device,
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                &[(
-                    composite,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                )],
-            );
+                    vk::ImageLayout::GENERAL,
+                    &clear,
+                    &[range],
+                );
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    &[(
+                        composite,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )],
+                );
+            }
         }
         let mut scene_index = 0;
         for id in &self.layers {
@@ -827,6 +1063,7 @@ impl Swapchain {
                 let clip = scene.clip.map_or(clip, |ancestor| {
                     intersection_for_scene(&clip, &ancestor.frame())
                 });
+                let clip = damage.map_or(clip, |changed| intersection_for_scene(&clip, &changed));
                 let placement = crate::overlay::Placement {
                     x: frame.x,
                     y: frame.y,
@@ -839,6 +1076,12 @@ impl Swapchain {
                     clip_width: clip.width,
                     clip_height: clip.height,
                     opacity: scene.opacity,
+                    clear: false,
+                    round_start: mask_spans
+                        .iter()
+                        .find(|(id, _, _)| *id == scene.id)
+                        .map_or(0, |(_, first, _)| *first),
+                    round_count: scene.rounded.len() as u32,
                 };
                 blender.draw(command_buffer, &placement);
             };
@@ -940,6 +1183,7 @@ impl Swapchain {
             opacity: self.scene_opacity(id),
             opaque: self.scene_opaque(id),
             clip: self.scene_clip(id),
+            rounded: self.scene_rounded(id).to_vec(),
             regions: None,
             ready: true,
         });
@@ -992,6 +1236,7 @@ impl Swapchain {
                     true,
                 ) && scene.opacity >= 1.0
                     && scene.opaque
+                    && scene.rounded.is_empty()
                     && scene
                         .clip
                         .is_none_or(|clip| scene_clip_contains(&clip.frame(), &frame))
@@ -1012,6 +1257,10 @@ impl Swapchain {
         if self.scene_blender.is_none() {
             self.scene_blender = Some(SceneBlender::new(self.gpu)?);
         }
+        self.scene_blender
+            .as_mut()
+            .expect("initialized")
+            .reserve_layers(self.layers.len().saturating_add(1))?;
         let slot = self.frame % self.frames.len();
         let (cb, done, submitted) = {
             let frame = &self.frames[slot];

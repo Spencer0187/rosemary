@@ -5,10 +5,10 @@
 //! `contentsGravity`, sublayers, `masksToBounds`, opacity and running
 //! animations. That is what a program builds a progress bar, a spinner, a badge
 //! or a highlight out of, and what a layer-backed view's content arrives as.
-//! Borders, shadows, `contentsRect` and transforms are not drawn, and
-//! `masksToBounds` clips to the square bounds whatever the corner radius; a
-//! program that relies on them gets its layer's background and contents and
-//! no more.
+//! Borders, shadows, `contentsRect` and transforms are not fully rendered.
+//! The software CA contents painter currently clips to rectangular bounds;
+//! the separate retained Metal scene honors rounded `masksToBounds` ancestors.
+//! Full native Core Animation masking and transforms remain unsupported.
 //!
 //! The state lives in side tables keyed by object address rather than in
 //! `crate::layer::Layer`, whose layout a `CAMetalLayer` extends.
@@ -259,6 +259,10 @@ pub(crate) fn scene_properties_below(layer: Id, ancestor: Id) -> (bool, f32) {
 /// scene snapshots the boolean on its mutator thread, not on the GPU worker.
 pub(crate) fn scene_masks_to_bounds(layer: Id) -> bool {
     read_node(layer, |node| node.is_some_and(|node| node.masks_to_bounds))
+}
+
+pub(crate) fn scene_corner_radius(layer: Id) -> f64 {
+    read_node(layer, |node| node.map_or(0.0, |node| node.corner_radius))
 }
 
 #[cfg(test)]

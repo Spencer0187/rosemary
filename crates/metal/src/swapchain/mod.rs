@@ -340,6 +340,14 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
             opacity: layer.opacity,
             opaque: layer.opaque,
             clip: layer.clip.map(|frame| DirectFrame::from_frame(&frame)),
+            rounded: layer
+                .rounded
+                .into_iter()
+                .map(|clip| scene::RoundedClip {
+                    frame: DirectFrame::from_frame(&clip.frame),
+                    radius: clip.radius,
+                })
+                .collect(),
         })
         .collect();
     *entry.pending_scene.lock().expect("AppKit scene pending") = Some(ordered);
@@ -1315,6 +1323,14 @@ fn present_impl(
                 opacity: item.opacity,
                 opaque: item.opaque,
                 clip: item.clip.map(|frame| DirectFrame::from_frame(&frame)),
+                rounded: item
+                    .rounded
+                    .into_iter()
+                    .map(|clip| scene::RoundedClip {
+                        frame: DirectFrame::from_frame(&clip.frame),
+                        radius: clip.radius,
+                    })
+                    .collect(),
             })
             .collect::<Vec<_>>()
     });
