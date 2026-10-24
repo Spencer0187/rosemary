@@ -466,19 +466,42 @@ impl Swapchain {
             }
         }
         let mut changed = self.layers != ordered;
-        if self.layers.len() == 1
-            && self.scene_layers.is_empty()
-            && live
-                .iter()
-                .any(|p| p.id == self.layers[0] && (p.opacity < 1.0 || !p.opaque))
-        {
-            changed = true;
+        if self.layers.len() == 1 && self.scene_layers.is_empty() {
+            let id = self.layers[0];
+            let old = self.scene_placements.iter().find(|p| p.id == id);
+            if live.iter().find(|p| p.id == id).is_some_and(|p| {
+                p.opacity < 1.0
+                    || !p.opaque
+                    || !p.rounded.is_empty()
+                    || p.clip
+                        .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &p.frame.frame()))
+                    || old.is_some_and(|old| {
+                        old.frame != p.frame
+                            || old.opacity != p.opacity
+                            || old.opaque != p.opaque
+                            || old.clip != p.clip
+                            || old.rounded != p.rounded
+                    })
+            }) {
+                changed = true;
+            }
         }
         if let Some(direct) = self.direct.as_ref() {
-            if live
-                .iter()
-                .any(|p| p.id == direct.layer && (p.opacity < 1.0 || !p.opaque))
-            {
+            let new = live.iter().find(|p| p.id == direct.layer);
+            let old = self.scene_placements.iter().find(|p| p.id == direct.layer);
+            if new.zip(old).is_some_and(|(new, old)| {
+                new.opacity != old.opacity
+                    || new.opaque != old.opaque
+                    || new.frame != old.frame
+                    || new.clip != old.clip
+                    || new.rounded != old.rounded
+            }) || new.is_some_and(|p| {
+                p.opacity < 1.0
+                    || !p.opaque
+                    || !p.rounded.is_empty()
+                    || p.clip
+                        .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &p.frame.frame()))
+            }) {
                 changed = true;
             }
         }
@@ -980,6 +1003,7 @@ impl Swapchain {
                     clear: true,
                     round_start: 0,
                     round_count: 0,
+                    sampled_srgb: 0,
                 },
             );
             unsafe {
@@ -1082,6 +1106,10 @@ impl Swapchain {
                         .find(|(id, _, _)| *id == scene.id)
                         .map_or(0, |(_, first, _)| *first),
                     round_count: scene.rounded.len() as u32,
+                    sampled_srgb: u32::from(matches!(
+                        scene.snapshot.image.format,
+                        vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+                    )),
                 };
                 blender.draw(command_buffer, &placement);
             };
@@ -1194,21 +1222,42 @@ impl Swapchain {
     /// changes. No SDL/Objective-C operation is performed under a Vulkan lock.
     pub(super) fn redisplay_scene(&mut self, window: usize) -> Result<bool, String> {
         if let Some(direct) = self.direct.as_ref() {
-            if self.scene_opacity(direct.layer) < 1.0 || !self.scene_opaque(direct.layer) {
-                // A CA-only opacity update must reuse the last drawable's
-                // retained image, not leave its old opaque direct WSI copy.
+            let source_frame = direct.frame.frame();
+            let layer = direct.layer;
+            let needs_scene = self.scene_opacity(layer) < 1.0
+                || !self.scene_opaque(layer)
+                || !self.scene_rounded(layer).is_empty()
+                || self
+                    .scene_clip(layer)
+                    .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &source_frame));
+            if needs_scene {
+                // Reuse the last retained drawable after *any* CA-only
+                // change that makes a direct WSI copy visually invalid.
+                // stage_direct_snapshot restores it on a busy-slot retry.
                 return self
                     .stage_direct_snapshot(true)
                     .map(|done| done == Some(true));
             }
         }
-        if self.layers.len() == 1
-            && self.scene_layers.is_empty()
-            && (self.scene_opacity(self.layers[0]) < 1.0 || !self.scene_opaque(self.layers[0]))
-        {
-            // FIFO's previously opaque single-layer blit has no separately
-            // retained GPU snapshot. Cache it now for CA-only alpha changes.
-            self.capture_single_scene_from_composite()?;
+        if self.layers.len() == 1 && self.scene_layers.is_empty() {
+            let id = self.layers[0];
+            let clipped = self
+                .scene_frames
+                .iter()
+                .find(|(known, _)| *known == id)
+                .is_some_and(|(_, frame)| {
+                    self.scene_clip(id)
+                        .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &frame.frame()))
+                });
+            if self.scene_opacity(id) < 1.0
+                || !self.scene_opaque(id)
+                || !self.scene_rounded(id).is_empty()
+                || clipped
+            {
+                // FIFO's opaque flattened single-layer result needs a
+                // retained original before any CA-only alpha/mask change.
+                self.capture_single_scene_from_composite()?;
+            }
         }
         if self.layers.len() == 1 {
             if self

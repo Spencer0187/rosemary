@@ -3156,6 +3156,393 @@ fn more_than_32_retained_layers_preserve_topmost_pixels() {
     sdl3::video::destroy_window(window);
 }
 
+/// FIFO previously flattened an opaque full-window source. A CA-only mask
+/// change must capture that source and rebuild the retained compositor too.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn fifo_flattened_static_drawable_recomposes_after_ca_mask_change() {
+    if isolate_vulkan_graphical_test(
+        "fifo_flattened_static_drawable_recomposes_after_ca_mask_change",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, source, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    if !matches!(
+        state.present_mode,
+        vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+    ) {
+        gpu.destroy_image(source);
+        drop(state);
+        sdl3::video::destroy_window(window);
+        return;
+    }
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            source.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("green FIFO source");
+    let id = 613;
+    let base = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&frame),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+    };
+    state.layers.push(id);
+    state.synchronize_scene(window as usize, &[base.clone()]);
+    assert_eq!(
+        state.stage_composite_layer(id, &frame, &source, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(id, &frame);
+    state.idle();
+    assert!(
+        state.scene_layers.is_empty(),
+        "FIFO fixture did not flatten"
+    );
+    let masked = ScenePlacement {
+        rounded: vec![scene::RoundedClip {
+            frame: base.frame,
+            radius: 32.0,
+        }],
+        ..base
+    };
+    assert!(state.synchronize_scene(window as usize, &[masked]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            frame.width,
+            frame.height,
+            0,
+            0
+        ),
+        [0, 0, 0, 0]
+    );
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            frame.width,
+            frame.height,
+            80,
+            60
+        ),
+        [0, 255, 0, 255]
+    );
+    drop(state);
+    gpu.destroy_image(source);
+    sdl3::video::destroy_window(window);
+}
+
+/// The sRGB view's sampler decodes RGB to linear floats. Retained scene
+/// composition uses display-referred RGBA8 bytes; it must encode the sampled
+/// sRGB source back before source-over blending into a UNORM accumulator.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
+    if isolate_vulkan_graphical_test(
+        "srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, bottom, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let top = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_SRGB,
+            width: whole.width,
+            height: whole.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("sRGB Metal source");
+    let bytes = u64::from(whole.width) * u64::from(whole.height) * 4;
+    let upload = gpu.create_buffer(bytes).expect("raw sRGB texels");
+    // B8G8R8A8: premultiplied source RGB=(96,64,32), alpha=128.
+    // This nontrivial encoded midtone must not be mistaken for the sampler's
+    // decoded linear components.
+    for i in 0..(bytes as usize / 4) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                [32u8, 64, 96, 128].as_ptr(),
+                upload.contents.add(i * 4),
+                4,
+            )
+        };
+    }
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            bottom.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [10.0 / 255.0, 50.0 / 255.0, 180.0 / 255.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+        device.cmd_copy_buffer_to_image(
+            cb,
+            upload.buffer,
+            top.image,
+            vk::ImageLayout::GENERAL,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: whole.width,
+                    height: whole.height,
+                    depth: 1,
+                })],
+        );
+    })
+    .expect("upload midtone SRGB image");
+    gpu.destroy_buffer(upload);
+    let background = 611;
+    let foreground = 612;
+    state.layers = vec![background, foreground];
+    state.synchronize_scene(
+        window as usize,
+        &[
+            ScenePlacement {
+                id: background,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                opaque: true,
+                clip: None,
+                rounded: vec![],
+            },
+            ScenePlacement {
+                id: foreground,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                opaque: false,
+                clip: None,
+                rounded: vec![],
+            },
+        ],
+    );
+    assert_eq!(
+        state.stage_composite_layer(
+            background,
+            &whole,
+            &bottom,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(background, &whole);
+    assert_eq!(
+        state.stage_composite_layer(
+            foreground,
+            &whole,
+            &top,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(foreground, &whole);
+    state.idle();
+    let pixel = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        whole.width,
+        whole.height,
+        80,
+        60,
+    );
+    // 96 + 10*(127/255), 64 + 50*(127/255), 32 + 180*(127/255).
+    for (actual, expected) in pixel.iter().zip([101u8, 89, 122, 255]) {
+        assert!(
+            (i32::from(*actual) - i32::from(expected)).abs() <= 2,
+            "sRGB source-over mismatch: pixel={pixel:?}"
+        );
+    }
+    drop(state);
+    gpu.destroy_image(bottom);
+    gpu.destroy_image(top);
+    sdl3::video::destroy_window(window);
+}
+
+/// A CA-only property update must withdraw an already-published direct WSI
+/// image and recompose its *retained* last drawable with the new mask.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
+    if isolate_vulkan_graphical_test("direct_wsi_static_drawable_recomposes_after_ca_mask_changes")
+    {
+        return;
+    }
+    let Some((window, gpu, mut state, green, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    if !matches!(
+        state.present_mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) {
+        gpu.destroy_image(green);
+        drop(state);
+        sdl3::video::destroy_window(window);
+        return;
+    }
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            green.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("green source");
+    let id = 404;
+    let base = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+    };
+    state.layers.push(id);
+    state.synchronize_scene(window as usize, &[base.clone()]);
+    assert!(fast_direct_scene(&state, id, &whole, None, true));
+    state.queue_direct(
+        id,
+        &whole,
+        PresentSource::from(&green),
+        &mut SourceOwner(None),
+        None,
+    );
+    state
+        .flush_composite(window)
+        .expect("actual direct WSI present");
+    assert!(
+        state.direct.is_some(),
+        "fixture did not enter actual direct path"
+    );
+    assert!(state.composite.is_none(), "unexpected early accumulator");
+    let rounded = scene::RoundedClip {
+        frame: DirectFrame::from_frame(&whole),
+        radius: 35.0,
+    };
+    let new = ScenePlacement {
+        rounded: vec![rounded],
+        ..base.clone()
+    };
+    assert!(state.synchronize_scene(window as usize, &[new.clone()]));
+    assert!(state.scene_repaint_needed);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(
+        state.direct.is_none(),
+        "masked scene was left in direct mode"
+    );
+    let pixel = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.window_width,
+            whole.window_height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(
+        pixel(&state, 0, 0),
+        [0, 0, 0, 0],
+        "rounded corner leaked direct pixels"
+    );
+    assert_eq!(pixel(&state, 80, 60), [0, 255, 0, 255]);
+    // Removing the rounded mask, then restricting the rectangular ancestor,
+    // still updates the same preserved green drawable without new submissions.
+    let unrounded = ScenePlacement {
+        rounded: vec![],
+        ..new
+    };
+    assert!(state.synchronize_scene(window as usize, &[unrounded.clone()]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(
+        state.direct.is_some(),
+        "unmasked layer did not restore direct WSI"
+    );
+    let rect = DirectFrame::from_frame(&appkit::view::Frame {
+        x: 20,
+        y: 15,
+        width: 110,
+        height: 75,
+        ..whole
+    });
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            clip: Some(rect),
+            ..unrounded
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(
+        state.direct.is_none(),
+        "rectangular mask left the old direct WSI image"
+    );
+    assert_eq!(pixel(&state, 5, 5), [0, 0, 0, 0]);
+    assert_eq!(pixel(&state, 80, 60), [0, 255, 0, 255]);
+    drop(state);
+    gpu.destroy_image(green);
+    sdl3::video::destroy_window(window);
+}
+
 /// Rounded masks from one or more ancestor CALayers multiply the Metal
 /// drawable's alpha, including its corners. No CPU surface readback or
 /// second Metal drawable is required when the CA geometry changes.

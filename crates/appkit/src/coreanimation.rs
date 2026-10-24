@@ -297,22 +297,43 @@ pub(crate) unsafe fn set_opacity_for_test(layer: Id, opacity: f32) {
     unsafe { set_opacity(layer, objc::sel::get("setOpacity:"), opacity) };
 }
 
+/// Resolve CA ancestry by its synchronized side-table identifiers only.
+/// A queued change never keeps or dereferences a guest Objective-C pointer.
+fn scene_root_key(nodes: &HashMap<usize, Node>, layer: usize) -> usize {
+    let mut at = layer;
+    for _ in 0..256 {
+        let Some(node) = nodes.get(&at) else { break };
+        if node.superlayer == 0 {
+            break;
+        }
+        at = node.superlayer;
+    }
+    at
+}
+
 /// A layer setter may execute on a guest thread other than AppKit's.
 /// Mark a transaction dirty rather than dereferencing a mutable NSView.
-pub(crate) fn changed(_layer: Id) {
-    crate::view::invalidate_metal_scene(true);
+pub(crate) fn changed(layer: Id) {
+    let root = read_all_nodes(|nodes| scene_root_key(nodes, layer as usize));
+    crate::view::invalidate_ca_layer(root);
 }
 
 /// Whether a currently progressing opacity animation needs a new retained
 /// scene at the next video-thread pump, independent of drawable submissions.
-pub(crate) fn scene_opacity_animating(now: f64) -> bool {
+pub(crate) fn scene_opacity_animating(now: f64) -> Vec<usize> {
     read_all_nodes(|nodes| {
-        nodes.values().any(|node| {
-            node.animations.iter().any(|(_, animation)| {
-                animation.spec.key_path == "opacity"
-                    && !progress(&animation.spec, animation.start, now).1
+        nodes
+            .iter()
+            .filter_map(|(id, node)| {
+                node.animations
+                    .iter()
+                    .any(|(_, animation)| {
+                        animation.spec.key_path == "opacity"
+                            && !progress(&animation.spec, animation.start, now).1
+                    })
+                    .then(|| scene_root_key(nodes, *id))
             })
-        })
+            .collect()
     })
 }
 

@@ -345,10 +345,13 @@ pub(crate) struct Placement {
     /// scene's per-frame GPU clip buffer (zero for ordinary overlays).
     pub round_start: u32,
     pub round_count: u32,
+    /// The sampled source has Vulkan's implicit sRGB-to-linear decode, but
+    /// the scene accumulator stores display-referred RGBA8 bytes.
+    pub sampled_srgb: u32,
 }
 
 impl Placement {
-    pub(crate) fn bytes(&self) -> [u8; 56] {
+    pub(crate) fn bytes(&self) -> [u8; 60] {
         let words = [
             self.x as u32,
             self.y as u32,
@@ -364,8 +367,9 @@ impl Placement {
             u32::from(self.clear),
             self.round_start,
             self.round_count,
+            self.sampled_srgb,
         ];
-        let mut bytes = [0; 56];
+        let mut bytes = [0; 60];
         for (at, word) in words.into_iter().enumerate() {
             bytes[at * 4..at * 4 + 4].copy_from_slice(&word.to_ne_bytes());
         }
@@ -656,6 +660,7 @@ pub(crate) fn blend<'a>(
                     clear: false,
                     round_start: 0,
                     round_count: 0,
+                    sampled_srgb: 0,
                 };
                 if placement.width == 0 || placement.height == 0 {
                     continue;
@@ -921,10 +926,10 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     }
 
     let placement = b.type_struct([
-        int, int, uint, uint, uint, uint, int, int, uint, uint, float, uint, uint, uint,
+        int, int, uint, uint, uint, uint, int, int, uint, uint, float, uint, uint, uint, uint,
     ]);
     b.decorate(placement, Decoration::Block, []);
-    for member in 0..14 {
+    for member in 0..15 {
         b.member_decorate(
             placement,
             member,
@@ -953,6 +958,12 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let function = b.type_function(void, []);
     let main = b.begin_function(void, None, spirv::FunctionControl::NONE, function)?;
     b.begin_block(None)?;
+    let encoded_source = if scene {
+        let ptr = b.type_pointer(None, StorageClass::Function, vec4);
+        Some(b.variable(ptr, None, StorageClass::Function, None))
+    } else {
+        None
+    };
     let (round_index, coverage) = if scene {
         let uint_var = b.type_pointer(None, StorageClass::Function, uint);
         let float_var = b.type_pointer(None, StorageClass::Function, float);
@@ -983,6 +994,7 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let clear = member(&mut b, 11, uint_pointer, uint)?;
     let round_start = member(&mut b, 12, uint_pointer, uint)?;
     let round_count = member(&mut b, 13, uint_pointer, uint)?;
+    let sampled_srgb = member(&mut b, 14, uint_pointer, uint)?;
     let target_width = b.bitcast(int, None, target_width)?;
     let target_height = b.bitcast(int, None, target_height)?;
     let global = b.load(uvec3, None, id, None, [])?;
@@ -1044,6 +1056,51 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
         spirv::ImageOperands::LOD,
         [Operand::IdRef(zero)],
     )?;
+    // Vulkan sampled-image reads decode R8/B8G8R8A8_SRGB RGB to linear.
+    // Rosemary's AppKit backing and RGBA8_UNORM scene accumulator currently
+    // use display-referred (encoded) sRGB bytes for source-over composition.
+    // Restore that encoding exactly once for explicitly sRGB Metal sources;
+    // UNORM sources remain numerically unchanged. Alpha is never gamma-coded.
+    let over = if let Some(encoded_source) = encoded_source {
+        b.store(encoded_source, over, None, [])?;
+        let zero_uint = b.constant_bit32(uint, 0);
+        let nonzero = b.i_not_equal(boolean, None, sampled_srgb, zero_uint)?;
+        let encode = b.id();
+        let done = b.id();
+        b.selection_merge(done, spirv::SelectionControl::NONE)?;
+        b.branch_conditional(nonzero, encode, done, [])?;
+        b.begin_block(Some(encode))?;
+        let threshold = b.constant_bit32(float, 0.0031308f32.to_bits());
+        let factor = b.constant_bit32(float, 12.92f32.to_bits());
+        let offset = b.constant_bit32(float, 0.055f32.to_bits());
+        let one055 = b.constant_bit32(float, 1.055f32.to_bits());
+        let exponent = b.constant_bit32(float, (1.0f32 / 2.4).to_bits());
+        let mut channels = Vec::with_capacity(4);
+        for index in 0..3 {
+            let input = b.composite_extract(float, None, over, [index])?;
+            let low = b.f_mul(float, None, input, factor)?;
+            let pow = b.ext_inst(
+                float,
+                None,
+                glsl,
+                26,
+                [Operand::IdRef(input), Operand::IdRef(exponent)],
+            )?;
+            let high = b.f_mul(float, None, pow, one055)?;
+            let high = b.f_sub(float, None, high, offset)?;
+            let near_zero = b.f_ord_less_than_equal(boolean, None, input, threshold)?;
+            let encoded = b.select(float, None, near_zero, low, high)?;
+            channels.push(encoded);
+        }
+        channels.push(b.composite_extract(float, None, over, [3])?);
+        let corrected = b.composite_construct(vec4, None, channels)?;
+        b.store(encoded_source, corrected, None, [])?;
+        b.branch(done)?;
+        b.begin_block(Some(done))?;
+        b.load(vec4, None, encoded_source, None, [])?
+    } else {
+        over
+    };
     let over = b.vector_times_scalar(vec4, None, over, opacity)?;
     let over = if let (Some(buffer), Some(ptr), Some(index_var), Some(coverage_var)) =
         (rounded, rounded_vec_pointer, round_index, coverage)
@@ -1195,12 +1252,14 @@ mod tests {
             clear: false,
             round_start: 0,
             round_count: 0,
+            sampled_srgb: 0,
         };
         let bytes = placement.bytes();
         assert_eq!(&bytes[0..4], &(-3i32).to_ne_bytes());
         assert_eq!(&bytes[20..24], &8u32.to_ne_bytes());
         assert_eq!(&bytes[24..28], &(-2i32).to_ne_bytes());
         assert_eq!(&bytes[40..44], &0.5f32.to_ne_bytes());
+        assert_eq!(&bytes[56..60], &0u32.to_ne_bytes());
     }
 
     #[test]

@@ -122,14 +122,26 @@ static METAL_SCENES: std::sync::Mutex<
 // No guest setter thread is allowed to borrow an NSView's subviews. Mark a
 // transaction dirty and let the video owner capture it once per event turn.
 static METAL_SCENE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static METAL_VIEW_SCENE_DIRTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 static METAL_CA_DAMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// CA roots are numerical identities; only the video owner associates them
+/// with live windows after walking the NSView tree.
+static METAL_CA_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+static METAL_SCENE_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
 static METAL_SCENE_WAS_ANIMATING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static METAL_SCENE_LAST_ANIM_FRAME: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
+static METAL_LAST_ANIM_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
 #[cfg(test)]
 static METAL_SCENE_CAPTURES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static METAL_SCENE_DAMAGED_WINDOWS: std::sync::Mutex<Vec<usize>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Queue from any guest thread, including while AppKit is reparenting views.
 /// No Objective-C pointer or mutable NSView field is touched here.
@@ -139,7 +151,18 @@ pub fn metal_scene_pending() -> bool {
     METAL_SCENE_DIRTY.load(std::sync::atomic::Ordering::Acquire)
 }
 
+pub(crate) fn invalidate_ca_layer(root: usize) {
+    // Never inspect NSView or SDL from the setter thread. A root not in the
+    // published owner table triggers a conservative full-window fallback.
+    let mut roots = METAL_CA_ROOTS.lock().expect("CA dirty roots");
+    if !roots.contains(&root) {
+        roots.push(root);
+    }
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
 pub(crate) fn invalidate_metal_scene(ca_damage: bool) {
+    METAL_VIEW_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
     if ca_damage {
         METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -154,11 +177,10 @@ pub(crate) fn flush_metal_scenes() {
         return;
     }
     let now = darwin::mach::media_time();
-    let animating = crate::coreanimation::scene_opacity_animating(now);
+    let animated_roots = crate::coreanimation::scene_opacity_animating(now);
+    let animating = !animated_roots.is_empty();
     let was_animating =
         METAL_SCENE_WAS_ANIMATING.swap(animating, std::sync::atomic::Ordering::AcqRel);
-    // Limit animation-only recaptures to 250 Hz even when a guest spins its
-    // event loop faster. Model/property changes always bypass this throttle.
     if animating && !metal_scene_pending() {
         let last = METAL_SCENE_LAST_ANIM_FRAME
             .lock()
@@ -169,10 +191,14 @@ pub(crate) fn flush_metal_scenes() {
     }
     let dirty = METAL_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
     let damage = METAL_CA_DAMAGE.swap(false, std::sync::atomic::Ordering::AcqRel);
-    if damage && !dirty {
-        // A CA setter can publish damage between the dirty-flag swap and
-        // this one. Carry both flags into the following turn.
-        METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
+    let view_dirty = METAL_VIEW_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+    if (damage || view_dirty) && !dirty {
+        if damage {
+            METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
+        }
+        if view_dirty {
+            METAL_VIEW_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+        }
         METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
     }
     if !dirty && !animating && !was_animating {
@@ -183,12 +209,53 @@ pub(crate) fn flush_metal_scenes() {
             .lock()
             .expect("Metal animation tick") = Some(std::time::Instant::now());
     }
+    // Drain only the roots pending at this transaction boundary. A CA setter
+    // racing the drain re-sets DIRTY and its root persists to the next turn.
+    let roots = std::mem::take(&mut *METAL_CA_ROOTS.lock().expect("CA dirty roots"));
+    let mut all_roots = roots.clone();
+    {
+        let mut last = METAL_LAST_ANIM_ROOTS
+            .lock()
+            .expect("last CA animation roots");
+        if was_animating && !animating {
+            all_roots.extend(last.iter().copied());
+        }
+        *last = animated_roots.clone();
+    }
+    all_roots.extend(animated_roots);
+    let owners = METAL_SCENE_OWNERS.lock().expect("CA owner windows");
+    let mut affected = std::collections::HashSet::new();
+    let mut unknown = false;
+    for root in all_roots {
+        let mut matched = false;
+        for (window, layers) in owners.iter() {
+            if layers.contains(&root) {
+                affected.insert(*window);
+                matched = true;
+            }
+        }
+        if !matched {
+            unknown = true;
+        }
+    }
+    drop(owners);
+    // View hierarchy mutations have no trusted target identifier: capture all
+    // live windows. CA changes with a published root affect only their owner.
+    let global = damage || view_dirty || unknown;
     for window in crate::window::all() {
         let sdl = unsafe { crate::window::sdl_window(window) };
         if sdl.is_null() {
             continue;
         }
-        if damage {
+        if !global && !affected.contains(&(sdl as usize)) {
+            continue;
+        }
+        if damage || !roots.is_empty() && (unknown || affected.contains(&(sdl as usize))) {
+            #[cfg(test)]
+            METAL_SCENE_DAMAGED_WINDOWS
+                .lock()
+                .expect("CA damage audit")
+                .push(sdl as usize);
             crate::backing::damage_view(crate::window::content_view_of(window));
         }
         publish_metal_scene_at(sdl, now);
@@ -211,17 +278,22 @@ pub fn metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
 }
 
 /// Only invoked on the AppKit mutator thread, not from Metal's presenter.
-fn capture_metal_scene(window: sdl3::Window, now: f64) -> Option<Vec<MetalSceneLayer>> {
+fn capture_metal_scene(
+    window: sdl3::Window,
+    now: f64,
+) -> Option<(Vec<MetalSceneLayer>, Vec<usize>)> {
     let nswindow = crate::window::window_for(window);
     if nswindow.is_null() {
         return None;
     }
     let content = crate::window::content_view_of(nswindow);
     let mut result = Vec::new();
+    let mut roots = Vec::new();
     visit_metal_scene(
         content,
         window,
         &mut result,
+        &mut roots,
         None,
         1.0,
         std::ptr::null_mut(),
@@ -231,13 +303,14 @@ fn capture_metal_scene(window: sdl3::Window, now: f64) -> Option<Vec<MetalSceneL
     );
     #[cfg(test)]
     METAL_SCENE_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(result)
+    Some((result, roots))
 }
 
 fn visit_metal_scene(
     view: Id,
     window: sdl3::Window,
     scene: &mut Vec<MetalSceneLayer>,
+    roots: &mut Vec<usize>,
     inherited_clip: Option<Frame>,
     inherited_layer_opacity: f32,
     parent_layer: Id,
@@ -249,6 +322,9 @@ fn visit_metal_scene(
         return;
     }
     let layer = view_of(view).layer;
+    if !layer.is_null() {
+        roots.push(layer as usize);
+    }
     let (hidden, own_layer_opacity) = if layer.is_null() {
         (false, 1.0)
     } else {
@@ -309,6 +385,7 @@ fn visit_metal_scene(
                 child as Id,
                 window,
                 scene,
+                roots,
                 child_clip,
                 layer_opacity,
                 if layer.is_null() { parent_layer } else { layer },
@@ -338,7 +415,11 @@ fn intersect_scene_clips(a: Frame, b: Frame) -> Frame {
 
 fn publish_metal_scene_at(sdl: sdl3::Window, now: f64) {
     debug_assert!(sdl3::video::is_video_thread());
-    let scene = capture_metal_scene(sdl, now).unwrap_or_default();
+    let (scene, roots) = capture_metal_scene(sdl, now).unwrap_or_default();
+    METAL_SCENE_OWNERS
+        .lock()
+        .expect("CA owner windows")
+        .insert(sdl as usize, roots);
     let changed = METAL_SCENES
         .lock()
         .expect("AppKit scene snapshots")
@@ -374,6 +455,10 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
 }
 
 pub fn forget_metal_scene(sdl: sdl3::Window) {
+    METAL_SCENE_OWNERS
+        .lock()
+        .expect("CA owner windows")
+        .remove(&(sdl as usize));
     if let Some(cache) = METAL_SCENES
         .lock()
         .expect("AppKit scene snapshots")
@@ -3379,6 +3464,28 @@ mod tests {
             }
             assert_eq!(ids(sdl), [first as usize]);
             assert_eq!(ids(other_sdl), [second as usize]);
+            METAL_SCENE_DAMAGED_WINDOWS.lock().unwrap().clear();
+            let before = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+            // A CA setter on the first window neither walks nor damages the
+            // second window, although both remain alive and visible.
+            unsafe { crate::coreanimation::set_opacity_for_test(first, 0.83) };
+            assert_eq!(
+                METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed),
+                before
+            );
+            flush_metal_scenes();
+            assert_eq!(
+                METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed) - before,
+                1,
+                "one CA setter captured an unrelated NSWindow"
+            );
+            assert_eq!(
+                *METAL_SCENE_DAMAGED_WINDOWS.lock().unwrap(),
+                [sdl as usize],
+                "CA property mutation damaged another window's CPU backing"
+            );
+            assert!((metal_scene(sdl).unwrap()[0].opacity - 0.83).abs() < 0.001);
+            assert_eq!(metal_scene(other_sdl).unwrap()[0].opacity, 0.5);
             unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
             assert_eq!(ids(other_sdl), []);
             // Another guest thread may mutate an ordinary CALayer while the
