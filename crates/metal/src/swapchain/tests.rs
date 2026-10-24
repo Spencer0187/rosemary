@@ -3737,6 +3737,320 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
     sdl3::video::destroy_window(window);
 }
 
+/// Rounded native view clips must not turn the region behind it into a hole
+/// in the static opaque Metal drawable. The layer shader must draw the native
+/// source only within its rounded mask, revealing green Metal at the corners.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn rounded_native_opaque_overlay_preserves_metal_corners() {
+    if isolate_vulkan_graphical_test("rounded_native_opaque_overlay_preserves_metal_corners") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("static green metal source");
+    let metal_layer = 0x313;
+    let native_layer = (1usize << (usize::BITS - 1)) | 0x314;
+    let bottom = ScenePlacement {
+        id: metal_layer,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let native = ScenePlacement {
+        id: native_layer,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![scene::RoundedClip {
+            frame: DirectFrame::from_frame(&whole),
+            radius: 35.0,
+        }],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 255, 255].repeat((whole.width * whole.height) as usize)),
+            revision: 1,
+            dmabuf: None,
+        }),
+    };
+    state.layers.push(metal_layer);
+    state.synchronize_scene(window as usize, &[bottom.clone(), native.clone()]);
+    assert_eq!(
+        state.stage_composite_layer(
+            metal_layer,
+            &whole,
+            &metal,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(metal_layer, &whole);
+    assert_eq!(stage_native_scene_source(&mut state, &native), Ok(true));
+    state.synchronize_scene(window as usize, &[bottom, native]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 0, 0),
+        [0, 255, 0, 255],
+        "rounded native corner incorrectly erased underlying metal"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 80, 60),
+        [255, 0, 0, 255],
+        "opaque native center should cover Metal"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// An invalid native DMA-BUF is a permanent capability failure, not an
+/// unfinished WSI fence. Verify a later software replacement can still draw
+/// over the previously successful Metal layer after the failed import.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
+    if isolate_vulkan_graphical_test("refused_native_dma_buff_does_not_block_later_cpu_scene") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let id = 7077usize;
+    let native_id = (1usize << (usize::BITS - 1)) | 7078;
+    let bottom = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.push(id);
+    state.synchronize_scene(window as usize, &[bottom.clone()]);
+    assert_eq!(
+        state.stage_composite_layer(id, &whole, &metal, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(id, &whole);
+    let native_frame = appkit::view::Frame {
+        x: 40,
+        y: 35,
+        width: 30,
+        height: 25,
+        ..whole
+    };
+    let invalid = ScenePlacement {
+        id: native_id,
+        frame: DirectFrame::from_frame(&native_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 11,
+            dmabuf: Some(Arc::new(appkit::backing::Dmabuf {
+                width: 30,
+                height: 25,
+                fourcc: 0,
+                modifier: 0,
+                planes: vec![],
+            })),
+        }),
+    };
+    // Mirror the worker's transactional order: do not mutate scene
+    // membership to the proposed native source before verifying the import.
+    let before_layers = state.layers.clone();
+    let before_placements: Vec<_> = state.scene_placements.iter().map(|p| p.id).collect();
+    let previous_image = state.scene_layers.iter().find(|p| p.id == id).map_or_else(
+        || state.composite.as_ref().unwrap().image,
+        |layer| layer.snapshot.image.image,
+    );
+    assert_eq!(
+        stage_native_scene_source(&mut state, &invalid),
+        Err("native-dmabuf-import-refused".to_string())
+    );
+    assert!(
+        !appkit::backing::shows_dmabufs(window),
+        "failed external import did not disable DMA-BUF output for CPU fallback"
+    );
+    let upload_count = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    for _ in 0..16 {
+        assert_eq!(
+            stage_native_scene_source(&mut state, &invalid),
+            Err("native-dmabuf-import-refused".to_string())
+        );
+    }
+    assert_eq!(
+        NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed),
+        upload_count,
+        "permanently rejected DMA-BUF allocated or uploaded again"
+    );
+    assert!(
+        state.scene_layers.iter().all(|layer| layer.id != native_id),
+        "failed native import became a ready layer"
+    );
+    assert_eq!(
+        state.layers, before_layers,
+        "permanent import failure removed a previously retained layer"
+    );
+    assert_eq!(
+        state
+            .scene_placements
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        before_placements,
+        "permanent failure committed new CA placements"
+    );
+    let remaining_image = state.scene_layers.iter().find(|p| p.id == id).map_or_else(
+        || state.composite.as_ref().unwrap().image,
+        |layer| layer.snapshot.image.image,
+    );
+    assert_eq!(
+        remaining_image, previous_image,
+        "permanent failure released the previous complete Metal image"
+    );
+    // The rejected overlay must not hold other CA changes hostage. The last
+    // accepted Metal frame can be repainted at a new opacity while the
+    // unsupported native picture is excluded awaiting a software redraw.
+    let half_metal = ScenePlacement {
+        opacity: 0.5,
+        ..bottom.clone()
+    };
+    let cleaned = preserve_refused_native_sources(
+        &state,
+        vec![half_metal.clone(), invalid.clone()],
+        &[native_id],
+    );
+    assert_eq!(cleaned.len(), 1, "new rejected source should be absent");
+    state.synchronize_scene(window as usize, &cleaned);
+    assert!(state.scene_repaint_needed);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let unaffected = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        whole.width,
+        whole.height,
+        80,
+        60,
+    );
+    assert!(
+        (i32::from(unaffected[1]) - 128).abs() <= 2,
+        "an unrelated Metal opacity update stalled behind failed DMA: {unaffected:?}"
+    );
+    let cpu = ScenePlacement {
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 128, 128].repeat(30 * 25)),
+            revision: 12,
+            dmabuf: None,
+        }),
+        ..invalid
+    };
+    state.synchronize_scene(window as usize, &[bottom.clone(), cpu.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &cpu), Ok(true));
+    // Once a CPU replacement has been accepted, a later refused DMA revision
+    // must retain those last valid native pixels, not erase them.
+    let second_invalid = ScenePlacement {
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 13,
+            dmabuf: invalid.native.as_ref().unwrap().dmabuf.clone(),
+        }),
+        ..cpu.clone()
+    };
+    let accepted =
+        preserve_refused_native_sources(&state, vec![bottom.clone(), second_invalid], &[native_id]);
+    assert_eq!(accepted.len(), 2);
+    assert_eq!(
+        accepted[1].native.as_ref().unwrap().revision,
+        12,
+        "previously accepted native pixels were dropped on reimport failure"
+    );
+    state.synchronize_scene(
+        window as usize,
+        &[
+            ScenePlacement {
+                id,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                opaque: true,
+                clip: None,
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: None,
+            },
+            cpu,
+        ],
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let pixel = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        whole.width,
+        whole.height,
+        45,
+        40,
+    );
+    assert!(
+        (i32::from(pixel[0]) - 128).abs() <= 2 && (i32::from(pixel[1]) - 127).abs() <= 2,
+        "CPU replacement did not advance after failed DMA import: {pixel:?}"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 /// A native opaque view is an authoritative occlusion source even before
 /// a CPU backing store has arrived. Moving/removing it must repaint a static
 /// retained Metal image without a new Metal drawable submission.

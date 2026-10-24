@@ -175,6 +175,30 @@ static STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
 /// Each drawn view's own pixels, keyed by the view's address.
 static VIEW_STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
 
+/// Immutable per-view pixel captures keyed by native content versions, not by
+/// the view's window placement, opacity, corner mask or ancestor geometry.
+/// Only the AppKit owner thread accesses these entries. The GPU worker gets
+/// an Arc snapshot and never follows an Objective-C view pointer.
+struct NativeCapture {
+    layer: usize,
+    width: u32,
+    height: u32,
+    view_generation: Option<u64>,
+    overlay_generation: u64,
+    ca_epoch: u64,
+    ca_descendant_revision: u64,
+    pixels: std::sync::Arc<Vec<u8>>,
+    revision: u64,
+}
+static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<usize, NativeCapture>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static NATIVE_RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn native_render_count_for_tests() -> usize {
+    NATIVE_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// What a window's composite is waiting on: the part of it views have drawn
 /// over since it was last composed, and where each view was then, so that a
 /// view which moved, hid or went away is recomposed without drawing.
@@ -288,6 +312,16 @@ pub fn shows_dmabufs(sdl: sdl3::Window) -> bool {
 
 /// The presenter could not draw a dma-buf overlay on `sdl`'s window; from
 /// now on it is given pixels there.
+/// Whether an actual import failed. Unlike shows_dmabufs(), false before
+/// the first GPU present is not itself a permanent failure.
+pub fn dmabuf_import_refused(sdl: sdl3::Window) -> bool {
+    GPU_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(window, refused)| window == sdl as usize && refused)
+}
+
 pub fn refuse_dmabufs(sdl: sdl3::Window) {
     let mut windows = GPU_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     match windows
@@ -838,6 +872,10 @@ pub fn layer_drew_on_surface(sdl: sdl3::Window, layer: usize) {
 /// Forget a view that is being deallocated, so no pump draws freed memory.
 pub(crate) fn forget(view: Id) {
     let key = view as usize;
+    NATIVE_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     NEEDS_DISPLAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1223,6 +1261,7 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
         .filter(|p| {
             !p.clip.is_empty()
                 && p.alpha >= 1.0
+                && !crate::view::has_rounded_mask_ancestor(p.view)
                 && crate::view::native_scene_ca_opacity(p.view, darwin::mach::media_time()) >= 1.0
         })
         .filter(|p| {
@@ -1295,8 +1334,42 @@ pub(crate) fn native_scene_pixels(
         .find(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
         .map(|(_, entry)| entry);
     if source.is_none() && overlay.is_none() && !crate::coreanimation::has_tree(layer) {
+        NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(view as usize));
         return None;
     }
+    let view_generation = source.map(Store::generation);
+    let overlay_generation = OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(view as usize))
+        .copied()
+        .unwrap_or(0);
+    let ca_epoch = crate::coreanimation::native_scene_content_epoch();
+    let ca_descendant_revision = crate::coreanimation::native_scene_descendant_revision(layer);
+    let content_animating =
+        crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time());
+    if !content_animating
+        && let Some(hit) = NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(view as usize))
+            .filter(|hit| {
+                hit.layer == layer as usize
+                    && hit.width == width
+                    && hit.height == height
+                    && hit.view_generation == view_generation
+                    && hit.overlay_generation == overlay_generation
+                    && hit.ca_epoch == ca_epoch
+                    && hit.ca_descendant_revision == ca_descendant_revision
+            })
+    {
+        return Some((std::sync::Arc::clone(&hit.pixels), hit.revision));
+    }
+    #[cfg(test)]
+    NATIVE_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut output = Store::new(width, height);
     let whole = Rect {
         x: 0,
@@ -1325,12 +1398,55 @@ pub(crate) fn native_scene_pixels(
         .iter()
         .all(|pixel| pixel[3] == 0)
     {
+        NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(view as usize));
         return None;
     }
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     output.pixels.hash(&mut hasher);
-    Some((std::sync::Arc::new(output.pixels), hasher.finish()))
+    let revision = hasher.finish();
+    let pixels = std::sync::Arc::new(output.pixels);
+    let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if content_animating {
+        captures.remove(&(view as usize));
+    } else {
+        captures.insert(
+            view as usize,
+            NativeCapture {
+                layer: layer as usize,
+                width,
+                height,
+                view_generation,
+                overlay_generation,
+                ca_epoch,
+                ca_descendant_revision,
+                pixels: std::sync::Arc::clone(&pixels),
+                revision,
+            },
+        );
+        // Bound cached pixel payload across all views to 128 MiB, retaining
+        // the current capture. In-progress GPU users own their own Arc.
+        let mut used: usize = captures.values().map(|entry| entry.pixels.len()).sum();
+        if used > 128 * 1024 * 1024 {
+            let keys: Vec<_> = captures
+                .keys()
+                .copied()
+                .filter(|id| *id != view as usize)
+                .collect();
+            for id in keys {
+                if used <= 128 * 1024 * 1024 {
+                    break;
+                }
+                if let Some(entry) = captures.remove(&id) {
+                    used = used.saturating_sub(entry.pixels.len());
+                }
+            }
+        }
+    }
+    Some((pixels, revision))
 }
 
 /// Window backing source excluding native views painted *above* the first
@@ -1427,6 +1543,11 @@ pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
 
 /// Bring a window's composite up to date with its views: recompose what was
 /// drawn over, and everywhere a view appeared, moved or went away.
+#[cfg(test)]
+pub(crate) fn compose_window_for_tests(window: Id) {
+    compose_window(window);
+}
+
 fn compose_window(window: Id) {
     // First, so it drops last: after every lock below is released.
     let _owed = crate::coreanimation::defer_releases();
@@ -1752,6 +1873,47 @@ pub(crate) fn cpu_fallback_calls_for_tests(window: sdl3::Window) -> usize {
         .iter()
         .filter(|&&key| key == window as usize)
         .count()
+}
+
+/// Opt-in allocation/CPU benchmark for metadata-only native captures.
+/// The view is retained solely in the builtin AppKit test process, not on a
+/// host-visible desktop. Run with ROSEMARY_BENCH_NATIVE_4K=1 in release mode.
+#[test]
+fn metadata_only_4k_native_capture_reuses_immutable_pixels() {
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_4K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    let view = objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+    let (w, h) = (3840u32, 2160u32);
+    set_native_view_pixels_for_tests(
+        view,
+        w,
+        h,
+        [128u8, 64, 32, 255].repeat(w as usize * h as usize),
+    );
+    let before = native_render_count_for_tests();
+    let start = std::time::Instant::now();
+    let (original, revision) = native_scene_pixels(view, w, h).unwrap();
+    let first_ms = start.elapsed().as_secs_f64() * 1e3;
+    let start = std::time::Instant::now();
+    for _ in 0..240 {
+        let (cached, again) = native_scene_pixels(view, w, h).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original, &cached));
+        assert_eq!(again, revision);
+    }
+    let cached_us = start.elapsed().as_secs_f64() * 1e6 / 240.0;
+    assert_eq!(
+        native_render_count_for_tests() - before,
+        1,
+        "240 metadata updates allocated, rendered or hashed 4K sources again"
+    );
+    eprintln!(
+        "4K native pixel capture first_ms={first_ms:.3} metadata_cache_mean_us={cached_us:.3} bytes={} cache_renders=1",
+        original.len()
+    );
+    forget(view);
+    objc::arc::release(view);
 }
 
 #[cfg(test)]

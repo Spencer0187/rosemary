@@ -1719,7 +1719,10 @@ fn native_scene_source(
     }
     let pixels = match (pixels, dmabuf.as_ref()) {
         (Some(pixels), _) if pixels.len() as u64 == bytes => pixels,
-        (None, Some(_)) => Arc::new(vec![0u8; bytes as usize]),
+        // An empty byte slice means an entirely transparent native CPU base.
+        // The GPU clears the staging target; no full-resolution zero-filled
+        // CPU image is needed for a DMA-BUF-only overlay.
+        (None, Some(_)) => Arc::new(Vec::new()),
         _ => return None,
     };
     Some(scene::NativeCpuSceneSource {
@@ -1732,6 +1735,10 @@ fn native_scene_source(
 /// Upload native AppKit pixels exclusively on the window's worker, then copy
 /// to the same fence-retained scene snapshot used for Metal drawables. AppKit
 /// publishes immutable bytes but never blocks on a Vulkan queue.
+#[cfg(test)]
+static NATIVE_IMAGE_UPLOAD_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 fn stage_native_scene_source(
     state: &mut Swapchain,
     layer: &ScenePlacement,
@@ -1739,6 +1746,13 @@ fn stage_native_scene_source(
     let Some(native) = layer.native.as_ref() else {
         return Ok(true);
     };
+    if native.dmabuf.is_some()
+        && appkit::backing::dmabuf_import_refused(layer.frame.window as sdl3::Window)
+    {
+        // Failure belongs to this window's importer capability, not a fence.
+        // Avoid all CPU/GPU allocation on future snapshots of the same source.
+        return Err("native-dmabuf-import-refused".into());
+    }
     // A direct WSI source is not a retained scene image. Materialize it
     // *before* recording the newly appearing native layer, or the latter's
     // transparent regions will permanently erase the still-static Metal
@@ -1762,9 +1776,12 @@ fn stage_native_scene_source(
             .saturating_mul(u64::from(frame.height))
             .saturating_mul(4)
             != native.bytes.len() as u64
+            && !(native.bytes.is_empty() && native.dmabuf.is_some())
     {
         return Err("invalid native AppKit scene pixel extent".into());
     }
+    #[cfg(test)]
+    NATIVE_IMAGE_UPLOAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let gpu = state.gpu;
     let image = gpu.create_image(&ImageDescription {
         image_type: vk::ImageType::TYPE_2D,
@@ -1781,32 +1798,56 @@ fn stage_native_scene_source(
         components: vk::ComponentMapping::default(),
     })?;
     let lease = BackingImageLease::new(gpu, image);
-    let staging = gpu.create_buffer(native.bytes.len() as u64)?;
-    unsafe {
-        std::ptr::copy_nonoverlapping(native.bytes.as_ptr(), staging.contents, native.bytes.len())
-    };
-    let upload = gpu.one_shot(|device, cb| unsafe {
-        device.cmd_copy_buffer_to_image(
-            cb,
-            staging.buffer,
-            lease.image.image,
-            vk::ImageLayout::GENERAL,
-            &[vk::BufferImageCopy::default()
-                .image_subresource(vk::ImageSubresourceLayers {
+    if native.bytes.is_empty() {
+        gpu.one_shot(|device, cb| unsafe {
+            device.cmd_clear_color_image(
+                cb,
+                lease.image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [0.0, 0.0, 0.0, 0.0],
+                },
+                &[vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
+                    base_mip_level: 0,
+                    level_count: 1,
                     base_array_layer: 0,
                     layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width: frame.width,
-                    height: frame.height,
-                    depth: 1,
-                })],
-        );
-    });
-    gpu.destroy_buffer(staging);
-    upload?;
+                }],
+            );
+        })?;
+    } else {
+        let staging = gpu.create_buffer(native.bytes.len() as u64)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                native.bytes.as_ptr(),
+                staging.contents,
+                native.bytes.len(),
+            )
+        };
+        let upload = gpu.one_shot(|device, cb| unsafe {
+            device.cmd_copy_buffer_to_image(
+                cb,
+                staging.buffer,
+                lease.image.image,
+                vk::ImageLayout::GENERAL,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: frame.width,
+                        height: frame.height,
+                        depth: 1,
+                    })],
+            );
+        });
+        gpu.destroy_buffer(staging);
+        upload?;
+    }
     // The existing DMA-BUF importer already validates external memory and
     // performs acquire/release barriers. Render onto a transparent (or CPU
     // backed) native source *before* staging that source as an ordered scene
@@ -1826,7 +1867,10 @@ fn stage_native_scene_source(
         }];
         if !crate::overlay::blend(gpu, &lease.image, &output.image, &overlay)?.is_empty() {
             appkit::backing::refuse_dmabufs(frame.window);
-            return Ok(false);
+            // Import refusal is permanent for this buffer/format, not a
+            // temporary fence shortage. The producer is now told to use CPU
+            // pixels. Do not schedule a 10-ms GPU reupload of this image.
+            return Err("native-dmabuf-import-refused".into());
         }
         Some(output)
     } else {
@@ -1856,9 +1900,43 @@ fn stage_native_scene_source(
     Ok(true)
 }
 
+/// A refused native DMA-BUF must not prevent unrelated Metal visibility or
+/// opacity changes from publishing. Retain its previously accepted GPU image
+/// (if any), using the *current* placement; otherwise omit only that native
+/// source. No rejected image is treated as successfully imported.
+fn preserve_refused_native_sources(
+    state: &Swapchain,
+    mut live: Vec<ScenePlacement>,
+    refused: &[usize],
+) -> Vec<ScenePlacement> {
+    live.retain_mut(|placement| {
+        if !refused.contains(&placement.id) {
+            return true;
+        }
+        let retained = state
+            .scene_layers
+            .iter()
+            .any(|source| source.id == placement.id && source.ready);
+        let old = state
+            .scene_placements
+            .iter()
+            .find(|previous| previous.id == placement.id && previous.native.is_some());
+        if retained && let Some(old) = old {
+            placement.native.clone_from(&old.native);
+            true
+        } else {
+            false
+        }
+    });
+    live
+}
+
 fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
     let mut prepare_failures = 0u32;
     let mut acquire_timeouts = 0u32;
+    // Do not request a CPU redraw for an identical rejected producer frame on
+    // every unrelated CA transaction. New native revisions can request again.
+    let mut refused_revisions = std::collections::HashMap::<usize, u64>::new();
     loop {
         // Wait without polling when clean. The writer sets composite_dirty under
         // the same mutex before signaling us, so notifications are not lost.
@@ -1924,17 +2002,40 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             let mut retry_delay = None;
             let mut device_lost = false;
             if let Some(live) = snapshot {
+                refused_revisions.retain(|id, _| live.iter().any(|p| p.id == *id));
                 let mut state = entry.state.lock().expect("window swapchain");
-                // New native source placements must be authoritative before
-                // their first GPU staging (including opacity and CA masks).
-                state.synchronize_scene(window, &live);
+                // Stage native sources before committing the proposed view
+                // hierarchy. A permanently refused DMA-BUF must not prune
+                // previously retained Metal images, direct sources or scene
+                // membership; only a complete import-ready snapshot may
+                // replace the last accepted scene. Scene metadata is applied
+                // in the subsequent synchronize_scene/redisplay_scene pass.
                 let mut native_ready = true;
+                let mut refused = Vec::new();
                 for layer in live.iter().filter(|p| p.native.is_some()) {
                     match stage_native_scene_source(&mut state, layer) {
                         Ok(true) => {}
                         Ok(false) => {
                             native_ready = false;
                             break;
+                        }
+                        Err(reason) if reason == "native-dmabuf-import-refused" => {
+                            // Keep the last successfully published window
+                            // image. Its producer will receive the changed
+                            // importer capability and next supply CPU pixels;
+                            // retries of the unchanged DMA-BUF cannot help.
+                            let revision = layer.native.as_ref().unwrap().revision;
+                            if refused_revisions.insert(layer.id, revision) != Some(revision) {
+                                appkit::view::request_native_cpu_fallback(
+                                    window as sdl3::Window,
+                                    layer.id,
+                                );
+                            }
+                            refused.push(layer.id);
+                            // Continue staging unaffected native sources. The
+                            // rejected one is restored from the last accepted
+                            // GPU snapshot, or omitted when none existed.
+                            continue;
                         }
                         Err(reason) => {
                             gpu::trace(format!("native AppKit scene staging failed: {reason}"));
@@ -1945,13 +2046,17 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         }
                     }
                 }
+                let effective = preserve_refused_native_sources(&state, live, &refused);
                 if !native_ready {
                     if !device_lost {
-                        requeue_scene(&entry.pending_scene, live);
+                        requeue_scene(&entry.pending_scene, effective);
                         retry_delay = Some(Duration::from_millis(10));
                     }
                 } else {
-                    state.synchronize_scene(window, &live);
+                    // Old accepted pixels are already in scene_layers; the
+                    // source corresponding to a refused id must not be staged
+                    // again merely because its AppKit metadata changed.
+                    state.synchronize_scene(window, &effective);
                     if state.scene_repaint_needed {
                         match state.redisplay_scene(window) {
                             Ok(true) => {
@@ -1961,7 +2066,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             Ok(false) => {
                                 // An unfinished staging fence cannot consume the
                                 // only notification for a visibility change.
-                                requeue_scene(&entry.pending_scene, live);
+                                requeue_scene(&entry.pending_scene, effective.clone());
                                 retry_delay = Some(Duration::from_millis(1));
                             }
                             Err(error) => {
@@ -1974,7 +2079,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                     // A transient recording/submission error must
                                     // not discard scene-only damage. Keep any
                                     // newer AppKit snapshot ahead of this retry.
-                                    requeue_scene(&entry.pending_scene, live);
+                                    requeue_scene(&entry.pending_scene, effective.clone());
                                     retry_delay = Some(Duration::from_millis(10));
                                 }
                             }

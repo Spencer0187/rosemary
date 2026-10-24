@@ -136,6 +136,54 @@ static METAL_CA_DAMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::Atomi
 /// CA roots are numerical identities; only the video owner associates them
 /// with live windows after walking the NSView tree.
 static METAL_CA_ROOTS: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+/// DMA-BUF import failures originate on the GPU worker. Only the AppKit
+/// owner can safely ask a still-live NSView to redraw via CPU pixels.
+static NATIVE_CPU_FALLBACKS: std::sync::Mutex<Vec<(usize, usize)>> =
+    std::sync::Mutex::new(Vec::new());
+
+pub fn request_native_cpu_fallback(window: sdl3::Window, scene_layer: usize) {
+    let mut pending = NATIVE_CPU_FALLBACKS
+        .lock()
+        .expect("native CPU redraw requests");
+    if !pending.contains(&(window as usize, scene_layer)) {
+        pending.push((window as usize, scene_layer));
+    }
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+fn find_scene_native_view(root: Id, scene_layer: usize, depth: usize) -> Option<Id> {
+    if root.is_null() || depth >= 64 || !is_view(root) {
+        return None;
+    }
+    if (root as usize | (1usize << (usize::BITS - 1))) == scene_layer {
+        return Some(root);
+    }
+    for child in unsafe { children(root) } {
+        if let Some(found) = find_scene_native_view(child, scene_layer, depth + 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+fn service_native_cpu_fallbacks() {
+    let pending = std::mem::take(
+        &mut *NATIVE_CPU_FALLBACKS
+            .lock()
+            .expect("native CPU redraw requests"),
+    );
+    for (sdl, layer) in pending {
+        let window = crate::window::window_for(sdl as sdl3::Window);
+        if window.is_null() {
+            continue;
+        }
+        if let Some(view) = find_scene_native_view(crate::window::content_view_of(window), layer, 0)
+        {
+            crate::backing::needs_display(view);
+        }
+    }
+}
+
 static METAL_SCENE_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
@@ -184,6 +232,7 @@ pub(crate) fn flush_metal_scenes() {
     if !sdl3::video::is_video_thread() {
         return;
     }
+    service_native_cpu_fallbacks();
     let now = darwin::mach::media_time();
     let animated_roots = crate::coreanimation::scene_opacity_animating(now);
     let animating = !animated_roots.is_empty();
@@ -277,8 +326,10 @@ pub fn set_metal_scene_changed(hook: fn(sdl3::Window, Vec<MetalSceneLayer>)) {
 /// Capture visible CAMetalLayer views in the order their enclosing NSViews
 /// would paint: ancestors precede descendants, later siblings are on top.
 /// A missing AppKit window is distinct from a window with no Metal layers.
-/// Fast notification gate for CPU backing redraws: unrelated software-only
-/// windows must not initiate a global scene recapture on every `drawRect:`.
+/// Gate backing pixel redraw recaptures by published Metal membership, not
+/// previously captured native pixels. The first drawRect: of a native view
+/// *creates* the source and must be discovered even if none existed before.
+/// Unrelated software-only windows still avoid scene captures.
 pub(crate) fn native_metal_scene_active(window: sdl3::Window) -> bool {
     METAL_SCENES
         .lock()
@@ -288,7 +339,7 @@ pub(crate) fn native_metal_scene_active(window: sdl3::Window) -> bool {
         .is_some_and(|scene| {
             scene
                 .iter()
-                .any(|layer| layer.native_pixels.is_some() || layer.native_dmabuf.is_some())
+                .any(|item| item.native_pixels.is_none() && item.native_dmabuf.is_none())
         })
 }
 
@@ -331,6 +382,27 @@ pub(crate) fn native_scene_ca_opacity(view: Id, now: f64) -> f32 {
         parent_layer = layer;
     }
     opacity
+}
+
+/// Opaque native coverage can only subtract a rectangle from Metal if no
+/// ancestor's rounded CA mask removes any of its pixels. Otherwise both
+/// sources must be drawn and the native source gets its rounded GPU mask.
+pub(crate) fn has_rounded_mask_ancestor(view: Id) -> bool {
+    let mut at = view;
+    for _ in 0..64 {
+        if at.is_null() || !is_view(at) {
+            break;
+        }
+        let layer = view_of(at).layer;
+        if !layer.is_null()
+            && crate::coreanimation::scene_masks_to_bounds(layer)
+            && crate::coreanimation::scene_corner_radius(layer) > 0.0
+        {
+            return true;
+        }
+        at = view_of(at).superview;
+    }
+    false
 }
 
 /// Only invoked on the AppKit mutator thread, not from Metal's presenter.
@@ -3259,6 +3331,124 @@ mod tests {
         assert_eq!(unsafe { window_of(child) }, window);
     }
 
+    static FIRST_NATIVE_DRAW_CONTENT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(true);
+
+    unsafe extern "C" fn first_native_draw_rect(
+        _receiver: Id,
+        _selector: objc::sel::Sel,
+        _rect: NSRect,
+    ) {
+        if !FIRST_NATIVE_DRAW_CONTENT.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        assert!(crate::backing::draw_focused(|pixels, width, height| {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
+                pixel.copy_from_slice(&[0, 0, 255, 255]);
+            }
+            Some(crate::backing::Rect {
+                x: 0,
+                y: 0,
+                width: i64::from(width),
+                height: i64::from(height),
+            })
+        }));
+    }
+
+    #[test]
+    fn first_native_draw_rect_after_static_metal_publishes_independent_scene() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        FIRST_NATIVE_DRAW_CONTENT.store(true, std::sync::atomic::Ordering::Relaxed);
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let metal = unsafe { make(cls as *const _ as Id, maker) };
+        let draw_class =
+            objc::class::lookup(c"RosemaryFirstNativeDrawTestView").unwrap_or_else(|| {
+                let class = objc::class::allocate_pair(
+                    objc::class::lookup(c"NSView"),
+                    c"RosemaryFirstNativeDrawTestView",
+                    0,
+                )
+                .expect("native draw test class");
+                assert!(class.add_method(
+                    objc::sel::get("drawRect:"),
+                    first_native_draw_rect as objc::class::Imp,
+                    c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16",
+                ));
+                objc::class::register_pair(class);
+                class
+            });
+        let native = unsafe {
+            init_with_frame(
+                objc::object::create_instance(draw_class, 0),
+                objc::sel::get("initWithFrame:"),
+                rect(40.0, 35.0, 30.0, 25.0),
+            )
+        };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), native);
+        }
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl).unwrap().len(),
+            1,
+            "a native view with no drawRect pixels must not publish a source"
+        );
+        assert!(
+            native_metal_scene_active(sdl),
+            "first native drawing must invalidate an already-published Metal window"
+        );
+        let set_needs: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_needs(native, objc::sel::get("setNeedsDisplay:"), 1) };
+        crate::backing::display_view(native);
+        crate::backing::compose_window_for_tests(window);
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(
+            scene.len(),
+            2,
+            "first drawRect: failed to publish native source"
+        );
+        assert_eq!(
+            &scene[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 255, 255]
+        );
+        // Repeated normal setNeedsDisplay:/drawRect: can also empty the
+        // native store. That transition must remove the stale source.
+        FIRST_NATIVE_DRAW_CONTENT.store(false, std::sync::atomic::Ordering::Relaxed);
+        unsafe { set_needs(native, objc::sel::get("setNeedsDisplay:"), 1) };
+        crate::backing::display_view(native);
+        crate::backing::compose_window_for_tests(window);
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl).unwrap().len(),
+            1,
+            "empty redraw left native pixels above the static Metal source"
+        );
+        crate::backing::forget(native);
+        objc::arc::release(window);
+    }
+
     #[test]
     fn opaque_native_occlusion_responds_to_ancestor_ca_opacity() {
         crate::bootstrap();
@@ -3328,6 +3518,27 @@ mod tests {
             "fractional ancestor CA opacity incorrectly punched a metal hole"
         );
         unsafe { opacity(ancestor, objc::sel::get("setOpacity:"), 1.0) };
+        assert_eq!(covers().len(), 1);
+        let radius: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mask: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            radius(ancestor, objc::sel::get("setCornerRadius:"), 16.0);
+            mask(ancestor, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        assert!(
+            covers().is_empty(),
+            "rounded ancestor mask must not punch a rectangular hole in Metal"
+        );
+        flush_metal_scenes();
+        assert!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .any(|item| item.native_pixels.is_some() && !item.rounded.is_empty())
+        );
+        unsafe { mask(ancestor, objc::sel::get("setMasksToBounds:"), 0) };
         assert_eq!(covers().len(), 1);
         let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
             unsafe { std::mem::transmute(objc::msg::entry()) };
@@ -3423,6 +3634,25 @@ mod tests {
         flush_metal_scenes();
         let faded = metal_scene(sdl).unwrap();
         assert!((faded[1].opacity - 0.5).abs() <= f32::EPSILON);
+        // Metadata-only CA animation/opacity changes must reuse both the CPU
+        // capture and immutable Arc; the GPU revision must stay identical.
+        let captured = crate::backing::native_render_count_for_tests();
+        let pixels = faded[1].native_pixels.as_ref().unwrap().clone();
+        for step in 0..32 {
+            unsafe { crate::coreanimation::set_opacity_for_test(native_layer, step as f32 / 31.0) };
+            flush_metal_scenes();
+            let latest = metal_scene(sdl).unwrap();
+            assert!(std::sync::Arc::ptr_eq(
+                latest[1].native_pixels.as_ref().unwrap(),
+                &pixels,
+            ));
+            assert_eq!(latest[1].native_revision, faded[1].native_revision);
+        }
+        assert_eq!(
+            crate::backing::native_render_count_for_tests(),
+            captured,
+            "opacity-only scene updates re-rendered unchanged native pixels"
+        );
         assert_eq!(
             &faded[1].native_pixels.as_ref().unwrap()[..4],
             &[0, 0, 128, 128]

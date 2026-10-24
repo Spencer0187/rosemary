@@ -121,6 +121,9 @@ struct Node {
     opacity: f64,
     /// `-cornerRadius`, in points.
     corner_radius: f64,
+    /// Metadata affecting CA sublayers may alter an ancestor's raster image,
+    /// even though that sublayer's own opacity is a scene-only property.
+    metadata_revision: u64,
     animations: Vec<(String, Running)>,
     /// `-contents`, retained. A surface also holds a use count while it is
     /// here, which is what tells its owner it is on screen.
@@ -152,6 +155,7 @@ impl Default for Node {
             hidden: false,
             opacity: 1.0,
             corner_radius: 0.0,
+            metadata_revision: 0,
             animations: Vec::new(),
             contents: 0,
             contents_revision: 0,
@@ -345,7 +349,104 @@ fn scene_root_key(nodes: &HashMap<usize, Node>, layer: usize) -> usize {
 
 /// A layer setter may execute on a guest thread other than AppKit's.
 /// Mark a transaction dirty rather than dereferencing a mutable NSView.
+static NATIVE_SCENE_CONTENT_EPOCH: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn native_scene_content_epoch() -> u64 {
+    NATIVE_SCENE_CONTENT_EPOCH.load(Ordering::Acquire)
+}
+
+/// Only descendants contribute their metadata to an ancestor's CPU pixels.
+/// Root opacity/clip/position is applied by the GPU scene placement instead.
+pub(crate) fn native_scene_descendant_revision(layer: Id) -> u64 {
+    if layer.is_null() {
+        return 0;
+    }
+    read_all_nodes(|nodes| {
+        fn fold(nodes: &HashMap<usize, Node>, id: usize, depth: usize) -> u64 {
+            if depth >= 64 {
+                return 0;
+            }
+            let Some(node) = nodes.get(&id) else {
+                return 0;
+            };
+            node.metadata_revision.wrapping_mul(0x9e3779b97f4a7c15)
+                ^ node
+                    .sublayers
+                    .iter()
+                    .enumerate()
+                    .fold(0u64, |sum, (index, child)| {
+                        sum.wrapping_add(
+                            (index as u64 + 1).wrapping_mul(0xbf58476d1ce4e5b9)
+                                ^ fold(nodes, *child, depth + 1),
+                        )
+                    })
+        }
+        nodes.get(&(layer as usize)).map_or(0, |node| {
+            node.sublayers
+                .iter()
+                .enumerate()
+                .fold(0u64, |sum, (index, child)| {
+                    sum.wrapping_add(
+                        (index as u64 + 1).wrapping_mul(0x9e3779b97f4a7c15)
+                            ^ fold(nodes, *child, 1),
+                    )
+                })
+        })
+    })
+}
+
+/// The view's root opacity is applied by the Metal scene, but animation of a
+/// descendant, its color or its transform changes the CPU-rendered pixels.
+/// Such images must not be memoized using the unchanged model content epoch.
+pub(crate) fn native_scene_content_animating(layer: Id, now: f64) -> bool {
+    if layer.is_null() {
+        return false;
+    }
+    read_all_nodes(|nodes| {
+        fn visit(
+            nodes: &HashMap<usize, Node>,
+            id: usize,
+            root: bool,
+            now: f64,
+            depth: usize,
+        ) -> bool {
+            if depth >= 64 {
+                return false;
+            }
+            let Some(node) = nodes.get(&id) else {
+                return false;
+            };
+            node.animations.iter().any(|(_, running)| {
+                (!root || running.spec.key_path != "opacity")
+                    && !progress(&running.spec, running.start, now).1
+            }) || node
+                .sublayers
+                .iter()
+                .any(|child| visit(nodes, *child, false, now, depth + 1))
+        }
+        visit(nodes, layer as usize, true, now, 0)
+    })
+}
+
 pub(crate) fn changed(layer: Id) {
+    // Conservative content invalidation for CA background, contents and
+    // subtree changes. Metadata-only setters call changed_metadata instead.
+    NATIVE_SCENE_CONTENT_EPOCH.fetch_add(1, Ordering::AcqRel);
+    changed_metadata(layer);
+}
+
+fn changed_metadata(layer: Id) {
+    // A root's metadata is composited in the GPU scene, but an embedded CA
+    // descendant's metadata changes the native source pixels of that root.
+    if let Some(node) = NODES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .and_then(|nodes| nodes.get_mut(&(layer as usize)))
+    {
+        node.metadata_revision = node.metadata_revision.wrapping_add(1);
+    }
     let root = read_all_nodes(|nodes| scene_root_key(nodes, layer as usize));
     crate::view::invalidate_ca_layer(root);
 }
@@ -456,7 +557,7 @@ unsafe extern "C" fn position(receiver: Id, _sel: Sel) -> NSPoint {
 
 unsafe extern "C" fn set_position(receiver: Id, _sel: Sel, position: NSPoint) {
     with_node(receiver, |node| node.position = position);
-    changed(receiver);
+    changed_metadata(receiver);
 }
 
 unsafe extern "C" fn anchor_point(receiver: Id, _sel: Sel) -> NSPoint {
@@ -467,7 +568,7 @@ unsafe extern "C" fn anchor_point(receiver: Id, _sel: Sel) -> NSPoint {
 
 unsafe extern "C" fn set_anchor_point(receiver: Id, _sel: Sel, anchor: NSPoint) {
     with_node(receiver, |node| node.anchor = anchor);
-    changed(receiver);
+    changed_metadata(receiver);
 }
 
 unsafe extern "C" fn background_color(receiver: Id, _sel: Sel) -> CFTypeRef {
@@ -569,7 +670,7 @@ unsafe extern "C" fn masks_to_bounds(receiver: Id, _sel: Sel) -> u8 {
 
 pub(crate) fn set_masks(layer: Id, masks: bool) {
     with_node(layer, |node| node.masks_to_bounds = masks);
-    changed(layer);
+    changed_metadata(layer);
 }
 
 unsafe extern "C" fn set_masks_to_bounds(receiver: Id, _sel: Sel, value: u8) {
@@ -582,7 +683,7 @@ unsafe extern "C" fn corner_radius(receiver: Id, _sel: Sel) -> f64 {
 
 unsafe extern "C" fn set_corner_radius(receiver: Id, _sel: Sel, value: f64) {
     with_node(receiver, |node| node.corner_radius = value.max(0.0));
-    changed(receiver);
+    changed_metadata(receiver);
 }
 
 unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
@@ -593,7 +694,7 @@ unsafe extern "C" fn is_hidden(receiver: Id, _sel: Sel) -> u8 {
 
 unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, value: u8) {
     with_node(receiver, |node| node.hidden = value != 0);
-    changed(receiver);
+    changed_metadata(receiver);
 }
 
 unsafe extern "C" fn opacity(receiver: Id, _sel: Sel) -> f32 {
@@ -604,7 +705,7 @@ unsafe extern "C" fn set_opacity(receiver: Id, _sel: Sel, value: f32) {
     with_node(receiver, |node| {
         node.opacity = f64::from(value).clamp(0.0, 1.0)
     });
-    changed(receiver);
+    changed_metadata(receiver);
 }
 
 /// Layers whose contents are an IOSurface. The compositor scans layer trees
