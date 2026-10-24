@@ -2043,6 +2043,32 @@ fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
         assert!(state.snapshot_idle_direct().expect("idle overlay snapshot"));
         state.idle();
     }
+    // All eight blended allocations are now retained as though the WSI
+    // presenter were slow to return them. Retries must defer before issuing
+    // another backing upload, not spin on a costly GPU copy every millisecond.
+    let retained_blends = crate::present::hold_every_blended_source_for_test(window);
+    let submitted = crate::present::backing_upload_submissions_for_test();
+    for _ in 0..5 {
+        assert_eq!(
+            crate::present::present_store_synchronous(window, &store, &[], &overlays),
+            appkit::backing::PresentOutcome::Deferred
+        );
+        assert_eq!(
+            crate::present::backing_upload_submissions_for_test(),
+            submitted,
+            "pool exhaustion submitted a redundant full-frame GPU upload"
+        );
+    }
+    drop(retained_blends);
+    assert_eq!(
+        crate::present::present_store_synchronous(window, &store, &[], &overlays),
+        appkit::backing::PresentOutcome::Displayed,
+        "source lease release must permit upload and presentation"
+    );
+    assert_eq!(
+        crate::present::backing_upload_submissions_for_test(),
+        submitted + 1
+    );
     drop(old);
     drop(entry);
     crate::present::forget_backing_store_for_test(window);

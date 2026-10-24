@@ -1841,6 +1841,37 @@ unsafe impl Send for StoreImage {}
 
 /// Keyed by the SDL window's address.
 static STORE_IMAGES: std::sync::Mutex<Vec<(usize, StoreImage)>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static TEST_STORE_UPLOAD_SUBMISSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn backing_upload_submissions_for_test() -> usize {
+    TEST_STORE_UPLOAD_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn hold_every_blended_source_for_test(
+    window: sdl3::Window,
+) -> Vec<std::sync::Arc<crate::swapchain::BackingImageLease>> {
+    let mut stores = STORE_IMAGES.lock().expect("store images");
+    let entry = &mut stores
+        .iter_mut()
+        .find(|(key, _)| *key == window as usize)
+        .expect("active backing store")
+        .1;
+    let mut retained = Vec::new();
+    loop {
+        retained.push(std::sync::Arc::clone(
+            entry.blended.as_ref().expect("initial blended frame"),
+        ));
+        if !entry.reserve_blended_source().expect("source pool") {
+            break;
+        }
+    }
+    assert_eq!(1 + entry.blended_spare.len(), MAX_IMAGES_PER_STORE_POOL);
+    retained
+}
 
 #[cfg(test)]
 pub(crate) fn backing_store_image_for_test(
@@ -2368,6 +2399,22 @@ pub(crate) fn present_store_synchronous(
             return store_failure_outcome(window);
         }
     }
+    // Reserve BOTH destinations before copying CPU pixels or submitting a
+    // Vulkan upload. Otherwise an exhausted overlay pool would repeatedly
+    // upload whole frames while the store worker waits for a source lease.
+    let blend_available = if overlays.is_empty() {
+        false
+    } else {
+        match entry.reserve_blended_source() {
+            Ok(true) => true,
+            Ok(false) => return Deferred,
+            Err(reason) => {
+                gpu::trace(format!("no image to blend overlays into: {reason}"));
+                appkit::backing::refuse_dmabufs(window);
+                false // Existing allocation-error fallback: show raw store.
+            }
+        }
+    };
     // SAFETY: the staging buffer is mapped over the store's whole length.
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -2389,6 +2436,8 @@ pub(crate) fn present_store_synchronous(
             depth: 1,
         });
     let (buffer, image) = (entry.staging.buffer, entry.image.image.image);
+    #[cfg(test)]
+    TEST_STORE_UPLOAD_SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let uploaded = entry.gpu.one_shot(|device, command_buffer| {
         // SAFETY: recording into a command buffer the call owns; the image is
         // in GENERAL layout from creation.
@@ -2406,12 +2455,10 @@ pub(crate) fn present_store_synchronous(
         gpu::trace(format!("window store upload failed: {reason}"));
         return store_failure_outcome(window);
     }
-    let shown = match overlays.is_empty() {
-        true => std::sync::Arc::clone(&entry.image),
-        false => match blend_overlays(window, entry, overlays) {
-            Some(image) => image,
-            None => return Deferred,
-        },
+    let shown = if blend_available {
+        blend_overlays(window, entry, overlays)
+    } else {
+        std::sync::Arc::clone(&entry.image)
     };
     let frame = appkit::view::Frame {
         window,
@@ -2465,34 +2512,25 @@ pub(crate) fn present_store_synchronous(
     presented
 }
 
-/// Produce an immutable blended backing-store source. Return `None` if all
-/// source slots are retained by WSI so the store worker can retry later.
+/// Blend into the source reserved before the backing-store upload. Only
+/// call this after `reserve_blended_source` succeeds while STORE_IMAGES is held.
 fn blend_overlays(
     window: sdl3::Window,
     entry: &mut StoreImage,
     overlays: &[appkit::backing::GpuOverlay],
-) -> Option<std::sync::Arc<crate::swapchain::BackingImageLease>> {
-    match entry.reserve_blended_source() {
-        Ok(true) => {}
-        Ok(false) => return None,
-        Err(reason) => {
-            gpu::trace(format!("no image to blend overlays into: {reason}"));
-            appkit::backing::refuse_dmabufs(window);
-            return Some(std::sync::Arc::clone(&entry.image));
-        }
-    }
-    let blended = entry.blended.as_ref().expect("made above");
+) -> std::sync::Arc<crate::swapchain::BackingImageLease> {
+    let blended = entry.blended.as_ref().expect("reserved before upload");
     match crate::overlay::blend(entry.gpu, &entry.image, &blended.image, overlays) {
         Ok(refused) => {
             if !refused.is_empty() {
                 appkit::backing::refuse_dmabufs(window);
             }
-            Some(std::sync::Arc::clone(blended))
+            std::sync::Arc::clone(blended)
         }
         Err(reason) => {
             gpu::trace(format!("blending overlays failed: {reason}"));
             appkit::backing::refuse_dmabufs(window);
-            Some(std::sync::Arc::clone(&entry.image))
+            std::sync::Arc::clone(&entry.image)
         }
     }
 }
