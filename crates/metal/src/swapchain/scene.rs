@@ -874,6 +874,10 @@ impl Swapchain {
                 .end_command_buffer(cb)
                 .map_err(|e| format!("vkEndCommandBuffer: {e:?}"))?;
         }
+        #[cfg(test)]
+        if let Some(error) = self.injected_post_scene_record_error.take() {
+            return Err(format!("injected post-scene recording failure: {error:?}"));
+        }
         self.gpu.submit_synchronized(cb, done, &[], &[])?;
         self.frames[slot].submitted = true;
         self.frames[slot].scene_reads = self

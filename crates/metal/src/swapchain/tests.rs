@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
+    let frame = DirectFrame {
+        window: 0,
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 1,
+        window_width: 1,
+        window_height: 1,
+    };
+    let scene = |id| {
+        vec![ScenePlacement {
+            id,
+            frame,
+            opacity: 1.0,
+        }]
+    };
+    let pending = Mutex::new(None);
+    requeue_scene(&pending, scene(1));
+    assert_eq!(pending.lock().unwrap().as_ref().unwrap()[0].id, 1);
+    *pending.lock().unwrap() = Some(scene(2));
+    requeue_scene(&pending, scene(1));
+    assert_eq!(
+        pending.lock().unwrap().as_ref().unwrap()[0].id,
+        2,
+        "a stale GPU retry replaced the latest AppKit visibility update"
+    );
+}
+
 /// Vulkan graphical tests share SDL video ownership and a singleton GPU;
 /// synthetic failures can poison them across Rust's serial test threads.
 /// Give each scenario its own SDL/Vulkan process while leaving pure tests in
@@ -2830,10 +2860,24 @@ fn static_foreground_survives_repeated_background_submissions() {
             },
         ]
     ));
-    assert_eq!(
-        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
-        Ok(Some(true))
+    let before_repaint = state.frame;
+    state.injected_post_scene_record_error = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+    let error = state
+        .redisplay_scene(window as usize)
+        .expect_err("first scene-only repaint must fail after recording");
+    assert!(error.contains("injected post-scene recording failure"));
+    assert_eq!(state.frame, before_repaint);
+    assert!(
+        state.scene_repaint_needed,
+        "failed repaint must retain damage"
     );
+    assert!(
+        state
+            .redisplay_scene(window as usize)
+            .expect("scene-only repaint must recover without another drawable")
+    );
+    assert_eq!(state.frame, before_repaint + 1);
+    state.scene_repaint_needed = false;
     state.idle();
     fetch();
     let translucent = pixel(55, 35);

@@ -1577,6 +1577,14 @@ fn ensure_layer_compositor_worker(window: usize, entry: &Arc<WindowSwapchain>) {
     *entry.worker.lock().expect("layer compositor worker") = Some(handle);
 }
 
+/// A retry must not overwrite a newer scene published during GPU recording.
+fn requeue_scene(pending: &Mutex<Option<Vec<ScenePlacement>>>, consumed: Vec<ScenePlacement>) {
+    pending
+        .lock()
+        .expect("AppKit scene pending")
+        .get_or_insert(consumed);
+}
+
 fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
     let mut prepare_failures = 0u32;
     let mut acquire_timeouts = 0u32;
@@ -1642,6 +1650,8 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 .lock()
                 .expect("AppKit scene pending")
                 .take();
+            let mut retry_delay = None;
+            let mut device_lost = false;
             if let Some(live) = snapshot {
                 let mut state = entry.state.lock().expect("window swapchain");
                 state.synchronize_scene(window, &live);
@@ -1652,30 +1662,35 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             wake_compositor_worker(&entry);
                         }
                         Ok(false) => {
-                            // Keep dirty scene damage across repeated scene
-                            // snapshots and concurrent guest presentations.
-                            entry
-                                .pending_scene
-                                .lock()
-                                .expect("AppKit scene pending")
-                                .get_or_insert(live);
+                            // An unfinished staging fence cannot consume the
+                            // only notification for a visibility change.
+                            requeue_scene(&entry.pending_scene, live);
+                            retry_delay = Some(Duration::from_millis(1));
                         }
                         Err(error) => {
-                            gpu::trace(format!("recomposing changed layer tree failed: {error}"))
+                            gpu::trace(format!("recomposing changed layer tree failed: {error}"));
+                            device_lost = error.contains("ERROR_DEVICE_LOST")
+                                || entry.gpu.lost.load(Ordering::Acquire);
+                            if !device_lost {
+                                // A transient recording/submission error must
+                                // not discard scene-only damage. Keep any
+                                // newer AppKit snapshot ahead of this retry.
+                                requeue_scene(&entry.pending_scene, live);
+                                retry_delay = Some(Duration::from_millis(10));
+                            }
                         }
                     }
                 }
             }
             drop(_presenting);
-            if entry
-                .state
-                .lock()
-                .expect("window swapchain")
-                .scene_repaint_needed
-            {
-                // Keep the GPU fence retry bounded without monopolizing the
-                // presentation mutex or spinning on an unfinished submission.
-                std::thread::park_timeout(Duration::from_millis(1));
+            if device_lost {
+                record_device_loss(entry.gpu);
+                return;
+            }
+            if let Some(delay) = retry_delay {
+                // Park outside the presentation mutex to avoid a busy retry
+                // loop when the GPU is still unavailable.
+                std::thread::park_timeout(delay);
             }
             continue;
         }
