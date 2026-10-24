@@ -82,6 +82,125 @@ pub const FRAME_DID_CHANGE: &str = "NSViewFrameDidChangeNotification";
 /// ...and when its bounds do.
 pub const BOUNDS_DID_CHANGE: &str = "NSViewBoundsDidChangeNotification";
 
+/// A live Metal layer in bottom-to-top AppKit view order. IDs are identities,
+/// not owned Objective-C references: consumers must not dereference them.
+#[derive(Clone, Copy)]
+pub struct MetalSceneLayer {
+    pub layer: usize,
+    pub frame: Frame,
+    pub opacity: f32,
+}
+
+// SAFETY: a snapshot owns only integer layer identities and a copied SDL
+// window handle, which is compared as an identity and never dereferenced by
+// a compositor worker. The AppKit event thread creates the values.
+unsafe impl Send for MetalSceneLayer {}
+
+/// AppKit sends value-only snapshots; Metal owns GPU resources independently.
+/// The hook must not wait for a presentation lock or the Vulkan device.
+static METAL_SCENE_CHANGED: std::sync::OnceLock<fn(sdl3::Window, Vec<MetalSceneLayer>)> =
+    std::sync::OnceLock::new();
+/// Event-thread-published scene snapshots. The Metal presenter must not walk
+/// mutable NSView subview arrays from a separate GPU presentation thread.
+static METAL_SCENES: std::sync::Mutex<
+    Option<std::collections::HashMap<usize, Vec<MetalSceneLayer>>>,
+> = std::sync::Mutex::new(None);
+
+pub fn set_metal_scene_changed(hook: fn(sdl3::Window, Vec<MetalSceneLayer>)) {
+    let _ = METAL_SCENE_CHANGED.set(hook);
+}
+
+/// Capture visible CAMetalLayer views in the order their enclosing NSViews
+/// would paint: ancestors precede descendants, later siblings are on top.
+/// A missing AppKit window is distinct from a window with no Metal layers.
+pub fn metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
+    METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)).cloned())
+}
+
+/// Only invoked on the AppKit mutator thread, not from Metal's presenter.
+fn capture_metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
+    let nswindow = crate::window::window_for(window);
+    if nswindow.is_null() {
+        return None;
+    }
+    let content = crate::window::content_view_of(nswindow);
+    let mut result = Vec::new();
+    visit_metal_scene(content, window, &mut result, 0);
+    Some(result)
+}
+
+fn visit_metal_scene(
+    view: Id,
+    window: sdl3::Window,
+    scene: &mut Vec<MetalSceneLayer>,
+    depth: usize,
+) {
+    if depth >= 64 || !is_view(view) || view_of(view).hidden != 0 {
+        return;
+    }
+    let layer = view_of(view).layer;
+    if !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && !crate::coreanimation::scene_hidden(layer)
+    {
+        if let Some(frame) = unsafe { presentation_frame(view) } {
+            if frame.window == window {
+                scene.push(MetalSceneLayer {
+                    layer: layer as usize,
+                    frame,
+                    opacity: (effective_alpha(view) as f32)
+                        * crate::coreanimation::scene_opacity(layer),
+                });
+            }
+        }
+    }
+    let children = view_of(view).subviews;
+    if let Some(children) = unsafe { corefoundation::collections::array(children as *const c_void) }
+    {
+        for &child in &children.values {
+            visit_metal_scene(child as Id, window, scene, depth + 1);
+        }
+    }
+}
+
+fn publish_metal_scene(sdl: sdl3::Window) {
+    let scene = capture_metal_scene(sdl).unwrap_or_default();
+    METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(sdl as usize, scene.clone());
+    if let Some(hook) = METAL_SCENE_CHANGED.get() {
+        hook(sdl, scene);
+    }
+}
+
+pub fn forget_metal_scene(sdl: sdl3::Window) {
+    if let Some(cache) = METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .as_mut()
+    {
+        cache.remove(&(sdl as usize));
+    }
+}
+
+pub(crate) fn notify_metal_layer_tree_change(view: Id) {
+    notify_metal_scene(view);
+}
+
+fn notify_metal_scene(view: Id) {
+    let window = unsafe { window_of(view) };
+    let sdl = unsafe { crate::window::sdl_window(window) };
+    if !sdl.is_null() {
+        publish_metal_scene(sdl);
+    }
+}
+
 /// Post the frame and bounds notifications a resized view owes its observers.
 ///
 /// Both, because this tree's `-bounds` is the frame's size at the origin: a
@@ -113,6 +232,7 @@ fn note_geometry_change(receiver: Id, before: NSRect) {
     // Moving or resizing the focused editor also moves the host IME UI.
     // SAFETY: `receiver` is the live view whose geometry changed.
     unsafe { crate::window::refresh_text_input_area_for(receiver) };
+    notify_metal_scene(receiver);
 }
 
 /// Resize `receiver`'s subviews for a superview that went from `old` to its
@@ -375,6 +495,7 @@ unsafe extern "C" fn set_layer(receiver: Id, _sel: Sel, layer: Id) {
         crate::layer::set_masks_to_bounds_of(layer, true);
     }
     objc::arc::release(previous);
+    notify_metal_scene(receiver);
 }
 
 /// `-setWantsLayer:`. Asking for a layer makes the view layer-backed: AppKit
@@ -552,6 +673,7 @@ unsafe extern "C" fn set_alpha_value(receiver: Id, _sel: Sel, alpha: CGFloat) {
     view_of(receiver).transparency = (1.0 - alpha).to_bits();
     if before != alpha {
         crate::backing::needs_display(receiver);
+        notify_metal_scene(receiver);
     }
 }
 
@@ -592,6 +714,7 @@ pub unsafe fn set_window(view: Id, window: Id) {
         return;
     }
     view_of(view).window = window;
+    notify_metal_scene(view);
 }
 
 /// Forget `window` as the window `view` is the content view of, if it still is.
@@ -601,7 +724,11 @@ pub unsafe fn set_window(view: Id, window: Id) {
 /// As [`set_window`].
 pub unsafe fn detach_window(view: Id, window: Id) {
     if is_view(view) && view_of(view).window == window {
+        let sdl = unsafe { crate::window::sdl_window(window) };
         view_of(view).window = std::ptr::null_mut();
+        if !sdl.is_null() {
+            publish_metal_scene(sdl);
+        }
     }
 }
 
@@ -955,6 +1082,7 @@ pub unsafe fn input_frame(view: Id) -> Option<(sdl3::Window, sdl3::Rect)> {
 
 /// A view's layer as a window system sees it: a rectangle of pixels, and the
 /// window it is a rectangle of.
+#[derive(Clone, Copy)]
 pub struct Frame {
     pub window: sdl3::Window,
     pub x: i32,
@@ -1720,6 +1848,7 @@ unsafe extern "C" fn add_subview(receiver: Id, sel: Sel, subview: Id) {
     unsafe { update_tracking_areas(subview) };
     crate::backing::needs_display_in_tree(subview, 0);
     crate::layout::solve();
+    notify_metal_scene(receiver);
 }
 
 /// `NSWindowOrderingMode`'s `NSWindowBelow`; `NSWindowAbove` is everything else.
@@ -1768,6 +1897,7 @@ unsafe extern "C" fn add_subview_positioned(
         (None, false) => array.values.len(),
     };
     array.values.insert(at, entry);
+    notify_metal_scene(receiver);
 }
 
 unsafe extern "C" fn set_translates_autoresizing_mask(receiver: Id, _sel: Sel, flag: u8) {
@@ -1816,6 +1946,8 @@ unsafe extern "C" fn remove_from_superview(receiver: Id, _sel: Sel) {
 /// Take `receiver` out of its superview's list, telling no one.
 fn detach_from_superview(receiver: Id) {
     let view = view_of(receiver);
+    // Notify after detachment but before potentially releasing the last
+    // reference, using the old parent's window as the notification identity.
     let parent = view.superview;
     view.superview = std::ptr::null_mut();
     if !is_view(parent) {
@@ -1823,6 +1955,7 @@ fn detach_from_superview(receiver: Id) {
     }
     let list = view_of(parent).subviews;
     if list.is_null() {
+        notify_metal_scene(parent);
         return;
     }
     // SAFETY: an array this module made.
@@ -1835,6 +1968,9 @@ fn detach_from_superview(receiver: Id) {
             array.policy.release(receiver as *const c_void);
         }
     }
+    // The old parent's child array must no longer contain the removed view
+    // when the compositor snapshots its visible membership.
+    notify_metal_scene(parent);
 }
 
 /// `-dealloc`. Subviews are told their superview is gone before the list that
@@ -2036,6 +2172,9 @@ unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
     view_of(receiver).hidden = usize::from(hidden != 0);
     if was && hidden == 0 {
         crate::backing::needs_display(receiver);
+    }
+    if was != (hidden != 0) {
+        notify_metal_scene(receiver);
     }
 }
 
@@ -2726,6 +2865,87 @@ mod tests {
         // SAFETY: both are objects this runtime allocated.
         unsafe { set_window(parent, window) };
         assert_eq!(unsafe { window_of(child) }, window);
+    }
+
+    /// The compositor consumes authoritative live AppKit order, not the order
+    /// in which a guest submits Metal command buffers. Hidden and removed
+    /// views must disappear from its scene before their next drawable.
+    #[test]
+    fn metal_scene_tracks_sibling_order_hiding_and_removal() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content = objc::sel::get("setContentView:");
+        unsafe {
+            let f: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            f(window, set_content, content);
+        }
+        let metal = objc::class::lookup(c"CAMetalLayer").expect("CAMetalLayer");
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let (a, b) = (
+            view(rect(0.0, 0.0, 320.0, 240.0)),
+            view(rect(25.0, 35.0, 120.0, 70.0)),
+        );
+        let (first, second) = unsafe {
+            (
+                make(metal as *const _ as Id, maker),
+                make(metal as *const _ as Id, maker),
+            )
+        };
+        unsafe {
+            set_layer(a, objc::sel::get("setLayer:"), first);
+            set_layer(b, objc::sel::get("setLayer:"), second);
+            add_subview(content, objc::sel::get("addSubview:"), a);
+            add_subview(content, objc::sel::get("addSubview:"), b);
+        }
+        let ids = |sdl| {
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .map(|entry| entry.layer)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        unsafe { set_hidden(b, objc::sel::get("setHidden:"), 1) };
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe { set_hidden(b, objc::sel::get("setHidden:"), 0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // A CAMetalLayer can change opacity or visibility without its NSView
+        // doing so. The published scene must reflect both transitions.
+        unsafe {
+            let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+                std::mem::transmute(objc::msg::entry());
+            hidden(second, objc::sel::get("setHidden:"), 1);
+        }
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe {
+            let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+                std::mem::transmute(objc::msg::entry());
+            hidden(second, objc::sel::get("setHidden:"), 0);
+            let opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+                std::mem::transmute(objc::msg::entry());
+            opacity(second, objc::sel::get("setOpacity:"), 0.5);
+        }
+        let current = metal_scene(sdl).expect("published layer snapshot");
+        assert_eq!(current.len(), 2);
+        assert!((current[1].opacity - 0.5).abs() <= f32::EPSILON);
+        unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+        assert_eq!(ids(sdl), [first as usize]);
+        objc::arc::release(window);
     }
 
     /// A subview's rectangle in the pixels of the window it is in, which is

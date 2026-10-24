@@ -1472,10 +1472,12 @@ fn send_size(receiver: Id, selector: &str) -> (f64, f64) {
 pub(crate) fn install() {
     appkit::bootstrap();
     appkit::backing::set_presenter(present_store);
+    appkit::view::set_metal_scene_changed(crate::swapchain::scene_changed);
     appkit::backing::set_importer(crate::overlay::importer);
     appkit::event::add_pump_hook(flush_readbacks);
     appkit::event::add_modal_presentation_hook(flush_readbacks);
     appkit::window::add_destroy_hook(forget_window);
+    appkit::window::add_destroy_hook(appkit::view::forget_metal_scene);
     object::register::<Drawable>(c"RosemaryCAMetalDrawable");
     let drawable = objc::class::lookup(c"RosemaryCAMetalDrawable").expect("just registered");
     methods!(drawable, {

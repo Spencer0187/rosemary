@@ -226,12 +226,54 @@ fn root_of(layer: Id) -> Id {
     at
 }
 
+/// Value-only CA presentation properties consumed by the Metal scene.
+/// A superlayer's visibility and opacity apply to its entire subtree, just as
+/// an enclosing NSView's properties do. Traverse a single immutable snapshot
+/// under one lock to avoid mixing two layer-tree revisions.
+pub(crate) fn scene_hidden(layer: Id) -> bool {
+    let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(nodes) = nodes.as_ref() else {
+        return false;
+    };
+    let mut at = layer as usize;
+    for _ in 0..256 {
+        let Some(node) = nodes.get(&at) else { break };
+        if node.hidden {
+            return true;
+        }
+        if node.superlayer == 0 {
+            break;
+        }
+        at = node.superlayer;
+    }
+    false
+}
+
+pub(crate) fn scene_opacity(layer: Id) -> f32 {
+    let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(nodes) = nodes.as_ref() else {
+        return 1.0;
+    };
+    let mut at = layer as usize;
+    let mut opacity = 1.0f64;
+    for _ in 0..256 {
+        let Some(node) = nodes.get(&at) else { break };
+        opacity *= node.opacity;
+        if node.superlayer == 0 {
+            break;
+        }
+        at = node.superlayer;
+    }
+    opacity.clamp(0.0, 1.0) as f32
+}
+
 /// Have the view showing `layer`'s tree recomposed.
 pub(crate) fn changed(layer: Id) {
     // SAFETY: a layer of this crate's.
     let view = unsafe { crate::layer::view_of(root_of(layer)) };
     if !view.is_null() {
         crate::backing::damage_view(view);
+        crate::view::notify_metal_layer_tree_change(view);
     }
 }
 
@@ -2361,6 +2403,36 @@ mod tests {
                 resume.wait();
             }
         });
+    }
+
+    #[test]
+    fn metal_scene_inherits_superlayer_visibility_and_opacity() {
+        // Side-table-only fixtures: the traversal must not dereference an
+        // Objective-C object or publish a live window during this test.
+        let parent = 0x2001usize as Id;
+        let child = 0x2002usize as Id;
+        with_node(parent, |node| {
+            node.opacity = 0.5;
+            node.hidden = false;
+        });
+        with_node(child, |node| {
+            node.superlayer = parent as usize;
+            node.opacity = 0.25;
+            node.hidden = false;
+        });
+        assert!(!scene_hidden(child));
+        assert_eq!(scene_opacity(child), 0.125);
+        with_node(parent, |node| node.hidden = true);
+        assert!(scene_hidden(child));
+        with_node(parent, |node| node.hidden = false);
+        with_node(child, |node| node.hidden = true);
+        assert!(scene_hidden(child));
+        with_node(child, |node| node.hidden = false);
+        let mut nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(nodes) = nodes.as_mut() {
+            nodes.remove(&(child as usize));
+            nodes.remove(&(parent as usize));
+        }
     }
 
     fn spec(duration: f64, repeat_count: f64) -> Spec {

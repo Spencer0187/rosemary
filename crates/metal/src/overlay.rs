@@ -323,17 +323,25 @@ fn color_range() -> vk::ImageSubresourceRange {
 /// Where one overlay goes, as the shader's push constants.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Placement {
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    target_width: u32,
-    target_height: u32,
+pub(crate) struct Placement {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub target_width: u32,
+    pub target_height: u32,
+    /// The dispatched region of the placement, in window pixels. The source
+    /// UV stays relative to the *full* placement even when clipped.
+    pub clip_x: i32,
+    pub clip_y: i32,
+    pub clip_width: u32,
+    pub clip_height: u32,
+    /// Core Animation opacity multiplies the entire premultiplied source.
+    pub opacity: f32,
 }
 
 impl Placement {
-    fn bytes(&self) -> [u8; 24] {
+    pub(crate) fn bytes(&self) -> [u8; 44] {
         let words = [
             self.x as u32,
             self.y as u32,
@@ -341,8 +349,13 @@ impl Placement {
             self.height,
             self.target_width,
             self.target_height,
+            self.clip_x as u32,
+            self.clip_y as u32,
+            self.clip_width,
+            self.clip_height,
+            self.opacity.to_bits(),
         ];
-        let mut bytes = [0; 24];
+        let mut bytes = [0; 44];
         for (at, word) in words.into_iter().enumerate() {
             bytes[at * 4..at * 4 + 4].copy_from_slice(&word.to_ne_bytes());
         }
@@ -625,6 +638,11 @@ pub(crate) fn blend<'a>(
                     height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
                     target_width: width,
                     target_height: height,
+                    clip_x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    clip_y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    clip_width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
+                    clip_height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                    opacity: 1.0,
                 };
                 if placement.width == 0 || placement.height == 0 {
                     continue;
@@ -799,7 +817,7 @@ unsafe fn general_barrier(
 ///     }
 /// }
 /// ```
-fn shader() -> Vec<u32> {
+pub(crate) fn shader() -> Vec<u32> {
     build_shader().expect("the overlay shader is well formed")
 }
 
@@ -857,9 +875,11 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
         );
     }
 
-    let placement = b.type_struct([int, int, uint, uint, uint, uint]);
+    let placement = b.type_struct([
+        int, int, uint, uint, uint, uint, int, int, uint, uint, float,
+    ]);
     b.decorate(placement, Decoration::Block, []);
-    for member in 0..6 {
+    for member in 0..11 {
         b.member_decorate(
             placement,
             member,
@@ -899,18 +919,24 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     let height = member(&mut b, 3, uint_pointer, uint)?;
     let target_width = member(&mut b, 4, uint_pointer, uint)?;
     let target_height = member(&mut b, 5, uint_pointer, uint)?;
+    let clip_x = member(&mut b, 6, int_pointer, int)?;
+    let clip_y = member(&mut b, 7, int_pointer, int)?;
+    let clip_width = member(&mut b, 8, uint_pointer, uint)?;
+    let clip_height = member(&mut b, 9, uint_pointer, uint)?;
+    let float_pointer = b.type_pointer(None, StorageClass::PushConstant, float);
+    let opacity = member(&mut b, 10, float_pointer, float)?;
     let target_width = b.bitcast(int, None, target_width)?;
     let target_height = b.bitcast(int, None, target_height)?;
     let global = b.load(uvec3, None, id, None, [])?;
     let column = b.composite_extract(uint, None, global, [0])?;
     let row = b.composite_extract(uint, None, global, [1])?;
     let at_x = b.bitcast(int, None, column)?;
-    let at_x = b.i_add(int, None, x, at_x)?;
+    let at_x = b.i_add(int, None, clip_x, at_x)?;
     let at_y = b.bitcast(int, None, row)?;
-    let at_y = b.i_add(int, None, y, at_y)?;
-    let mut inside = b.u_less_than(boolean, None, column, width)?;
+    let at_y = b.i_add(int, None, clip_y, at_y)?;
+    let mut inside = b.u_less_than(boolean, None, column, clip_width)?;
     for condition in [
-        b.u_less_than(boolean, None, row, height)?,
+        b.u_less_than(boolean, None, row, clip_height)?,
         b.s_greater_than_equal(boolean, None, at_x, zero_int)?,
         b.s_greater_than_equal(boolean, None, at_y, zero_int)?,
         b.s_less_than(boolean, None, at_x, target_width)?,
@@ -924,8 +950,10 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
     b.branch_conditional(inside, body, merge, [])?;
 
     b.begin_block(Some(body))?;
-    let u = b.convert_u_to_f(float, None, column)?;
-    let v = b.convert_u_to_f(float, None, row)?;
+    let source_x = b.i_sub(int, None, at_x, x)?;
+    let source_y = b.i_sub(int, None, at_y, y)?;
+    let u = b.convert_s_to_f(float, None, source_x)?;
+    let v = b.convert_s_to_f(float, None, source_y)?;
     let u = b.f_add(float, None, u, half)?;
     let v = b.f_add(float, None, v, half)?;
     let across = b.convert_u_to_f(float, None, width)?;
@@ -942,6 +970,7 @@ fn build_shader() -> Result<Vec<u32>, rspirv::dr::Error> {
         spirv::ImageOperands::LOD,
         [Operand::IdRef(zero)],
     )?;
+    let over = b.vector_times_scalar(vec4, None, over, opacity)?;
     let at = b.composite_construct(ivec2, None, [at_x, at_y])?;
     let image = b.load(storage, None, target, None, [])?;
     let under = b.image_read(vec4, None, image, at, None, [])?;
@@ -981,10 +1010,17 @@ mod tests {
             height: 6,
             target_width: 7,
             target_height: 8,
+            clip_x: -2,
+            clip_y: 5,
+            clip_width: 3,
+            clip_height: 4,
+            opacity: 0.5,
         };
         let bytes = placement.bytes();
         assert_eq!(&bytes[0..4], &(-3i32).to_ne_bytes());
         assert_eq!(&bytes[20..24], &8u32.to_ne_bytes());
+        assert_eq!(&bytes[24..28], &(-2i32).to_ne_bytes());
+        assert_eq!(&bytes[40..44], &0.5f32.to_ne_bytes());
     }
 
     #[test]

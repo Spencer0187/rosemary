@@ -1,5 +1,7 @@
 mod corners;
 mod present;
+mod scene;
+use scene::{SceneBlender, SceneLayer, ScenePlacement, ScenePrepared};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -71,6 +73,17 @@ struct Swapchain {
     /// The layers which have presented to this window. Its length is what
     /// decides whether the composite is needed.
     layers: Vec<usize>,
+    /// Latest GPU-owned contents for each layer in the flattened window tree.
+    /// Scene images must survive both drawable reuse and in-flight GPU reads.
+    scene_layers: Vec<SceneLayer>,
+    scene_placements: Vec<ScenePlacement>,
+    scene_blender: Option<SceneBlender>,
+    /// The previous layer's frame is needed when its contents must first be
+    /// captured out of a single-layer accumulator when another layer joins.
+    scene_frames: Vec<(usize, DirectFrame)>,
+    /// Scene damage survives an early membership sync or a busy staging slot.
+    /// It is cleared only once a GPU update contains the new visible scene.
+    scene_repaint_needed: bool,
     /// For a window whose surface shows its alpha, the pass that makes its
     /// content opaque and rounds its corners. `None` presents opaque.
     corners: Option<corners::Corners>,
@@ -96,6 +109,8 @@ struct Swapchain {
     injected_build_vk_error: Option<vk::Result>,
     #[cfg(test)]
     injected_stage_vk_error: Option<vk::Result>,
+    #[cfg(test)]
+    injected_post_scene_record_error: Option<vk::Result>,
     #[cfg(test)]
     injected_queue_present_error: Option<vk::Result>,
     #[cfg(test)]
@@ -165,6 +180,9 @@ struct WindowSwapchain {
     gpu: &'static Gpu,
     presenting: Mutex<()>,
     state: Mutex<Swapchain>,
+    /// Latest AppKit hierarchy snapshot, handed to the WSI worker without
+    /// holding its GPU or presentation locks on the AppKit event thread.
+    pending_scene: Mutex<Option<Vec<ScenePlacement>>>,
     wake: Condvar,
     alive: AtomicBool,
     worker_started: AtomicBool,
@@ -197,6 +215,7 @@ struct AcquireRequest {
 #[derive(Clone, Copy)]
 struct PresentSource {
     image: vk::Image,
+    format: vk::Format,
     width: u32,
     height: u32,
 }
@@ -205,6 +224,7 @@ impl From<&GpuImage> for PresentSource {
     fn from(image: &GpuImage) -> Self {
         Self {
             image: image.image,
+            format: image.format,
             width: image.width,
             height: image.height,
         }
@@ -225,7 +245,7 @@ struct PreparedComposite {
 /// Its WSI-copy fence protects release if another frame supersedes it.
 // Store SDL's opaque window handle as an integer, as the other worker state
 // does. Reconstruct the Frame only under the window's presenting mutex.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct DirectFrame {
     window: usize,
     x: i32,
@@ -263,6 +283,7 @@ impl DirectFrame {
 }
 
 struct DirectLayer {
+    layer: usize,
     frame: DirectFrame,
     source: PresentSource,
     owner: Option<usize>,
@@ -295,6 +316,32 @@ fn wake_compositor_worker(entry: &WindowSwapchain) {
         worker.thread().unpark();
     }
     entry.wake.notify_all();
+}
+
+/// AppKit only transfers value snapshots. It never waits for an in-flight
+/// Vulkan frame or calls into the renderer with an Objective-C object alive.
+pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::MetalSceneLayer>) {
+    let entry = SWAPCHAINS
+        .lock()
+        .expect("window swapchains")
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)).cloned());
+    let Some(entry) = entry else {
+        return;
+    };
+    if !entry.alive.load(Ordering::Acquire) {
+        return;
+    }
+    let ordered = visible
+        .into_iter()
+        .map(|layer| ScenePlacement {
+            id: layer.layer,
+            frame: DirectFrame::from_frame(&layer.frame),
+            opacity: layer.opacity,
+        })
+        .collect();
+    *entry.pending_scene.lock().expect("AppKit scene pending") = Some(ordered);
+    wake_compositor_worker(&entry);
 }
 
 fn wake_resize_worker(entry: &WindowSwapchain) {
@@ -490,6 +537,8 @@ struct Frame {
     source: Option<usize>,
     /// Store upload source kept immutable until the associated GPU copy fence.
     backing: Option<Arc<BackingImageLease>>,
+    /// Retained scene source images referenced by the GPU command buffer.
+    scene_reads: Vec<Arc<BackingImageLease>>,
 }
 
 struct PresentFence {
@@ -773,7 +822,7 @@ pub(crate) fn present(
 ) -> Result<bool, String> {
     let limit = Instant::now() + Duration::from_secs(3);
     loop {
-        match present_impl(gpu, layer, frame, source, holes, None, None)? {
+        match present_impl(gpu, layer, frame, source, holes, None, None, true)? {
             Some(shown) => return Ok(shown),
             None if Instant::now() < limit => {
                 // These tests do not run an AppKit event pump.
@@ -868,7 +917,7 @@ pub(crate) fn present_nonblocking(
     source: &GpuImage,
     holes: &[(usize, Region)],
 ) -> Result<Option<bool>, String> {
-    present_impl(gpu, layer, frame, source, holes, None, None)
+    present_impl(gpu, layer, frame, source, holes, None, None, true)
 }
 
 /// Present a command buffer's drawable, consuming its retained `owner` on
@@ -881,7 +930,17 @@ pub(crate) fn present_owned(
     holes: &[(usize, Region)],
     owner: usize,
 ) -> Result<Option<bool>, String> {
-    present_impl(gpu, layer, frame, source, holes, Some(owner), None)
+    present_impl(
+        gpu,
+        layer,
+        frame,
+        source,
+        holes,
+        Some(owner),
+        None,
+        #[cfg(test)]
+        false,
+    )
 }
 
 /// Retain one immutable backing-store GPU image through its direct WSI copy.
@@ -894,7 +953,17 @@ pub(crate) fn present_backing_nonblocking(
     holes: &[(usize, Region)],
 ) -> Result<Option<bool>, String> {
     let lease = Arc::clone(&source);
-    present_impl(gpu, layer, frame, &source.image, holes, None, Some(lease))
+    present_impl(
+        gpu,
+        layer,
+        frame,
+        &source.image,
+        holes,
+        None,
+        Some(lease),
+        #[cfg(test)]
+        false,
+    )
 }
 
 fn present_impl(
@@ -905,6 +974,7 @@ fn present_impl(
     holes: &[(usize, Region)],
     owner: Option<usize>,
     backing: Option<Arc<BackingImageLease>>,
+    #[cfg(test)] synthetic_scene: bool,
 ) -> Result<Option<bool>, String> {
     let mut owner = SourceOwner(owner);
     if gpu.lost.load(Ordering::Acquire) {
@@ -1098,6 +1168,7 @@ fn present_impl(
                                 gpu,
                                 presenting: Mutex::new(()),
                                 state: Mutex::new(swapchain),
+                                pending_scene: Mutex::new(None),
                                 wake: Condvar::new(),
                                 alive: AtomicBool::new(true),
                                 worker_started: AtomicBool::new(false),
@@ -1221,9 +1292,43 @@ fn present_impl(
         wake_resize_worker(&window_swapchain);
         return Ok(None);
     }
+    // The view hierarchy, rather than drawable submission order, is the
+    // authority on what was attached and which layer is in front. Synthetic
+    // WSI tests have no NSWindow and retain their explicit registration order.
+    // Synthetic WSI fixtures deliberately submit layer IDs that are not
+    // associated with an NSView. Guest-owned and backing-store sources always
+    // obey authoritative live AppKit membership.
+    #[cfg(test)]
+    let live_scene = (!synthetic_scene)
+        .then(|| appkit::view::metal_scene(frame.window))
+        .flatten();
+    #[cfg(not(test))]
+    let live_scene = appkit::view::metal_scene(frame.window);
+    let live_scene = live_scene.map(|scene| {
+        scene
+            .into_iter()
+            .map(|item| ScenePlacement {
+                id: item.layer,
+                frame: DirectFrame::from_frame(&item.frame),
+                opacity: item.opacity,
+            })
+            .collect::<Vec<_>>()
+    });
+    if let Some(scene) = live_scene.as_deref() {
+        swapchain.synchronize_scene(window, scene);
+        if layer != window && !scene.iter().any(|item| item.id == layer) {
+            // A view removed while its GPU drawable was still queued cannot
+            // resurrect itself by a late presentation.
+            finish_source(owner.take());
+            return Ok(Some(true));
+        }
+    }
     let joined = !swapchain.layers.contains(&layer);
     if joined {
         swapchain.layers.push(layer);
+    }
+    if let Some(scene) = live_scene.as_deref() {
+        swapchain.synchronize_scene(window, scene);
     }
     // Only a layer that has presented here has anything of its own to keep:
     // over any other hole the source is still what the window shows.
@@ -1287,6 +1392,7 @@ fn present_impl(
         let staged = match converted {
             Ok(_) if direct => {
                 swapchain.queue_direct(
+                    layer,
                     frame,
                     PresentSource::from(source),
                     &mut owner,
@@ -1299,8 +1405,14 @@ fn present_impl(
             // presenting an incomplete window image over that drawable.
             Ok(None) if converting => Ok(None),
             Ok(None) | Ok(Some(true)) => {
-                let result =
-                    swapchain.stage_composite(frame, source, regions.as_deref(), &mut owner, true);
+                let result = swapchain.stage_composite_layer(
+                    layer,
+                    frame,
+                    source,
+                    regions.as_deref(),
+                    &mut owner,
+                    true,
+                );
                 if matches!(result, Ok(Some(true))) {
                     // A backing-store source must also survive its staging
                     // copy when this window already has multiple layers.
@@ -1315,6 +1427,10 @@ fn present_impl(
         };
         let typed_device_loss =
             swapchain.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
+        if matches!(staged, Ok(Some(true))) {
+            swapchain.note_scene_frame(layer, frame);
+            swapchain.scene_repaint_needed = false;
+        }
         let refresh_store = composite_first_stage_needs_store(joined, &staged, layer, window);
         if !matches!(staged, Ok(Some(true))) && joined {
             // A saved background snapshot does not mean the new layer's own
@@ -1469,6 +1585,11 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         // the same mutex before signaling us, so notifications are not lost.
         let mut state = entry.state.lock().expect("window swapchain");
         while !state.composite_dirty
+            && entry
+                .pending_scene
+                .lock()
+                .expect("AppKit scene pending")
+                .is_none()
             && entry.alive.load(Ordering::Acquire)
             && !entry.gpu.lost.load(Ordering::Acquire)
             && entry.present_failure.load(Ordering::Acquire) == 0
@@ -1504,6 +1625,59 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             || entry.present_failure.load(Ordering::Acquire) != 0
         {
             return;
+        }
+        if entry
+            .pending_scene
+            .lock()
+            .expect("AppKit scene pending")
+            .is_some()
+        {
+            drop(state);
+            let _presenting = PresentingGuard {
+                held: Some(entry.presenting.lock().expect("window presentation")),
+                gpu: entry.gpu,
+            };
+            let snapshot = entry
+                .pending_scene
+                .lock()
+                .expect("AppKit scene pending")
+                .take();
+            if let Some(live) = snapshot {
+                let mut state = entry.state.lock().expect("window swapchain");
+                state.synchronize_scene(window, &live);
+                if state.scene_repaint_needed {
+                    match state.redisplay_scene(window) {
+                        Ok(true) => {
+                            state.scene_repaint_needed = false;
+                            wake_compositor_worker(&entry);
+                        }
+                        Ok(false) => {
+                            // Keep dirty scene damage across repeated scene
+                            // snapshots and concurrent guest presentations.
+                            entry
+                                .pending_scene
+                                .lock()
+                                .expect("AppKit scene pending")
+                                .get_or_insert(live);
+                        }
+                        Err(error) => {
+                            gpu::trace(format!("recomposing changed layer tree failed: {error}"))
+                        }
+                    }
+                }
+            }
+            drop(_presenting);
+            if entry
+                .state
+                .lock()
+                .expect("window swapchain")
+                .scene_repaint_needed
+            {
+                // Keep the GPU fence retry bounded without monopolizing the
+                // presentation mutex or spinning on an unfinished submission.
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            continue;
         }
         if !state.composite_dirty {
             drop(state);
@@ -1699,6 +1873,7 @@ impl Swapchain {
 
     fn queue_direct(
         &mut self,
+        layer: usize,
         frame: &appkit::view::Frame,
         source: PresentSource,
         owner: &mut SourceOwner,
@@ -1706,6 +1881,7 @@ impl Swapchain {
     ) {
         self.retire_direct();
         self.direct = Some(DirectLayer {
+            layer,
             frame: DirectFrame::from_frame(frame),
             source,
             owner: owner.take(),
@@ -1726,6 +1902,7 @@ impl Swapchain {
         };
         let mut owner = SourceOwner(direct.owner.take());
         let result = self.stage_composite_source(
+            direct.layer,
             &direct.frame.frame(),
             direct.source,
             None,
@@ -1765,14 +1942,16 @@ impl Swapchain {
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
         self.frames[slot].backing.take();
+        self.frames[slot].scene_reads.clear();
         self.composite_dirty = false;
         self.composite_dirty_since = None;
         Ok(true)
     }
 
-    /// Copy a guest layer into the window accumulator without making the
-    /// compositor display an intermediate image. The regular Metal drawable
-    /// ownership/fence lifetime still applies to this submission.
+    /// Copy a synthetic test drawable into the window accumulator without
+    /// publishing an intermediate WSI frame. Production uses the per-layer
+    /// scene path to retain independent GPU-owned snapshots.
+    #[cfg(test)]
     fn stage_composite(
         &mut self,
         frame: &appkit::view::Frame,
@@ -1787,6 +1966,31 @@ impl Swapchain {
             return Err(format!("injected composite staging failure: {error:?}"));
         }
         self.stage_composite_source(
+            0,
+            frame,
+            PresentSource::from(source),
+            regions,
+            owner,
+            nonblocking,
+        )
+    }
+
+    fn stage_composite_layer(
+        &mut self,
+        layer: usize,
+        frame: &appkit::view::Frame,
+        source: &GpuImage,
+        regions: Option<&[Region]>,
+        owner: &mut SourceOwner,
+        nonblocking: bool,
+    ) -> Result<Option<bool>, String> {
+        #[cfg(test)]
+        if let Some(error) = self.injected_stage_vk_error.take() {
+            self.last_wsi_error = Some(error);
+            return Err(format!("injected composite staging failure: {error:?}"));
+        }
+        self.stage_composite_source(
+            layer,
             frame,
             PresentSource::from(source),
             regions,
@@ -1797,6 +2001,7 @@ impl Swapchain {
 
     fn stage_composite_source(
         &mut self,
+        layer: usize,
         frame: &appkit::view::Frame,
         source: PresentSource,
         regions: Option<&[Region]>,
@@ -1822,99 +2027,127 @@ impl Swapchain {
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
         self.frames[slot].backing.take();
+        self.frames[slot].scene_reads.clear();
         let composite = self.composite()?;
+        let scene_work = match self.prepare_scene(layer, frame, source, regions)? {
+            ScenePrepared::SingleLayer => None,
+            ScenePrepared::Deferred => return Ok(None),
+            ScenePrepared::Ready(work) => Some(work),
+        };
 
         let device = &self.gpu.device;
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: this command buffer's fence has completed, and all images
-        // remain in GENERAL for copies between guest layers.
-        unsafe {
-            device
-                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                .map_err(|e| format!("vkResetCommandBuffer failed: {e:?}"))?;
-            device
-                .begin_command_buffer(command_buffer, &begin)
-                .map_err(|e| format!("vkBeginCommandBuffer failed: {e:?}"))?;
-            prepare_source(device, command_buffer, source.image);
-            // A previous window presentation may still be reading the
-            // accumulator (transfer or corners compute), even when its layer
-            // writes have finished. Order those reads before a new write.
-            let image_barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(
-                    vk::AccessFlags::TRANSFER_READ
-                        | vk::AccessFlags::TRANSFER_WRITE
-                        | vk::AccessFlags::SHADER_READ,
-                )
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(composite)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[image_barrier],
-            );
-            match regions {
-                Some(regions) => {
-                    for region in regions {
-                        let part = appkit::view::Frame {
-                            x: region.x,
-                            y: region.y,
-                            width: region.width.max(0) as u32,
-                            height: region.height.max(0) as u32,
-                            ..*frame
-                        };
-                        if let Some(into) = clamp(&part, self.extent) {
-                            blit(
-                                device,
-                                command_buffer,
-                                source.image,
-                                source_of(into, frame, (source.width, source.height)),
-                                composite,
-                                vk::ImageLayout::GENERAL,
-                                into,
-                            );
+        let staged = (|| -> Result<(), String> {
+            // SAFETY: this command buffer's fence has completed, and all images
+            // remain in GENERAL for copies between guest layers.
+            unsafe {
+                device
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                    .map_err(|e| format!("vkResetCommandBuffer failed: {e:?}"))?;
+                device
+                    .begin_command_buffer(command_buffer, &begin)
+                    .map_err(|e| format!("vkBeginCommandBuffer failed: {e:?}"))?;
+                prepare_source(device, command_buffer, source.image);
+                // A previous window presentation may still be reading the
+                // accumulator (transfer or corners compute), even when its layer
+                // writes have finished. Order those reads before a new write.
+                let image_barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(
+                        vk::AccessFlags::TRANSFER_READ
+                            | vk::AccessFlags::TRANSFER_WRITE
+                            | vk::AccessFlags::SHADER_READ,
+                    )
+                    .dst_access_mask(
+                        vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ,
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(composite)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[image_barrier],
+                );
+                if let Some(work) = &scene_work {
+                    self.record_scene(device, command_buffer, composite, source, work)?;
+                } else {
+                    match regions {
+                        Some(regions) => {
+                            for region in regions {
+                                let part = appkit::view::Frame {
+                                    x: region.x,
+                                    y: region.y,
+                                    width: region.width.max(0) as u32,
+                                    height: region.height.max(0) as u32,
+                                    ..*frame
+                                };
+                                if let Some(into) = clamp(&part, self.extent) {
+                                    blit(
+                                        device,
+                                        command_buffer,
+                                        source.image,
+                                        source_of(into, frame, (source.width, source.height)),
+                                        composite,
+                                        vk::ImageLayout::GENERAL,
+                                        into,
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            if let Some(into) = clamp(frame, self.extent) {
+                                blit(
+                                    device,
+                                    command_buffer,
+                                    source.image,
+                                    source_of(into, frame, (source.width, source.height)),
+                                    composite,
+                                    vk::ImageLayout::GENERAL,
+                                    into,
+                                );
+                            }
                         }
                     }
                 }
-                None => {
-                    if let Some(into) = clamp(frame, self.extent) {
-                        blit(
-                            device,
-                            command_buffer,
-                            source.image,
-                            source_of(into, frame, (source.width, source.height)),
-                            composite,
-                            vk::ImageLayout::GENERAL,
-                            into,
-                        );
-                    }
-                }
+                device
+                    .end_command_buffer(command_buffer)
+                    .map_err(|e| format!("vkEndCommandBuffer failed: {e:?}"))?;
             }
-            device
-                .end_command_buffer(command_buffer)
-                .map_err(|e| format!("vkEndCommandBuffer failed: {e:?}"))?;
+            // The Vulkan queue orders this composite update after the guest's
+            // Metal command buffer and before a later WSI copy. No WSI semaphore
+            // is required: the composite is an ordinary device-owned image.
+            #[cfg(test)]
+            if let Some(error) = self.injected_post_scene_record_error.take() {
+                return Err(format!("injected post-scene recording failure: {error:?}"));
+            }
+            self.gpu
+                .submit_synchronized(command_buffer, done, &[], &[])?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            if let Some(work) = scene_work {
+                self.rollback_scene(work);
+            }
+            return Err(error);
         }
-        // The Vulkan queue orders this composite update after the guest's
-        // Metal command buffer and before a later WSI copy. No WSI semaphore
-        // is required: the composite is an ordinary device-owned image.
-        self.gpu
-            .submit_synchronized(command_buffer, done, &[], &[])?;
         self.frames[slot].submitted = true;
+        if let Some(work) = scene_work {
+            self.complete_scene(slot, work);
+        }
         self.frames[slot].source = owner.take();
         self.frame = self.frame.wrapping_add(1);
         if !self.composite_dirty {
@@ -2284,6 +2517,7 @@ impl Swapchain {
                 submitted: false,
                 source: None,
                 backing: None,
+                scene_reads: Vec::new(),
             });
         }
         drop(wsi);
@@ -2315,6 +2549,11 @@ impl Swapchain {
             composite: None,
             direct: None,
             layers: Vec::new(),
+            scene_layers: Vec::new(),
+            scene_placements: Vec::new(),
+            scene_blender: None,
+            scene_frames: Vec::new(),
+            scene_repaint_needed: false,
             corners,
             pool: pool.take(),
             frames: frames.take(),
@@ -2334,6 +2573,8 @@ impl Swapchain {
             injected_build_vk_error: None,
             #[cfg(test)]
             injected_stage_vk_error: None,
+            #[cfg(test)]
+            injected_post_scene_record_error: None,
             #[cfg(test)]
             injected_queue_present_error: None,
             #[cfg(test)]
@@ -2418,6 +2659,7 @@ impl Swapchain {
                 self.frames[slot].submitted = false;
                 finish_source(self.frames[slot].source.take());
                 self.frames[slot].backing.take();
+                self.frames[slot].scene_reads.clear();
             }
         }
         // DXVK requests the surface minimum for IMMEDIATE and min+1 for
@@ -2635,7 +2877,9 @@ impl Swapchain {
     fn retire_copied(&mut self) -> bool {
         let mut retired = false;
         for frame in &mut self.frames {
-            if (frame.source.is_none() && frame.backing.is_none()) || !frame.submitted {
+            if (frame.source.is_none() && frame.backing.is_none() && frame.scene_reads.is_empty())
+                || !frame.submitted
+            {
                 continue;
             }
             // Both an Objective-C drawable and a ref-counted store image are
@@ -2643,6 +2887,7 @@ impl Swapchain {
             if self.gpu.fence_signaled(frame.done).unwrap_or(false) {
                 finish_source(frame.source.take());
                 frame.backing.take();
+                frame.scene_reads.clear();
                 retired = true;
             }
         }
@@ -2653,7 +2898,12 @@ impl Swapchain {
     fn copying(&self) -> Vec<vk::Fence> {
         self.frames
             .iter()
-            .filter(|frame| frame.submitted && (frame.source.is_some() || frame.backing.is_some()))
+            .filter(|frame| {
+                frame.submitted
+                    && (frame.source.is_some()
+                        || frame.backing.is_some()
+                        || !frame.scene_reads.is_empty())
+            })
             .map(|frame| frame.done)
             .collect()
     }
@@ -2699,6 +2949,7 @@ impl Swapchain {
                 frame.submitted = false;
                 finish_source(frame.source.take());
                 frame.backing.take();
+                frame.scene_reads.clear();
             }
             return;
         }
@@ -2722,6 +2973,7 @@ impl Swapchain {
             frame.submitted = false;
             finish_source(frame.source.take());
             frame.backing.take();
+            frame.scene_reads.clear();
         }
         for present in &mut self.presented {
             present.pending = false;
@@ -2734,7 +2986,7 @@ impl Swapchain {
     ///
     /// With the corners pass, the composite is one the pass can read.
     fn composite_description(
-        format: vk::Format,
+        _format: vk::Format,
         extent: vk::Extent2D,
         corners_enabled: bool,
     ) -> ImageDescription {
@@ -2744,14 +2996,14 @@ impl Swapchain {
             ImageDescription {
                 image_type: vk::ImageType::TYPE_2D,
                 view_type: vk::ImageViewType::TYPE_2D,
-                format,
+                format: vk::Format::R8G8B8A8_UNORM,
                 width: extent.width,
                 height: extent.height,
                 depth: 1,
                 levels: 1,
                 layers: 1,
                 samples: 1,
-                usage: gpu::USAGE_RENDER_TARGET,
+                usage: gpu::USAGE_SHADER_WRITE | gpu::USAGE_SHADER_READ,
                 cube: false,
                 components: vk::ComponentMapping::default(),
             }
@@ -2838,6 +3090,7 @@ impl Swapchain {
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
         self.frames[slot].backing.take();
+        self.frames[slot].scene_reads.clear();
         if self.frames[slot].acquire_pending {
             // WSI may signal an acquisition fence after a successful
             // vkAcquireNextImageKHR returns. Never stall AppKit while it

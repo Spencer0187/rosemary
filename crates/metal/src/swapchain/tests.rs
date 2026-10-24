@@ -766,7 +766,7 @@ fn slow_window_initialization_does_not_block_other_windows_or_teardown() {
     TEST_SLOW_INITIALIZER_STARTED.store(false, Ordering::Release);
     TEST_SLOW_INITIALIZER.store(a.0 as usize, Ordering::Release);
     assert_eq!(
-        present_impl(gpu, a.0 as usize, &a.2, &a.1, &[], None, None),
+        present_impl(gpu, a.0 as usize, &a.2, &a.1, &[], None, None, true),
         Ok(None)
     );
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -1005,7 +1005,7 @@ fn device_loss_before_swapchain_create_cleans_pending_initializer() {
             Instant::now() < deadline,
             "initializer did not reach pre-create checkpoint"
         );
-        let _ = present_impl(gpu, key, &frame, &source, &[], None, None);
+        let _ = present_impl(gpu, key, &frame, &source, &[], None, None, true);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1163,7 +1163,7 @@ fn minimized_window_retries_transient_initialization_after_restore() {
             Instant::now() < deadline,
             "transient failure did not schedule retry"
         );
-        let _ = present_impl(gpu, 42, &frame, &source, &[], None, None);
+        let _ = present_impl(gpu, 42, &frame, &source, &[], None, None, true);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1214,7 +1214,7 @@ fn minimized_window_retries_transient_initialization_after_restore() {
             Instant::now() < until,
             "restored window never recovered Vulkan presentation"
         );
-        let _ = present_impl(gpu, 42, &frame, &source, &[], None, None);
+        let _ = present_impl(gpu, 42, &frame, &source, &[], None, None, true);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1580,6 +1580,7 @@ fn single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer() {
     // repeatedly; the first few images alone do not exercise retirement.
     for _ in 0..(FRAMES_IN_FLIGHT * 3 + 2) {
         state.queue_direct(
+            8,
             &frame,
             PresentSource::from(&image),
             &mut SourceOwner(None),
@@ -1720,6 +1721,7 @@ fn direct_layer_resize_preserves_unscaled_static_window_image_impl(wsi_only: boo
     assert_eq!(state.present_mode, expected_mode);
     state.layers.push(8);
     state.queue_direct(
+        8,
         &frame,
         PresentSource::from(&image),
         &mut SourceOwner(None),
@@ -2110,6 +2112,7 @@ fn retained_backing_source_uses_direct_wsi_and_releases_after_gpu_copy() {
     ));
     for _ in 0..FRAMES_IN_FLIGHT * 2 {
         state.queue_direct(
+            8,
             &frame,
             PresentSource::from(&lease.image),
             &mut SourceOwner(None),
@@ -2166,6 +2169,7 @@ fn idle_direct_frame_snapshots_once_and_releases_the_source_fence() {
     assert_eq!(state.present_mode, expected_mode);
     state.layers.push(8);
     state.queue_direct(
+        8,
         &frame,
         PresentSource::from(&image),
         &mut SourceOwner(None),
@@ -2245,6 +2249,7 @@ fn direct_single_layer_replays_after_failed_submit() {
     assert_eq!(state.present_mode, expected_mode);
     state.layers.push(8);
     state.queue_direct(
+        8,
         &frame,
         PresentSource::from(&image),
         &mut SourceOwner(None),
@@ -2605,7 +2610,7 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
             Instant::now() < deadline,
             "initializer device loss deadlocked the registry"
         );
-        let _ = present_impl(gpu, window as usize, &frame, &source, &[], None, None);
+        let _ = present_impl(gpu, window as usize, &frame, &source, &[], None, None, true);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -2649,6 +2654,459 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
     sdl3::video::vulkan::service_surface_requests();
     gpu.lost.store(false, Ordering::Release); // synthetic result, real device healthy
     gpu.destroy_image(source);
+}
+
+/// A background can submit another drawable after an opaque foreground
+/// overlay stops submitting. The *pixels*, not just layer-count metadata,
+/// must still contain the static foreground after the background update.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn static_foreground_survives_repeated_background_submissions() {
+    if isolate_vulkan_graphical_test("static_foreground_survives_repeated_background_submissions") {
+        return;
+    }
+    let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let overlay = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 60,
+            height: 40,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("overlay image");
+    let paint = |image: &GpuImage, rgba: [f32; 4]| {
+        gpu.one_shot(|device, command_buffer| unsafe {
+            device.cmd_clear_color_image(
+                command_buffer,
+                image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: rgba },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .expect("fill test image")
+    };
+    paint(&background, [1.0, 0.0, 0.0, 1.0]);
+    paint(&overlay, [0.0, 1.0, 0.0, 1.0]);
+    let foreground = appkit::view::Frame {
+        x: 30,
+        y: 20,
+        width: 60,
+        height: 40,
+        ..whole
+    };
+    state.layers.push(1);
+    state.note_scene_frame(1, &whole);
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.layers.push(2);
+    assert_eq!(
+        state.stage_composite_layer(
+            2,
+            &foreground,
+            &overlay,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(2, &foreground);
+    // B has now stopped updating. Replacing A's drawable cannot erase it.
+    paint(&background, [0.0, 0.0, 1.0, 1.0]);
+    for _ in 0..4 {
+        assert_eq!(
+            state.stage_composite_layer(
+                1,
+                &whole,
+                &background,
+                None,
+                &mut SourceOwner(None),
+                false
+            ),
+            Ok(Some(true))
+        );
+    }
+    state.idle();
+    let read = gpu
+        .create_buffer(u64::from(whole.window_width) * u64::from(whole.window_height) * 4)
+        .expect("readback buffer");
+    let composite_image = state.composite.as_ref().expect("window accumulator").image;
+    let fetch = || {
+        gpu.one_shot(|device, cb| unsafe {
+            let read_barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(composite_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[read_barrier],
+            );
+            device.cmd_copy_image_to_buffer(
+                cb,
+                composite_image,
+                vk::ImageLayout::GENERAL,
+                read.buffer,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: whole.window_width,
+                        height: whole.window_height,
+                        depth: 1,
+                    })],
+            );
+        })
+        .expect("GPU compositor readback")
+    };
+    fetch();
+    let pixel = |x: usize, y: usize| {
+        let offset = (y * whole.window_width as usize + x) * 4;
+        unsafe { std::slice::from_raw_parts(read.contents.add(offset), 4).to_vec() }
+    };
+    assert_eq!(
+        pixel(55, 35),
+        [0, 255, 0, 255],
+        "static green overlay was overwritten"
+    );
+    assert_eq!(
+        pixel(5, 5),
+        [0, 0, 255, 255],
+        "new blue background is missing"
+    );
+    // Parent/view opacity changes are part of the retained scene state, not
+    // an instruction for the static foreground to submit another drawable.
+    // A 50% green layer over solid blue is ~[0,128,128,255] in RGBA.
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[
+            ScenePlacement {
+                id: 1,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0
+            },
+            ScenePlacement {
+                id: 2,
+                frame: DirectFrame::from_frame(&foreground),
+                opacity: 0.5
+            },
+        ]
+    ));
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.idle();
+    fetch();
+    let translucent = pixel(55, 35);
+    assert_eq!(
+        translucent[0], 0,
+        "red leaked into green-over-blue composition"
+    );
+    assert!(
+        (127..=129).contains(&translucent[1]),
+        "opacity did not halve the static green foreground: {translucent:?}"
+    );
+    assert!(
+        (126..=129).contains(&translucent[2]),
+        "blue was erased by the half-transparent green foreground: {translucent:?}"
+    );
+    assert_eq!(
+        translucent[3], 255,
+        "premultiplied source-over must end opaque"
+    );
+    gpu.destroy_buffer(read);
+    drop(state);
+    gpu.destroy_image(background);
+    gpu.destroy_image(overlay);
+    sdl3::video::destroy_window(window);
+}
+
+/// Every image the compositor has submitted remains immutable until the GPU
+/// fence has signaled. Once the per-layer source pool fills with retained
+/// generations, a new frame must defer without overwriting an older image.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn retained_scene_sources_rotate_and_defer_when_all_generations_are_busy() {
+    if isolate_vulkan_graphical_test(
+        "retained_scene_sources_rotate_and_defer_when_all_generations_are_busy",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let overlay = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 60,
+            height: 40,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("scene overlay");
+    let child = appkit::view::Frame {
+        x: 15,
+        y: 20,
+        width: 60,
+        height: 40,
+        ..whole
+    };
+    state.layers.push(1);
+    state.note_scene_frame(1, &whole);
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.layers.push(2);
+    assert_eq!(
+        state.stage_composite_layer(2, &child, &overlay, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(2, &child);
+    // The first background update establishes a source matching the guest
+    // BGRA image; its initial fallback snapshot was in RGBA compositor format.
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    let mut retained = Vec::new();
+    for index in 0..super::scene::MAX_SCENE_IMAGES_PER_LAYER {
+        let source = state
+            .scene_layers
+            .iter()
+            .find(|scene| scene.id == 1)
+            .expect("background in retained scene");
+        retained.push(Arc::clone(&source.snapshot));
+        let before = state.frame;
+        let next = state
+            .stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false)
+            .expect("scene source rotation");
+        if index + 1 == super::scene::MAX_SCENE_IMAGES_PER_LAYER {
+            assert_eq!(
+                next, None,
+                "pool must defer rather than overwrite an in-flight scene source"
+            );
+            assert_eq!(
+                state.frame, before,
+                "deferred source caused a GPU staging submission"
+            );
+        } else {
+            assert_eq!(
+                next,
+                Some(true),
+                "unexpected exhaustion at generation {index}"
+            );
+            assert!(
+                !Arc::ptr_eq(
+                    retained.last().unwrap(),
+                    &state
+                        .scene_layers
+                        .iter()
+                        .find(|scene| scene.id == 1)
+                        .unwrap()
+                        .snapshot
+                ),
+                "updated the same source allocation while its previous generation was retained"
+            );
+        }
+    }
+    state.idle();
+    drop(retained);
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
+        Ok(Some(true)),
+        "a retired scene source must be reusable without another allocation"
+    );
+    state.idle();
+    drop(state);
+    gpu.destroy_image(background);
+    gpu.destroy_image(overlay);
+    sdl3::video::destroy_window(window);
+}
+
+/// A real WSI direct frame becomes a multi-layer scene, then regains direct
+/// WSI after the foreground view leaves the live AppKit hierarchy. Repaint
+/// only from GPU-retained layer contents: no new guest drawable is submitted.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn removed_foreground_recomposes_and_restores_direct_wsi() {
+    if isolate_vulkan_graphical_test("removed_foreground_recomposes_and_restores_direct_wsi") {
+        return;
+    }
+    let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    assert_eq!(
+        state.present_mode, expected,
+        "test did not select actual requested WSI mode"
+    );
+    let overlay = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 60,
+            height: 40,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("foreground image");
+    let fill = |image: &GpuImage, color| {
+        gpu.one_shot(|device, cb| unsafe {
+            device.cmd_clear_color_image(
+                cb,
+                image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: color },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .expect("fill scene source")
+    };
+    fill(&background, [0.0, 0.0, 1.0, 1.0]);
+    fill(&overlay, [0.0, 1.0, 0.0, 1.0]);
+    state.layers.push(1);
+    state.note_scene_frame(1, &whole);
+    state.queue_direct(
+        1,
+        &whole,
+        PresentSource::from(&background),
+        &mut SourceOwner(None),
+        None,
+    );
+    state
+        .flush_composite(window)
+        .expect("single-layer direct WSI");
+    assert!(state.direct.is_some());
+    assert!(state.composite.is_none());
+    let foreground = appkit::view::Frame {
+        x: 30,
+        y: 20,
+        width: 60,
+        height: 40,
+        ..whole
+    };
+    state.layers.push(2);
+    assert_eq!(state.stage_direct_snapshot(false), Ok(Some(true)));
+    assert_eq!(
+        state.stage_composite_layer(
+            2,
+            &foreground,
+            &overlay,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(2, &foreground);
+    state
+        .flush_composite(window)
+        .expect("two-layer accumulator WSI");
+    assert!(state.direct.is_none());
+    assert_eq!(state.scene_layers.len(), 2);
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id: 1,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+        }]
+    ));
+    assert_eq!(state.layers, [1]);
+    let gpu_frame = state.frame;
+    assert!(
+        state
+            .redisplay_scene(window as usize)
+            .expect("retained scene repaint")
+    );
+    assert_eq!(
+        state.frame, gpu_frame,
+        "restored direct WSI paid an extra accumulator submission"
+    );
+    let direct = state
+        .direct
+        .as_ref()
+        .expect("single-layer fast path not restored");
+    assert_eq!(direct.layer, 1);
+    assert!(
+        direct.backing.is_some(),
+        "new direct frame has no GPU source lease"
+    );
+    assert!(
+        state.scene_layers.iter().all(|scene| scene.id != 2),
+        "removed overlay source remains in live scene"
+    );
+    state
+        .flush_composite(window)
+        .expect("direct WSI after foreground removal");
+    state.idle();
+    drop(state);
+    gpu.destroy_image(background);
+    gpu.destroy_image(overlay);
+    sdl3::video::destroy_window(window);
 }
 
 /// Two layers in one window, the second of them a rectangle inside it,
