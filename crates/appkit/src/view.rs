@@ -2943,8 +2943,93 @@ mod tests {
         let current = metal_scene(sdl).expect("published layer snapshot");
         assert_eq!(current.len(), 2);
         assert!((current[1].opacity - 0.5).abs() <= f32::EPSILON);
-        unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+        // Moving a live Metal layer changes placement without requiring it to
+        // submit another drawable. Sibling reordering changes compositing
+        // order even if neither layer publishes a new frame.
+        let old_frame = current[1].frame;
+        unsafe {
+            set_frame_origin(
+                b,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: 42.0, y: 50.0 },
+            )
+        };
+        let moved = metal_scene(sdl).expect("updated geometry");
+        assert_ne!(moved[1].frame.x, old_frame.x);
+        assert_ne!(moved[1].frame.y, old_frame.y);
+        unsafe {
+            add_subview_positioned(
+                content,
+                objc::sel::get("addSubview:positioned:relativeTo:"),
+                a,
+                1,
+                b,
+            )
+        };
+        assert_eq!(ids(sdl), [second as usize, first as usize]);
+        unsafe {
+            add_subview_positioned(
+                content,
+                objc::sel::get("addSubview:positioned:relativeTo:"),
+                a,
+                ORDER_BELOW,
+                b,
+            )
+        };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // Reparent B beneath a container. Hiding an ancestor must retire the
+        // nested Metal layer without changing B's own hidden flag.
+        let container = view(rect(15.0, 10.0, 280.0, 200.0));
+        unsafe {
+            add_subview(content, objc::sel::get("addSubview:"), container);
+            add_subview(container, objc::sel::get("addSubview:"), b);
+        }
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        let before_container_move = metal_scene(sdl).unwrap()[1].frame;
+        unsafe {
+            set_frame_origin(
+                container,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: 35.0, y: 22.0 },
+            )
+        };
+        let after_container_move = metal_scene(sdl).unwrap()[1].frame;
+        assert_ne!(after_container_move.x, before_container_move.x);
+        unsafe { set_hidden(container, objc::sel::get("setHidden:"), 1) };
         assert_eq!(ids(sdl), [first as usize]);
+        unsafe { set_hidden(container, objc::sel::get("setHidden:"), 0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // Moving an existing view into a second window must evict it from the
+        // first compositor before the second window can accept its drawable.
+        let other_window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if unsafe {
+            crate::window::init_with_content_rect_for_tests(
+                other_window,
+                rect(0.0, 0.0, 320.0, 240.0),
+            )
+        } {
+            let other_sdl = unsafe { crate::window::sdl_window(other_window) };
+            let other_content = view(rect(0.0, 0.0, 320.0, 240.0));
+            unsafe {
+                let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                    std::mem::transmute(objc::msg::entry());
+                set_content(
+                    other_window,
+                    objc::sel::get("setContentView:"),
+                    other_content,
+                );
+                add_subview(other_content, objc::sel::get("addSubview:"), b);
+            }
+            assert_eq!(ids(sdl), [first as usize]);
+            assert_eq!(ids(other_sdl), [second as usize]);
+            unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+            assert_eq!(ids(other_sdl), []);
+        } else {
+            unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+        }
+        assert_eq!(ids(sdl), [first as usize]);
+        objc::arc::release(other_window);
         objc::arc::release(window);
     }
 
