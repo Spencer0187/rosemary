@@ -1822,6 +1822,127 @@ fn backing_store_uploads_select_direct_wsi_without_overwriting_inflight_source()
     wait_for_test_retirements();
 }
 
+/// The real AppKit overlay-present route must retain its blended GPU image
+/// and perform one WSI copy. The deliberately invalid DMA-BUF exercises the
+/// overlay fallback copy and refusal contract without requiring an exporter;
+/// importing an actual foreign buffer needs separate supported-host coverage.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
+    let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let window = sdl3::video::create_window(c"direct GPU overlay store", 160, 120, 0)
+        .expect("SDL overlay test window");
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).expect("SDL overlay metadata");
+    let mut store = appkit::backing::Store::new(160, 120);
+    store.pixels.fill(42);
+    let overlays = [appkit::backing::GpuOverlay {
+        picture: Arc::new(appkit::backing::Dmabuf {
+            width: 160,
+            height: 120,
+            fourcc: u32::from_le_bytes(*b"AR24"),
+            modifier: 0,
+            planes: Vec::new(),
+        }),
+        rect: appkit::backing::Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 120,
+        },
+    }];
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match crate::present::present_store_synchronous(window, &store, &[], &overlays) {
+            appkit::backing::PresentOutcome::Displayed => break,
+            appkit::backing::PresentOutcome::Deferred => {
+                assert!(
+                    Instant::now() < deadline,
+                    "overlay backing store did not reach Vulkan"
+                );
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            other => panic!("unexpected overlay backing outcome: {other:?}"),
+        }
+    }
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&(window as usize))
+        .unwrap()
+        .clone();
+    let old = {
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        assert_eq!(state.present_mode, expected);
+        assert!(
+            state.composite.is_none(),
+            "overlay unnecessarily staged into accumulator"
+        );
+        let direct = state
+            .direct
+            .as_ref()
+            .expect("eligible overlay must queue directly");
+        let lease = direct
+            .backing
+            .as_ref()
+            .expect("blended image lacks GPU-copy lease");
+        assert_eq!(
+            lease.image.format,
+            vk::Format::R8G8B8A8_UNORM,
+            "overlay route did not select actual blended target"
+        );
+        let previous = Arc::clone(lease);
+        state
+            .flush_composite(window)
+            .expect("direct overlay WSI frame");
+        assert!(
+            state.composite.is_none(),
+            "direct overlay frame created full window composite"
+        );
+        previous
+    };
+    store.pixels.fill(87);
+    assert_eq!(
+        crate::present::present_store_synchronous(window, &store, &[], &overlays),
+        appkit::backing::PresentOutcome::Displayed
+    );
+    {
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        let direct = state.direct.as_ref().expect("updated overlay direct frame");
+        let fresh = direct.backing.as_ref().expect("overlay source lease");
+        assert!(
+            !Arc::ptr_eq(&old, fresh),
+            "blended image overwritten while WSI retained it"
+        );
+        assert!(state.composite.is_none());
+        state
+            .flush_composite(window)
+            .expect("second direct overlay WSI");
+        state.direct.as_mut().unwrap().queued_at = Instant::now() - DIRECT_IDLE_SNAPSHOT_DELAY;
+        assert!(state.snapshot_idle_direct().expect("idle overlay snapshot"));
+        state.idle();
+    }
+    drop(old);
+    drop(entry);
+    crate::present::forget_backing_store_for_test(window);
+    appkit::backing::forget_window(window); // Clear the deliberate DMA-BUF refusal.
+    forget_window(window);
+    sdl3::video::destroy_window(window);
+    wait_for_test_retirements();
+}
+
 /// A full-window store upload supplies a retained GPU allocation, not a
 /// CAMetalDrawable. The WSI worker can copy it directly without an offscreen
 /// accumulator or reading a source the next upload will overwrite.

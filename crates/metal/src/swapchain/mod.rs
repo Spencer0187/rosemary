@@ -856,8 +856,9 @@ pub(crate) fn window_presenting_busy(window: sdl3::Window) -> bool {
     entry.is_some_and(|entry| entry.presenting.try_lock().is_err())
 }
 
-/// A backing-store presentation must never block AppKit's event pump on a
-/// Window compositor's image acquisition. `None` keeps the store dirty.
+/// Exercise synthetic unowned sources in Vulkan regression tests. Production
+/// backing stores use retained leases to preserve their GPU-copy lifetime.
+#[cfg(test)]
 pub(crate) fn present_nonblocking(
     gpu: &'static Gpu,
     layer: usize,

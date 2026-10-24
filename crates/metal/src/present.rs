@@ -3,7 +3,7 @@ use objc::object::Id;
 use objc::sel::Sel;
 
 use crate::constants::*;
-use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
+use crate::gpu::{self, Gpu, ImageDescription};
 use crate::object::{self, methods};
 use crate::resource::Texture;
 
@@ -1522,6 +1522,41 @@ fn make_backing_source(
     .map(|image| crate::swapchain::BackingImageLease::new(gpu, image))
 }
 
+fn make_blended_source(
+    gpu: &'static Gpu,
+    width: u32,
+    height: u32,
+) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String> {
+    gpu.create_image(&crate::overlay::target_description(width, height))
+        .map(|image| crate::swapchain::BackingImageLease::new(gpu, image))
+}
+
+/// Select a source that is not read by an outstanding compositor copy.
+/// The allocation cap applies independently to regular and blended stores.
+fn reserve_backing_source(
+    image: &mut std::sync::Arc<crate::swapchain::BackingImageLease>,
+    spare: &mut Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
+    create: impl FnOnce() -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String>,
+) -> Result<bool, String> {
+    if std::sync::Arc::strong_count(image) == 1 {
+        return Ok(true);
+    }
+    let available = spare
+        .iter()
+        .position(|candidate| std::sync::Arc::strong_count(candidate) == 1);
+    let replacement = if let Some(at) = available {
+        spare.swap_remove(at)
+    } else {
+        const MAX_BACKING_SOURCE_IMAGES: usize = 8;
+        if spare.len() + 1 >= MAX_BACKING_SOURCE_IMAGES {
+            return Ok(false);
+        }
+        create()?
+    };
+    spare.push(std::mem::replace(image, replacement));
+    Ok(true)
+}
+
 /// A window's CPU-drawn contents on the device: see [`present_store`].
 struct StoreImage {
     gpu: &'static Gpu,
@@ -1531,7 +1566,8 @@ struct StoreImage {
     staging: gpu::GpuBuffer,
     /// The store with dma-buf overlays blended over it, made the first time
     /// the window has any.
-    blended: Option<GpuImage>,
+    blended: Option<std::sync::Arc<crate::swapchain::BackingImageLease>>,
+    blended_spare: Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
 }
 
 impl StoreImage {
@@ -1539,36 +1575,28 @@ impl StoreImage {
     /// can exhaust the pool; return `Ok(false)` so the store worker retries
     /// without holding up AppKit or allocating images without bound.
     fn reserve_upload_source(&mut self) -> Result<bool, String> {
-        if std::sync::Arc::strong_count(&self.image) == 1 {
-            return Ok(true);
+        let (width, height) = (self.image.width, self.image.height);
+        reserve_backing_source(&mut self.image, &mut self.spare, || {
+            make_backing_source(self.gpu, width, height)
+        })
+    }
+
+    fn reserve_blended_source(&mut self) -> Result<bool, String> {
+        let (width, height) = (self.image.width, self.image.height);
+        if self.blended.is_none() {
+            self.blended = Some(make_blended_source(self.gpu, width, height)?);
         }
-        let free = self
-            .spare
-            .iter()
-            .position(|image| std::sync::Arc::strong_count(image) == 1);
-        let replacement = if let Some(at) = free {
-            self.spare.swap_remove(at)
-        } else {
-            // Bounded independently of the host WSI swapchain image count.
-            const MAX_BACKING_SOURCE_IMAGES: usize = 8;
-            if self.spare.len() + 1 >= MAX_BACKING_SOURCE_IMAGES {
-                return Ok(false);
-            }
-            make_backing_source(self.gpu, self.image.width, self.image.height)?
-        };
-        let previous = std::mem::replace(&mut self.image, replacement);
-        self.spare.push(previous);
-        Ok(true)
+        let blended = self.blended.as_mut().expect("made above");
+        reserve_backing_source(blended, &mut self.blended_spare, || {
+            make_blended_source(self.gpu, width, height)
+        })
     }
 
     /// Every presentation that could name one of its images has finished.
     fn destroy(self) {
         self.gpu.destroy_buffer(self.staging);
-        // Both `image` and `spare` have ref-counted GPU lifetimes; the WSI
-        // worker can still be using a retired store's last direct frame.
-        if let Some(blended) = self.blended {
-            self.gpu.destroy_image(blended);
-        }
+        // All regular and blended sources have ref-counted GPU lifetimes;
+        // the WSI worker may still be reading one when this store retires.
     }
 }
 
@@ -1594,6 +1622,7 @@ fn backing_upload_source_pool_is_bounded_and_reuses_released_images() {
         spare: Vec::new(),
         staging,
         blended: None,
+        blended_spare: Vec::new(),
     };
     let mut retained = Vec::new();
     for index in 0..8 {
@@ -1618,6 +1647,37 @@ fn backing_upload_source_pool_is_bounded_and_reuses_released_images() {
     );
     assert!(!std::sync::Arc::ptr_eq(&current, &store.image));
     drop(current);
+    // The overlay output has an independent pool, including when the base
+    // backing upload remains unretained and is reused each frame.
+    assert!(
+        store
+            .reserve_blended_source()
+            .expect("initial blended source")
+    );
+    let mut blended_held = Vec::new();
+    for index in 0..8 {
+        blended_held.push(std::sync::Arc::clone(store.blended.as_ref().unwrap()));
+        assert_eq!(
+            store
+                .reserve_blended_source()
+                .expect("bounded blended pool"),
+            index < 7,
+            "blended GPU sources exceeded the fixed cap"
+        );
+    }
+    assert_eq!(store.blended_spare.len(), 7);
+    drop(blended_held);
+    let blended_old = std::sync::Arc::clone(store.blended.as_ref().unwrap());
+    assert!(
+        store
+            .reserve_blended_source()
+            .expect("reuse idle blended source")
+    );
+    assert!(!std::sync::Arc::ptr_eq(
+        &blended_old,
+        store.blended.as_ref().unwrap()
+    ));
+    drop(blended_old);
     store.destroy();
 }
 
@@ -2128,6 +2188,7 @@ pub(crate) fn present_store_synchronous(
                 spare: Vec::new(),
                 staging,
                 blended: None,
+                blended_spare: Vec::new(),
             },
         ));
     }
@@ -2186,8 +2247,11 @@ pub(crate) fn present_store_synchronous(
         return store_failure_outcome(window);
     }
     let shown = match overlays.is_empty() {
-        true => &entry.image,
-        false => blend_overlays(window, entry, overlays),
+        true => std::sync::Arc::clone(&entry.image),
+        false => match blend_overlays(window, entry, overlays) {
+            Some(image) => image,
+            None => return Deferred,
+        },
     };
     let frame = appkit::view::Frame {
         window,
@@ -2202,19 +2266,10 @@ pub(crate) fn present_store_synchronous(
         .iter()
         .map(|hole| (hole.layer, crate::swapchain::Region::from(hole.rect)))
         .collect();
-    let presented_result = if overlays.is_empty() {
-        // A ref-counted source is immutable while the compositor references
-        // it, so a full-window backing store can use the direct WSI path.
-        crate::swapchain::present_backing_nonblocking(
-            gpu,
-            window as usize,
-            &frame,
-            std::sync::Arc::clone(&entry.image),
-            &holes,
-        )
-    } else {
-        crate::swapchain::present_nonblocking(gpu, window as usize, &frame, shown, &holes)
-    };
+    // Both raw and blended backing-store images are immutable while leased.
+    // A single opaque full-window result can therefore use direct WSI.
+    let presented_result =
+        crate::swapchain::present_backing_nonblocking(gpu, window as usize, &frame, shown, &holes);
     let presented = match presented_result {
         Ok(Some(true)) => Displayed,
         Ok(Some(false)) => store_failure_outcome(window),
@@ -2250,39 +2305,34 @@ pub(crate) fn present_store_synchronous(
     presented
 }
 
-/// The store with `overlays` blended over it, or the store alone where they
-/// cannot be; the window is then given pixel overlays from the next frame.
-fn blend_overlays<'a>(
+/// Produce an immutable blended backing-store source. Return `None` if all
+/// source slots are retained by WSI so the store worker can retry later.
+fn blend_overlays(
     window: sdl3::Window,
-    entry: &'a mut StoreImage,
+    entry: &mut StoreImage,
     overlays: &[appkit::backing::GpuOverlay],
-) -> &'a GpuImage {
-    let (width, height) = (entry.image.width, entry.image.height);
-    if entry.blended.is_none() {
-        match entry
-            .gpu
-            .create_image(&crate::overlay::target_description(width, height))
-        {
-            Ok(image) => entry.blended = Some(image),
-            Err(reason) => {
-                gpu::trace(format!("no image to blend overlays into: {reason}"));
-                appkit::backing::refuse_dmabufs(window);
-                return &entry.image;
-            }
+) -> Option<std::sync::Arc<crate::swapchain::BackingImageLease>> {
+    match entry.reserve_blended_source() {
+        Ok(true) => {}
+        Ok(false) => return None,
+        Err(reason) => {
+            gpu::trace(format!("no image to blend overlays into: {reason}"));
+            appkit::backing::refuse_dmabufs(window);
+            return Some(std::sync::Arc::clone(&entry.image));
         }
     }
     let blended = entry.blended.as_ref().expect("made above");
-    match crate::overlay::blend(entry.gpu, &entry.image, blended, overlays) {
+    match crate::overlay::blend(entry.gpu, &entry.image, &blended.image, overlays) {
         Ok(refused) => {
             if !refused.is_empty() {
                 appkit::backing::refuse_dmabufs(window);
             }
-            blended
+            Some(std::sync::Arc::clone(blended))
         }
         Err(reason) => {
             gpu::trace(format!("blending overlays failed: {reason}"));
             appkit::backing::refuse_dmabufs(window);
-            &entry.image
+            Some(std::sync::Arc::clone(&entry.image))
         }
     }
 }
