@@ -713,7 +713,7 @@ fn slow_window_initialization_does_not_block_other_windows_or_teardown() {
     TEST_SLOW_INITIALIZER_STARTED.store(false, Ordering::Release);
     TEST_SLOW_INITIALIZER.store(a.0 as usize, Ordering::Release);
     assert_eq!(
-        present_impl(gpu, a.0 as usize, &a.2, &a.1, &[], None),
+        present_impl(gpu, a.0 as usize, &a.2, &a.1, &[], None, None),
         Ok(None)
     );
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -942,7 +942,7 @@ fn device_loss_before_swapchain_create_cleans_pending_initializer() {
             Instant::now() < deadline,
             "initializer did not reach pre-create checkpoint"
         );
-        let _ = present_impl(gpu, key, &frame, &source, &[], None);
+        let _ = present_impl(gpu, key, &frame, &source, &[], None, None);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1090,7 +1090,7 @@ fn minimized_window_retries_transient_initialization_after_restore() {
             Instant::now() < deadline,
             "transient failure did not schedule retry"
         );
-        let _ = present_impl(gpu, 42, &frame, &source, &[], None);
+        let _ = present_impl(gpu, 42, &frame, &source, &[], None, None);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1141,7 +1141,7 @@ fn minimized_window_retries_transient_initialization_after_restore() {
             Instant::now() < until,
             "restored window never recovered Vulkan presentation"
         );
-        let _ = present_impl(gpu, 42, &frame, &source, &[], None);
+        let _ = present_impl(gpu, 42, &frame, &source, &[], None, None);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -1484,7 +1484,12 @@ fn single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer() {
     // Reuse every WSI image, acquisition semaphore and presentation fence
     // repeatedly; the first few images alone do not exercise retirement.
     for _ in 0..(FRAMES_IN_FLIGHT * 3 + 2) {
-        state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+        state.queue_direct(
+            &frame,
+            PresentSource::from(&image),
+            &mut SourceOwner(None),
+            None,
+        );
         assert_eq!(pending_batch_delay(&state), Duration::ZERO);
         assert!(
             state.composite.is_none(),
@@ -1538,9 +1543,73 @@ fn single_opaque_layer_uses_one_wsi_copy_then_snapshots_on_second_layer() {
     sdl3::video::destroy_window(window);
 }
 
+/// An acquired WSI image must never force the worker to wait forever on
+/// the previous maintenance1 presentation fence.
 #[test]
 #[cfg(not(target_os = "macos"))]
-fn direct_layer_resize_preserves_unscaled_static_window_image() {
+fn unsignaled_prior_present_fence_does_not_block_acquired_image() {
+    let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    if state.presented.is_empty() {
+        drop(state);
+        gpu.destroy_image(image);
+        sdl3::video::destroy_window(window);
+        return;
+    }
+    assert_eq!(
+        state.stage_composite(&frame, &image, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.flush_composite(window).expect("initial presentation");
+    // Ensure the fault applies to whichever image this MAILBOX or IMMEDIATE
+    // driver acquires next, including MAILBOX implementations that skip images.
+    for fence in &mut state.presented {
+        fence.pending = true;
+    }
+    state.injected_unsignaled_present_fence = true;
+    let before = state.frame;
+    // Acquire the same image on repeated presents to exercise its prior fence.
+    for _ in 0..(state.images.len() * 3) {
+        assert_eq!(
+            state.stage_composite(&frame, &image, None, &mut SourceOwner(None), false),
+            Ok(Some(true))
+        );
+        let start = Instant::now();
+        state
+            .flush_composite(window)
+            .expect("present without waiting for stalled fence");
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "previous presentation fence blocked worker"
+        );
+        if state.skipped_stalled_present_fence {
+            break;
+        }
+    }
+    assert!(
+        state.skipped_stalled_present_fence,
+        "failed to reacquire a previously presented image"
+    );
+    assert!(state.frame > before);
+    assert!(
+        state.acquired_unsubmitted.is_none(),
+        "acquired semaphore was not consumed"
+    );
+    assert!(!state.composite_dirty);
+    // After a present omits a maintenance fence, even a later signal of the
+    // original fence cannot cover the new present. Retire via queue idle.
+    assert!(state.stalled_present_fence);
+    state.idle();
+    assert!(!state.stalled_present_fence);
+    assert!(state.presented.iter().all(|fence| !fence.pending));
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn direct_layer_resize_preserves_unscaled_static_window_image_impl(wsi_only: bool) {
     let expected_mode = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
@@ -1551,7 +1620,12 @@ fn direct_layer_resize_preserves_unscaled_static_window_image() {
     };
     assert_eq!(state.present_mode, expected_mode);
     state.layers.push(8);
-    state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+    state.queue_direct(
+        &frame,
+        PresentSource::from(&image),
+        &mut SourceOwner(None),
+        None,
+    );
     state
         .flush_composite(window)
         .expect("first direct WSI presentation");
@@ -1566,6 +1640,14 @@ fn direct_layer_resize_preserves_unscaled_static_window_image() {
                 .get_physical_device_surface_capabilities(gpu.physical, state.surface)
         }
         .expect("WSI capabilities");
+        if caps.current_extent.width == u32::MAX && wsi_only {
+            // This host uses the caller's requested extent, not WSI's:
+            // cannot force a new effective extent without a new request.
+            drop(state);
+            gpu.destroy_image(image);
+            sdl3::video::destroy_window(window);
+            return;
+        }
         if caps.current_extent.width == u32::MAX
             || (caps.current_extent.width, caps.current_extent.height) == (208, 144)
         {
@@ -1574,12 +1656,24 @@ fn direct_layer_resize_preserves_unscaled_static_window_image() {
         assert!(Instant::now() < deadline, "Vulkan surface did not resize");
         std::thread::sleep(Duration::from_millis(5));
     }
-    state
-        .rebuild(vk::Extent2D {
+    let requested_before = state.requested;
+    let rebuild_request = if wsi_only {
+        requested_before
+    } else {
+        vk::Extent2D {
             width: 208,
             height: 144,
-        })
-        .expect("direct WSI resize");
+        }
+    };
+    state.rebuild(rebuild_request).expect("direct WSI resize");
+    if wsi_only {
+        assert_eq!(state.requested, requested_before, "rebuild request changed");
+        assert_ne!(
+            (state.extent.width, state.extent.height),
+            (frame.width, frame.height),
+            "WSI extent did not change"
+        );
+    }
     assert!(
         state.direct.is_none(),
         "old geometry must not be stretched as a direct frame"
@@ -1602,6 +1696,194 @@ fn direct_layer_resize_preserves_unscaled_static_window_image() {
     sdl3::video::destroy_window(window);
 }
 
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn direct_layer_resize_preserves_unscaled_static_window_image() {
+    direct_layer_resize_preserves_unscaled_static_window_image_impl(false);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn wsi_effective_extent_change_preserves_direct_layer_without_new_request() {
+    direct_layer_resize_preserves_unscaled_static_window_image_impl(true);
+}
+
+/// Exercise the actual AppKit CPU store upload worker's Vulkan path. Its
+/// image cache must rotate while an earlier frame is still retained, and the
+/// compositor must select direct WSI instead of an intermediate accumulator.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn backing_store_uploads_select_direct_wsi_without_overwriting_inflight_source() {
+    let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Some(window) = sdl3::video::create_window(c"direct backing store", 160, 120, 0) else {
+        return;
+    };
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).expect("SDL metadata");
+    let mut store = appkit::backing::Store::new(160, 120);
+    store.pixels.fill(43);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        match crate::present::present_store_synchronous(window, &store, &[], &[]) {
+            appkit::backing::PresentOutcome::Displayed => break,
+            appkit::backing::PresentOutcome::Deferred => {
+                assert!(
+                    Instant::now() < deadline,
+                    "store upload never reached Vulkan"
+                );
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            outcome => panic!("store upload failed: {outcome:?}"),
+        }
+    }
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&(window as usize))
+        .unwrap()
+        .clone();
+    {
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        assert_eq!(state.present_mode, expected);
+        assert!(
+            state.composite.is_none(),
+            "backing store took extra GPU accumulator path"
+        );
+        assert!(
+            state.direct.as_ref().unwrap().backing.is_some(),
+            "missing retained backing image"
+        );
+        state.flush_composite(window).expect("direct store WSI");
+    }
+    let (old, _) = crate::present::backing_store_image_for_test(window).unwrap();
+    store.pixels.fill(77);
+    assert_eq!(
+        crate::present::present_store_synchronous(window, &store, &[], &[]),
+        appkit::backing::PresentOutcome::Displayed
+    );
+    {
+        let (current, spare) = crate::present::backing_store_image_for_test(window).unwrap();
+        assert!(
+            !Arc::ptr_eq(&old, &current),
+            "overwrote an image retained by WSI"
+        );
+        assert_eq!(spare, 1, "source rotation did not retain old image");
+    }
+    {
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        assert!(state.composite.is_none());
+        state
+            .flush_composite(window)
+            .expect("new backing-store direct WSI");
+        state.direct.as_mut().unwrap().queued_at = Instant::now() - DIRECT_IDLE_SNAPSHOT_DELAY;
+        assert!(state.snapshot_idle_direct().expect("idle store snapshot"));
+        state.layers.push(0x777); // The next backing-store update joins a second Metal layer.
+    }
+    store.pixels.fill(91);
+    assert_eq!(
+        crate::present::present_store_synchronous(window, &store, &[], &[]),
+        appkit::backing::PresentOutcome::Displayed,
+        "multi-layer backing store should enter the compositor"
+    );
+    {
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        assert!(state.composite.is_some());
+        assert!(
+            state
+                .frames
+                .iter()
+                .any(|frame| frame.backing.is_some() && frame.submitted),
+            "staged backing source lost its lease before the GPU-copy fence"
+        );
+        state
+            .flush_composite(window)
+            .expect("multi-layer backing-store present");
+        state.idle();
+        assert!(state.frames.iter().all(|frame| frame.backing.is_none()));
+    }
+    drop(old);
+    drop(entry); // Teardown waits for every external WindowSwapchain Arc.
+    crate::present::forget_backing_store_for_test(window);
+    forget_window(window);
+    sdl3::video::destroy_window(window);
+    wait_for_test_retirements();
+}
+
+/// A full-window store upload supplies a retained GPU allocation, not a
+/// CAMetalDrawable. The WSI worker can copy it directly without an offscreen
+/// accumulator or reading a source the next upload will overwrite.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn retained_backing_source_uses_direct_wsi_and_releases_after_gpu_copy() {
+    let expected = match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
+        Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
+        _ => return,
+    };
+    let Some((window, gpu, mut state, image, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    assert_eq!(state.present_mode, expected, "real WSI mode required");
+    let lease = BackingImageLease::new(gpu, image);
+    state.layers.push(window as usize);
+    assert!(fast_direct_layer(
+        state.present_mode,
+        1,
+        &frame,
+        None,
+        false,
+        true
+    ));
+    for _ in 0..FRAMES_IN_FLIGHT * 2 {
+        state.queue_direct(
+            &frame,
+            PresentSource::from(&lease.image),
+            &mut SourceOwner(None),
+            Some(Arc::clone(&lease)),
+        );
+        assert_eq!(pending_batch_delay(&state), Duration::ZERO);
+        assert!(state.composite.is_none());
+        state
+            .flush_composite(window)
+            .expect("backing image direct WSI copy");
+        assert!(
+            state.composite.is_none(),
+            "must not allocate offscreen full-frame accumulator"
+        );
+        assert!(
+            Arc::strong_count(&lease) > 1,
+            "direct WSI image lost retained lifetime"
+        );
+    }
+    // After idle, a single snapshot is enough to preserve static contents
+    // and the last backing-store copy is no longer WSI-owned.
+    state.direct.as_mut().unwrap().queued_at = Instant::now() - DIRECT_IDLE_SNAPSHOT_DELAY;
+    assert!(state.snapshot_idle_direct().expect("idle source snapshot"));
+    state.idle();
+    assert_eq!(
+        Arc::strong_count(&lease),
+        1,
+        "GPU fence failed to release backing store"
+    );
+    assert!(!state.composite_dirty);
+    drop(state);
+    drop(lease);
+    sdl3::video::destroy_window(window);
+}
+
 /// Idle direct frames are snapshotted only after they are on screen, then
 /// their drawable can be returned without queuing another WSI presentation.
 #[test]
@@ -1617,7 +1899,12 @@ fn idle_direct_frame_snapshots_once_and_releases_the_source_fence() {
     };
     assert_eq!(state.present_mode, expected_mode);
     state.layers.push(8);
-    state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+    state.queue_direct(
+        &frame,
+        PresentSource::from(&image),
+        &mut SourceOwner(None),
+        None,
+    );
     assert!(
         !state
             .snapshot_idle_direct()
@@ -1688,7 +1975,12 @@ fn direct_single_layer_replays_after_failed_submit() {
     };
     assert_eq!(state.present_mode, expected_mode);
     state.layers.push(8);
-    state.queue_direct(&frame, PresentSource::from(&image), &mut SourceOwner(None));
+    state.queue_direct(
+        &frame,
+        PresentSource::from(&image),
+        &mut SourceOwner(None),
+        None,
+    );
     state.injected_queue_submit_error = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
     state
         .flush_composite(window)
@@ -2010,7 +2302,7 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
             Instant::now() < deadline,
             "initializer device loss deadlocked the registry"
         );
-        let _ = present_impl(gpu, window as usize, &frame, &source, &[], None);
+        let _ = present_impl(gpu, window as usize, &frame, &source, &[], None, None);
         sdl3::video::vulkan::service_surface_requests();
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -2538,6 +2830,34 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
         after > baseline,
         "the deferred drawable never reached Vulkan"
     );
+    // This harness omits the asynchronous production compositor worker.
+    // Its direct single-layer source remains retained after WSI copy until
+    // the worker's idle snapshot releases the last CAMetalDrawable. Exercise
+    // that exact completion contract synchronously rather than timing out.
+    {
+        let entry = SWAPCHAINS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get(&(sdl as usize))
+            .unwrap()
+            .clone();
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        if state.direct.is_some() {
+            assert!(
+                crate::present::drawable_is_submitted_for_test(drawable),
+                "WSI copy must not finish a drawable before idle snapshot"
+            );
+            state.direct.as_mut().unwrap().queued_at = Instant::now() - DIRECT_IDLE_SNAPSHOT_DELAY;
+            assert!(
+                state
+                    .snapshot_idle_direct()
+                    .expect("idle snapshot after direct WSI")
+            );
+        }
+    }
     // Other backing-store recomposites can create more swapchain frames.
     // This drawable itself was handled once; wait for its real copy fence.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -2641,6 +2961,30 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
         "the frames must not reorder"
     );
     flush_if_composed(sdl);
+    {
+        let entry = SWAPCHAINS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .get(&(sdl as usize))
+            .unwrap()
+            .clone();
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        if state.direct.is_some() {
+            assert!(
+                crate::present::drawable_is_submitted_for_test(second),
+                "the last direct drawable remains submitted until GPU idle snapshot"
+            );
+            state.direct.as_mut().unwrap().queued_at = Instant::now() - DIRECT_IDLE_SNAPSHOT_DELAY;
+            assert!(
+                state
+                    .snapshot_idle_direct()
+                    .expect("idle snapshot for deferred pair")
+            );
+        }
+    }
     let deadline = Instant::now() + Duration::from_secs(3);
     while crate::present::drawable_is_submitted_for_test(first)
         || crate::present::drawable_is_submitted_for_test(second)

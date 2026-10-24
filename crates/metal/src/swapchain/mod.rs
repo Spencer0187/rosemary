@@ -83,6 +83,13 @@ struct Swapchain {
     composite_dirty_since: Option<Instant>,
     compositor_batch_delay: Duration,
     last_wsi_error: Option<vk::Result>,
+    /// A maintenance1 present fence did not signal even after reacquiring
+    /// its image. Queue idle is the fallback at retirement for this driver.
+    stalled_present_fence: bool,
+    #[cfg(test)]
+    injected_unsignaled_present_fence: bool,
+    #[cfg(test)]
+    skipped_stalled_present_fence: bool,
     #[cfg(test)]
     injected_build_vk_error: Option<vk::Result>,
     #[cfg(test)]
@@ -106,6 +113,34 @@ struct Swapchain {
     rebuild_attempts: usize,
     #[cfg(test)]
     last_create_old_swapchain: vk::SwapchainKHR,
+}
+
+/// A backing-store GPU upload can be reused only after every asynchronous
+/// WSI read of it has completed. Store uploads own one Arc; pending direct
+/// presentation and its GPU copy fence hold additional references.
+pub(crate) struct BackingImageLease {
+    gpu: &'static Gpu,
+    pub image: GpuImage,
+}
+
+impl BackingImageLease {
+    pub(crate) fn new(gpu: &'static Gpu, image: GpuImage) -> Arc<Self> {
+        Arc::new(Self { gpu, image })
+    }
+}
+
+impl std::ops::Deref for BackingImageLease {
+    type Target = GpuImage;
+    fn deref(&self) -> &GpuImage {
+        &self.image
+    }
+}
+
+impl Drop for BackingImageLease {
+    fn drop(&mut self) {
+        self.gpu
+            .destroy_image(std::mem::replace(&mut self.image, GpuImage::none()));
+    }
 }
 
 /// Serialize presentations for one window while leaving swapchain state
@@ -229,6 +264,7 @@ struct DirectLayer {
     frame: DirectFrame,
     source: PresentSource,
     owner: Option<usize>,
+    backing: Option<Arc<BackingImageLease>>,
     submitted_slot: Option<usize>,
     queued_at: Instant,
 }
@@ -450,6 +486,8 @@ struct Frame {
     submitted: bool,
     /// Retained drawable whose image this frame's command buffer reads.
     source: Option<usize>,
+    /// Store upload source kept immutable until the associated GPU copy fence.
+    backing: Option<Arc<BackingImageLease>>,
 }
 
 struct PresentFence {
@@ -733,7 +771,7 @@ pub(crate) fn present(
 ) -> Result<bool, String> {
     let limit = Instant::now() + Duration::from_secs(3);
     loop {
-        match present_impl(gpu, layer, frame, source, holes, None)? {
+        match present_impl(gpu, layer, frame, source, holes, None, None)? {
             Some(shown) => return Ok(shown),
             None if Instant::now() < limit => {
                 // These tests do not run an AppKit event pump.
@@ -827,7 +865,7 @@ pub(crate) fn present_nonblocking(
     source: &GpuImage,
     holes: &[(usize, Region)],
 ) -> Result<Option<bool>, String> {
-    present_impl(gpu, layer, frame, source, holes, None)
+    present_impl(gpu, layer, frame, source, holes, None, None)
 }
 
 /// Present a command buffer's drawable, consuming its retained `owner` on
@@ -840,7 +878,20 @@ pub(crate) fn present_owned(
     holes: &[(usize, Region)],
     owner: usize,
 ) -> Result<Option<bool>, String> {
-    present_impl(gpu, layer, frame, source, holes, Some(owner))
+    present_impl(gpu, layer, frame, source, holes, Some(owner), None)
+}
+
+/// Retain one immutable backing-store GPU image through its direct WSI copy.
+/// The caller's pool never writes an image with outstanding Arc references.
+pub(crate) fn present_backing_nonblocking(
+    gpu: &'static Gpu,
+    layer: usize,
+    frame: &appkit::view::Frame,
+    source: Arc<BackingImageLease>,
+    holes: &[(usize, Region)],
+) -> Result<Option<bool>, String> {
+    let lease = Arc::clone(&source);
+    present_impl(gpu, layer, frame, &source.image, holes, None, Some(lease))
 }
 
 fn present_impl(
@@ -850,6 +901,7 @@ fn present_impl(
     source: &GpuImage,
     holes: &[(usize, Region)],
     owner: Option<usize>,
+    backing: Option<Arc<BackingImageLease>>,
 ) -> Result<Option<bool>, String> {
     let mut owner = SourceOwner(owner);
     if gpu.lost.load(Ordering::Acquire) {
@@ -1216,7 +1268,7 @@ fn present_impl(
             frame,
             regions.as_deref(),
             swapchain.corners.is_some(),
-            owner.0.is_some(),
+            owner.0.is_some() || backing.is_some(),
         );
         let converting = !direct && swapchain.direct.is_some();
         let converted = if converting {
@@ -1228,9 +1280,15 @@ fn present_impl(
         // staging actually transfers it to a GPU fence. Error paths must not
         // release the ring slot before the dispatcher decides to retry.
         let converted_staged = matches!(converted, Ok(Some(true)));
+        let mut backing = backing;
         let staged = match converted {
             Ok(_) if direct => {
-                swapchain.queue_direct(frame, PresentSource::from(source), &mut owner);
+                swapchain.queue_direct(
+                    frame,
+                    PresentSource::from(source),
+                    &mut owner,
+                    backing.take(),
+                );
                 Ok(Some(true))
             }
             // A busy GPU staging slot cannot yet preserve the previous
@@ -1238,7 +1296,16 @@ fn present_impl(
             // presenting an incomplete window image over that drawable.
             Ok(None) if converting => Ok(None),
             Ok(None) | Ok(Some(true)) => {
-                swapchain.stage_composite(frame, source, regions.as_deref(), &mut owner, true)
+                let result =
+                    swapchain.stage_composite(frame, source, regions.as_deref(), &mut owner, true);
+                if matches!(result, Ok(Some(true))) {
+                    // A backing-store source must also survive its staging
+                    // copy when this window already has multiple layers.
+                    let slot = swapchain.frame.wrapping_sub(1) % swapchain.frames.len();
+                    debug_assert!(swapchain.frames[slot].backing.is_none());
+                    swapchain.frames[slot].backing = backing.take();
+                }
+                result
             }
             Ok(Some(false)) => unreachable!(),
             Err(error) => Err(error),
@@ -1619,7 +1686,9 @@ impl Swapchain {
         if let Some(slot) = direct.submitted_slot {
             if self.frames[slot].submitted {
                 debug_assert!(self.frames[slot].source.is_none());
+                debug_assert!(self.frames[slot].backing.is_none());
                 self.frames[slot].source = direct.owner.take();
+                self.frames[slot].backing = direct.backing.take();
             }
         }
         // An unsubmitted drawable or a completed WSI copy is safe to release.
@@ -1630,12 +1699,14 @@ impl Swapchain {
         frame: &appkit::view::Frame,
         source: PresentSource,
         owner: &mut SourceOwner,
+        backing: Option<Arc<BackingImageLease>>,
     ) {
         self.retire_direct();
         self.direct = Some(DirectLayer {
             frame: DirectFrame::from_frame(frame),
             source,
             owner: owner.take(),
+            backing,
             submitted_slot: None,
             queued_at: Instant::now(),
         });
@@ -1658,7 +1729,11 @@ impl Swapchain {
             &mut owner,
             nonblocking,
         );
-        if !matches!(result, Ok(Some(true))) {
+        if matches!(result, Ok(Some(true))) {
+            let slot = self.frame.wrapping_sub(1) % self.frames.len();
+            debug_assert!(self.frames[slot].backing.is_none());
+            self.frames[slot].backing = direct.backing.take();
+        } else {
             direct.owner = owner.take();
             self.direct = Some(direct);
         }
@@ -1686,6 +1761,7 @@ impl Swapchain {
         self.gpu.wait(self.frames[slot].done)?;
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
+        self.frames[slot].backing.take();
         self.composite_dirty = false;
         self.composite_dirty_since = None;
         Ok(true)
@@ -1742,6 +1818,7 @@ impl Swapchain {
         }
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
+        self.frames[slot].backing.take();
         let composite = self.composite()?;
 
         let device = &self.gpu.device;
@@ -2203,6 +2280,7 @@ impl Swapchain {
                 done: done.take(),
                 submitted: false,
                 source: None,
+                backing: None,
             });
         }
         drop(wsi);
@@ -2244,6 +2322,11 @@ impl Swapchain {
             composite_dirty_since: None,
             compositor_batch_delay: Duration::from_millis(4),
             last_wsi_error: None,
+            stalled_present_fence: false,
+            #[cfg(test)]
+            injected_unsignaled_present_fence: false,
+            #[cfg(test)]
+            skipped_stalled_present_fence: false,
             #[cfg(test)]
             injected_build_vk_error: None,
             #[cfg(test)]
@@ -2321,6 +2404,18 @@ impl Swapchain {
         };
         if extent.width == 0 || extent.height == 0 {
             return Err("the window has no area to present into".into());
+        }
+        // WSI can change currentExtent without a new AppKit window size.
+        // Preserve the old direct image before replacing its dimensions, not
+        // just when the last requested size changed.
+        if self.direct.is_some() && extent != self.extent {
+            let slot = self.frame % self.frames.len();
+            if matches!(self.stage_direct_snapshot(false)?, Some(true)) {
+                self.gpu.wait(self.frames[slot].done)?;
+                self.frames[slot].submitted = false;
+                finish_source(self.frames[slot].source.take());
+                self.frames[slot].backing.take();
+            }
         }
         // DXVK requests the surface minimum for IMMEDIATE and min+1 for
         // queued modes. Do not expand WSI's queue to hide extra host presents.
@@ -2537,13 +2632,14 @@ impl Swapchain {
     fn retire_copied(&mut self) -> bool {
         let mut retired = false;
         for frame in &mut self.frames {
-            if frame.source.is_none() || !frame.submitted {
+            if (frame.source.is_none() && frame.backing.is_none()) || !frame.submitted {
                 continue;
             }
-            // SAFETY: a fence of this device's, attached to this frame's
-            // last submission.
+            // Both an Objective-C drawable and a ref-counted store image are
+            // released only after their last GPU read has completed.
             if self.gpu.fence_signaled(frame.done).unwrap_or(false) {
                 finish_source(frame.source.take());
+                frame.backing.take();
                 retired = true;
             }
         }
@@ -2554,7 +2650,7 @@ impl Swapchain {
     fn copying(&self) -> Vec<vk::Fence> {
         self.frames
             .iter()
-            .filter(|frame| frame.submitted && frame.source.is_some())
+            .filter(|frame| frame.submitted && (frame.source.is_some() || frame.backing.is_some()))
             .map(|frame| frame.done)
             .collect()
     }
@@ -2577,17 +2673,6 @@ impl Swapchain {
 
     fn rebuild(&mut self, extent: vk::Extent2D) -> Result<(), String> {
         self.idle();
-        if self.direct.is_some() && extent != self.requested {
-            // Preserve the last direct layer's unscaled top-left pixels as a
-            // static window snapshot before the swapchain changes size. A
-            // direct blit using the old frame's geometry would stretch it.
-            let slot = self.frame % self.frames.len();
-            if matches!(self.stage_direct_snapshot(false)?, Some(true)) {
-                self.gpu.wait(self.frames[slot].done)?;
-                self.frames[slot].submitted = false;
-                finish_source(self.frames[slot].source.take());
-            }
-        }
         self.build(extent)
     }
 
@@ -2597,11 +2682,20 @@ impl Swapchain {
     /// image and wait semaphore. On an older device, only making the queue
     /// idle supplies that guarantee.
     fn idle(&mut self) {
-        if !self.gpu.has_present_fences() {
+        // At least one present omitted its maintenance1 fence because an old
+        // fence was still pending. Even if that *old* fence signals later, it
+        // cannot cover subsequent fence-less presentations. Queue idle is
+        // necessary to retire their WSI use of images and semaphores safely.
+        if !self.gpu.has_present_fences() || self.stalled_present_fence {
             self.gpu.wait_queue_idle();
+            self.stalled_present_fence = false;
+            for present in &mut self.presented {
+                present.pending = false;
+            }
             for frame in &mut self.frames {
                 frame.submitted = false;
                 finish_source(frame.source.take());
+                frame.backing.take();
             }
             return;
         }
@@ -2624,6 +2718,7 @@ impl Swapchain {
         for frame in &mut self.frames {
             frame.submitted = false;
             finish_source(frame.source.take());
+            frame.backing.take();
         }
         for present in &mut self.presented {
             present.pending = false;
@@ -2739,6 +2834,7 @@ impl Swapchain {
         }
         self.frames[slot].submitted = false;
         finish_source(self.frames[slot].source.take());
+        self.frames[slot].backing.take();
         if self.frames[slot].acquire_pending {
             // WSI may signal an acquisition fence after a successful
             // vkAcquireNextImageKHR returns. Never stall AppKit while it
@@ -2811,17 +2907,31 @@ impl Swapchain {
         // semaphore is finished.
         let blitted = self.blitted[index as usize];
         let present_fence = if let Some(present) = self.presented.get_mut(index as usize) {
-            if present.pending {
-                // The presentation worker, never the AppKit event pump,
-                // waits for previous use of this image's present fence.
-                self.gpu.wait(present.fence)?;
+            #[cfg(test)]
+            let forced_unsignaled = std::mem::take(&mut self.injected_unsignaled_present_fence);
+            #[cfg(not(test))]
+            let forced_unsignaled = false;
+            if present.pending
+                && (forced_unsignaled || !self.gpu.wait_fence_timeout(present.fence, 0)?)
+            {
+                // Successful acquisition means WSI returned this image, but
+                // some implementations do not signal its old maintenance1
+                // fence promptly. Do not block the compositor. Keep that
+                // fence untouched and submit the new present without a fence.
+                // Queue idle handles the fallback on rebuild/teardown.
+                self.stalled_present_fence = true;
+                #[cfg(test)]
+                {
+                    self.skipped_stalled_present_fence = true;
+                }
+                None
+            } else {
                 present.pending = false;
+                // SAFETY: fresh or signaled; no old queued use remains.
+                unsafe { self.gpu.device.reset_fences(&[present.fence]) }
+                    .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
+                Some(present.fence)
             }
-            // SAFETY: the fence is either fresh or was waited above, and is
-            // not associated with an outstanding queue operation.
-            unsafe { self.gpu.device.reset_fences(&[present.fence]) }
-                .map_err(|error| format!("vkResetFences failed with {error:?}"))?;
-            Some(present.fence)
         } else {
             None
         };
@@ -3018,6 +3128,7 @@ impl Swapchain {
         self.acquired_unsubmitted = None;
         self.frames[slot].submitted = true;
         self.frames[slot].source = None;
+        self.frames[slot].backing = None;
         self.frame = self.frame.wrapping_add(1);
 
         let result = crate::stats::timed(crate::stats::Counter::QueuePresentMicros, || {

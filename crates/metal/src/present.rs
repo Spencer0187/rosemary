@@ -1498,10 +1498,36 @@ unsafe extern "C" fn drawable_id(_receiver: Id, _sel: Sel) -> u64 {
     0
 }
 
+/// Allocate an owned upload source; its allocation remains alive until
+/// every window presentation that refers to it finishes its source copy.
+fn make_backing_source(
+    gpu: &'static Gpu,
+    width: u32,
+    height: u32,
+) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String> {
+    gpu.create_image(&ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width,
+        height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    })
+    .map(|image| crate::swapchain::BackingImageLease::new(gpu, image))
+}
+
 /// A window's CPU-drawn contents on the device: see [`present_store`].
 struct StoreImage {
     gpu: &'static Gpu,
-    image: GpuImage,
+    image: std::sync::Arc<crate::swapchain::BackingImageLease>,
+    /// Recycle images only after every WSI copy and idle snapshot releases them.
+    spare: Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
     staging: gpu::GpuBuffer,
     /// The store with dma-buf overlays blended over it, made the first time
     /// the window has any.
@@ -1509,14 +1535,90 @@ struct StoreImage {
 }
 
 impl StoreImage {
+    /// Select an image no outstanding WSI copy can read. An occluded window
+    /// can exhaust the pool; return `Ok(false)` so the store worker retries
+    /// without holding up AppKit or allocating images without bound.
+    fn reserve_upload_source(&mut self) -> Result<bool, String> {
+        if std::sync::Arc::strong_count(&self.image) == 1 {
+            return Ok(true);
+        }
+        let free = self
+            .spare
+            .iter()
+            .position(|image| std::sync::Arc::strong_count(image) == 1);
+        let replacement = if let Some(at) = free {
+            self.spare.swap_remove(at)
+        } else {
+            // Bounded independently of the host WSI swapchain image count.
+            const MAX_BACKING_SOURCE_IMAGES: usize = 8;
+            if self.spare.len() + 1 >= MAX_BACKING_SOURCE_IMAGES {
+                return Ok(false);
+            }
+            make_backing_source(self.gpu, self.image.width, self.image.height)?
+        };
+        let previous = std::mem::replace(&mut self.image, replacement);
+        self.spare.push(previous);
+        Ok(true)
+    }
+
     /// Every presentation that could name one of its images has finished.
     fn destroy(self) {
         self.gpu.destroy_buffer(self.staging);
-        self.gpu.destroy_image(self.image);
+        // Both `image` and `spare` have ref-counted GPU lifetimes; the WSI
+        // worker can still be using a retired store's last direct frame.
         if let Some(blended) = self.blended {
             self.gpu.destroy_image(blended);
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn backing_upload_source_pool_is_bounded_and_reuses_released_images() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Some(gpu) = crate::vulkan::adapters()
+        .ok()
+        .and_then(|a| a.first()?.gpu().ok())
+    else {
+        return;
+    };
+    let first = make_backing_source(gpu, 32, 24).expect("initial backing source");
+    let staging = gpu
+        .create_buffer(32 * 24 * 4)
+        .expect("upload staging buffer");
+    let mut store = StoreImage {
+        gpu,
+        image: first,
+        spare: Vec::new(),
+        staging,
+        blended: None,
+    };
+    let mut retained = Vec::new();
+    for index in 0..8 {
+        retained.push(std::sync::Arc::clone(&store.image));
+        let expected = index < 7;
+        assert_eq!(
+            store
+                .reserve_upload_source()
+                .expect("bounded pool allocation"),
+            expected,
+            "unexpected source pool capacity"
+        );
+    }
+    assert_eq!(store.spare.len(), 7);
+    assert!(!store.reserve_upload_source().expect("bounded pool"));
+    drop(retained);
+    let current = std::sync::Arc::clone(&store.image);
+    assert!(
+        store
+            .reserve_upload_source()
+            .expect("reuse released pool slot")
+    );
+    assert!(!std::sync::Arc::ptr_eq(&current, &store.image));
+    drop(current);
+    store.destroy();
 }
 
 // SAFETY: Vulkan handles and a permanent mapping, used under `STORE_IMAGES`.
@@ -1524,6 +1626,23 @@ unsafe impl Send for StoreImage {}
 
 /// Keyed by the SDL window's address.
 static STORE_IMAGES: std::sync::Mutex<Vec<(usize, StoreImage)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn backing_store_image_for_test(
+    window: sdl3::Window,
+) -> Option<(std::sync::Arc<crate::swapchain::BackingImageLease>, usize)> {
+    STORE_IMAGES
+        .lock()
+        .expect("store images")
+        .iter()
+        .find(|(key, _)| *key == window as usize)
+        .map(|(_, entry)| (std::sync::Arc::clone(&entry.image), entry.spare.len()))
+}
+
+#[cfg(test)]
+pub(crate) fn forget_backing_store_for_test(window: sdl3::Window) {
+    forget_window(window);
+}
 
 /// CPU backing-store contents and overlay references owned through completion
 /// of an asynchronous GPU upload. The SDL event thread only copies the bytes.
@@ -1940,7 +2059,7 @@ pub(crate) fn present_store(
 
 /// Runs off the AppKit thread. Owns the CPU staging contents until one_shot
 /// completes and holds the window's SDL lifetime token through GPU teardown.
-fn present_store_synchronous(
+pub(crate) fn present_store_synchronous(
     window: sdl3::Window,
     store: &appkit::backing::Store,
     holes: &[appkit::backing::Hole],
@@ -1986,20 +2105,7 @@ fn present_store_synchronous(
             .push((old, FRAMES_RETIRED));
     }
     if at.is_none() || stale {
-        let image = match gpu.create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: store.width,
-            height: store.height,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_SHADER_READ,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        }) {
+        let image = match make_backing_source(gpu, store.width, store.height) {
             Ok(image) => image,
             Err(reason) => {
                 gpu::trace(format!("window store image creation failed: {reason}"));
@@ -2009,7 +2115,7 @@ fn present_store_synchronous(
         let staging = match gpu.create_buffer(store.pixels.len() as u64) {
             Ok(staging) => staging,
             Err(reason) => {
-                gpu.destroy_image(image);
+                drop(image);
                 gpu::trace(format!("window store staging failed: {reason}"));
                 return store_failure_outcome(window);
             }
@@ -2019,6 +2125,7 @@ fn present_store_synchronous(
             StoreImage {
                 gpu,
                 image,
+                spare: Vec::new(),
                 staging,
                 blended: None,
             },
@@ -2029,6 +2136,17 @@ fn present_store_synchronous(
         .find(|(key, _)| *key == window as usize)
         .expect("made above")
         .1;
+    // Reused store GPU allocations cannot be overwritten while a WSI copy
+    // still owns them. The pool is capped so occluded windows cannot consume
+    // unbounded device memory.
+    match entry.reserve_upload_source() {
+        Ok(true) => {}
+        Ok(false) => return Deferred,
+        Err(reason) => {
+            gpu::trace(format!("backing-store source allocation failed: {reason}"));
+            return store_failure_outcome(window);
+        }
+    }
     // SAFETY: the staging buffer is mapped over the store's whole length.
     unsafe {
         std::ptr::copy_nonoverlapping(
@@ -2049,7 +2167,7 @@ fn present_store_synchronous(
             height: store.height,
             depth: 1,
         });
-    let (buffer, image) = (entry.staging.buffer, entry.image.image);
+    let (buffer, image) = (entry.staging.buffer, entry.image.image.image);
     let uploaded = entry.gpu.one_shot(|device, command_buffer| {
         // SAFETY: recording into a command buffer the call owns; the image is
         // in GENERAL layout from creation.
@@ -2084,16 +2202,28 @@ fn present_store_synchronous(
         .iter()
         .map(|hole| (hole.layer, crate::swapchain::Region::from(hole.rect)))
         .collect();
-    let presented =
-        match crate::swapchain::present_nonblocking(gpu, window as usize, &frame, shown, &holes) {
-            Ok(Some(true)) => Displayed,
-            Ok(Some(false)) => store_failure_outcome(window),
-            Ok(None) => Deferred,
-            Err(reason) => {
-                gpu::trace(format!("window store presentation failed: {reason}"));
-                store_failure_outcome(window)
-            }
-        };
+    let presented_result = if overlays.is_empty() {
+        // A ref-counted source is immutable while the compositor references
+        // it, so a full-window backing store can use the direct WSI path.
+        crate::swapchain::present_backing_nonblocking(
+            gpu,
+            window as usize,
+            &frame,
+            std::sync::Arc::clone(&entry.image),
+            &holes,
+        )
+    } else {
+        crate::swapchain::present_nonblocking(gpu, window as usize, &frame, shown, &holes)
+    };
+    let presented = match presented_result {
+        Ok(Some(true)) => Displayed,
+        Ok(Some(false)) => store_failure_outcome(window),
+        Ok(None) => Deferred,
+        Err(reason) => {
+            gpu::trace(format!("window store presentation failed: {reason}"));
+            store_failure_outcome(window)
+        }
+    };
     drop(images);
     // A deferred store was not staged. Its previous swapchain submissions
     // still refer to retired images, so only successful presentation attempts
