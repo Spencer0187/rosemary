@@ -2860,6 +2860,108 @@ fn static_foreground_survives_repeated_background_submissions() {
     sdl3::video::destroy_window(window);
 }
 
+/// A Vulkan recording/queue failure must never replace the last composited
+/// layer with an unwritten GPU image, even when a new scene generation was
+/// allocated and the old one is still retained by another GPU frame.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn failed_scene_submission_restores_last_complete_layer_snapshot() {
+    if isolate_vulkan_graphical_test(
+        "failed_scene_submission_restores_last_complete_layer_snapshot",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let overlay = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 60,
+            height: 40,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("overlay source");
+    let child = appkit::view::Frame {
+        x: 30,
+        y: 10,
+        width: 60,
+        height: 40,
+        ..whole
+    };
+    state.layers.push(1);
+    state.note_scene_frame(1, &whole);
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &background, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.layers.push(2);
+    assert_eq!(
+        state.stage_composite_layer(2, &child, &overlay, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(2, &child);
+    let previous = Arc::clone(
+        &state
+            .scene_layers
+            .iter()
+            .find(|scene| scene.id == 2)
+            .unwrap()
+            .snapshot,
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .find(|scene| scene.id == 2)
+            .unwrap()
+            .ready
+    );
+    let frame_before = state.frame;
+    state.injected_post_scene_record_error = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+    let failure =
+        state.stage_composite_layer(2, &child, &overlay, None, &mut SourceOwner(None), false);
+    assert!(
+        failure
+            .unwrap_err()
+            .contains("injected post-scene recording failure")
+    );
+    assert_eq!(state.frame, frame_before);
+    let retained = state
+        .scene_layers
+        .iter()
+        .find(|scene| scene.id == 2)
+        .unwrap();
+    assert!(
+        retained.ready,
+        "failed submit left the previous layer marked unreadable"
+    );
+    assert!(
+        Arc::ptr_eq(&previous, &retained.snapshot),
+        "failed submit replaced the last visible image"
+    );
+    assert_eq!(state.layers, [1, 2]);
+    assert_eq!(
+        state.stage_composite_layer(2, &child, &overlay, None, &mut SourceOwner(None), false),
+        Ok(Some(true)),
+        "retry should stage a complete new scene"
+    );
+    state.idle();
+    drop(state);
+    drop(previous);
+    gpu.destroy_image(background);
+    gpu.destroy_image(overlay);
+    sdl3::video::destroy_window(window);
+}
+
 /// Every image the compositor has submitted remains immutable until the GPU
 /// fence has signaled. Once the per-layer source pool fills with retained
 /// generations, a new frame must defer without overwriting an older image.

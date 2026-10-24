@@ -12,7 +12,7 @@ pub(super) struct SceneLayer {
     spare: Vec<Arc<BackingImageLease>>,
     opacity: f32,
     regions: Option<Vec<Region>>,
-    ready: bool,
+    pub(super) ready: bool,
 }
 
 pub(super) struct SceneWork {
