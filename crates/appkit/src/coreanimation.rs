@@ -226,6 +226,31 @@ fn root_of(layer: Id) -> Id {
     at
 }
 
+/// Local CA state up to (but excluding) the nearest ancestor NSView layer.
+/// When that ancestor also appears in the child's CA superlayer chain its
+/// opacity has already been applied by the parent view traversal.
+/// A missing ancestor link is intentional: NSView backing layers need not be
+/// structurally linked as Core Animation superlayers.
+pub(crate) fn scene_properties_below(layer: Id, ancestor: Id) -> (bool, f32) {
+    let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(nodes) = nodes.as_ref() else {
+        return (false, 1.0);
+    };
+    let mut at = layer as usize;
+    let mut opacity = 1.0f64;
+    let mut hidden = false;
+    for _ in 0..256 {
+        if at == 0 || (!ancestor.is_null() && at == ancestor as usize) {
+            break;
+        }
+        let Some(node) = nodes.get(&at) else { break };
+        hidden |= node.hidden;
+        opacity *= node.opacity;
+        at = node.superlayer;
+    }
+    (hidden, opacity.clamp(0.0, 1.0) as f32)
+}
+
 /// Value-only CA presentation properties consumed by the Metal scene.
 /// A superlayer's visibility and opacity apply to its entire subtree, just as
 /// an enclosing NSView's properties do. Traverse a single immutable snapshot
@@ -236,6 +261,7 @@ pub(crate) fn scene_masks_to_bounds(layer: Id) -> bool {
     read_node(layer, |node| node.is_some_and(|node| node.masks_to_bounds))
 }
 
+#[cfg(test)]
 pub(crate) fn scene_hidden(layer: Id) -> bool {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(nodes) = nodes.as_ref() else {
@@ -255,6 +281,7 @@ pub(crate) fn scene_hidden(layer: Id) -> bool {
     false
 }
 
+#[cfg(test)]
 pub(crate) fn scene_opacity(layer: Id) -> f32 {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(nodes) = nodes.as_ref() else {

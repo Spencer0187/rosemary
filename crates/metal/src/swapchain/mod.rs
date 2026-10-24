@@ -338,6 +338,7 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
             id: layer.layer,
             frame: DirectFrame::from_frame(&layer.frame),
             opacity: layer.opacity,
+            opaque: layer.opaque,
             clip: layer.clip.map(|frame| DirectFrame::from_frame(&frame)),
         })
         .collect();
@@ -1312,6 +1313,7 @@ fn present_impl(
                 id: item.layer,
                 frame: DirectFrame::from_frame(&item.frame),
                 opacity: item.opacity,
+                opaque: item.opaque,
                 clip: item.clip.map(|frame| DirectFrame::from_frame(&frame)),
             })
             .collect::<Vec<_>>()
@@ -1339,18 +1341,12 @@ fn present_impl(
         .filter(|(owner, _)| *owner != layer && swapchain.layers.contains(owner))
         .map(|(_, region)| *region)
         .collect();
-    let regions = match holes.is_empty() {
-        true => None,
-        false => Some(subtract(
-            Region {
-                x: frame.x,
-                y: frame.y,
-                width: frame.width as i32,
-                height: frame.height as i32,
-            },
-            &holes,
-        )),
-    };
+    // In the retained scene the CPU backing store is the bottom layer,
+    // including pixels behind translucent Metal. The window store's holes
+    // describe Metal coverage, not true occlusion. Conversely, the Metal
+    // drawable's holes describe opaque AppKit views above it and must still
+    // be respected to keep native controls in front of the guest drawable.
+    let regions = scene_regions(layer, window, live_scene.is_some(), frame, &holes);
     // Core Animation combines independent layers into one window image.
     // Host WSI presentation mode only determines how that completed image
     // reaches the display; never enqueue one host present per Metal layer.
@@ -1379,12 +1375,14 @@ fn present_impl(
             regions.as_deref(),
             swapchain.corners.is_some(),
             owner.0.is_some() || backing.is_some(),
-        ) && swapchain
-            .scene_placements
-            .iter()
-            .find(|placement| placement.id == layer)
-            .and_then(|placement| placement.clip)
-            .is_none_or(|clip| scene::scene_clip_contains(&clip.frame(), frame));
+        ) && swapchain.scene_opacity(layer) >= 1.0
+            && swapchain.scene_opaque(layer)
+            && swapchain
+                .scene_placements
+                .iter()
+                .find(|placement| placement.id == layer)
+                .and_then(|placement| placement.clip)
+                .is_none_or(|clip| scene::scene_clip_contains(&clip.frame(), frame));
         let converting = !direct && swapchain.direct.is_some();
         let converted = if converting {
             swapchain.stage_direct_snapshot(true)
@@ -1479,6 +1477,34 @@ fn present_impl(
     Err(format!(
         "unsupported Vulkan window presentation mode {:?}",
         swapchain.present_mode
+    ))
+}
+
+/// The CPU backing-store source is below the Metal layer tree. Its
+/// rectangles labelled as Metal holes must not erase pixels that a
+/// translucent drawable needs to reveal. Metal's own masks still clip opaque
+/// AppKit controls that are actually above the drawable.
+fn scene_regions(
+    layer: usize,
+    window: usize,
+    retained: bool,
+    frame: &appkit::view::Frame,
+    holes: &[Region],
+) -> Option<Vec<Region>> {
+    if retained && layer == window {
+        return None;
+    }
+    if holes.is_empty() {
+        return None;
+    }
+    Some(subtract(
+        Region {
+            x: frame.x,
+            y: frame.y,
+            width: frame.width as i32,
+            height: frame.height as i32,
+        },
+        holes,
     ))
 }
 

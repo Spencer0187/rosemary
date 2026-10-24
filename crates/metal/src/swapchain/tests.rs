@@ -16,6 +16,7 @@ fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
             id,
             frame,
             opacity: 1.0,
+            opaque: true,
             clip: None,
         }]
     };
@@ -2687,6 +2688,593 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
     gpu.destroy_image(source);
 }
 
+/// Read a window accumulator only after the staging queue has completed.
+/// This inspects raw RGBA8 compositor texels, not a WSI screenshot.
+#[cfg(not(target_os = "macos"))]
+fn read_scene_pixel(
+    gpu: &'static Gpu,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+) -> Vec<u8> {
+    let buffer = gpu
+        .create_buffer(u64::from(width) * u64::from(height) * 4)
+        .expect("GPU readback staging");
+    gpu.one_shot(|device, cb| unsafe {
+        let sync = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[sync],
+        );
+        device.cmd_copy_image_to_buffer(
+            cb,
+            image,
+            vk::ImageLayout::GENERAL,
+            buffer.buffer,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                })],
+        );
+    })
+    .expect("GPU readback");
+    let offset = (y as usize * width as usize + x as usize) * 4;
+    let pixel = unsafe { std::slice::from_raw_parts(buffer.contents.add(offset), 4).to_vec() };
+    gpu.destroy_buffer(buffer);
+    pixel
+}
+
+/// The CPU backing image, including its pixels covered by Metal, is the
+/// bottom scene source. This is not the opaque-AppKit-over-Metal mask.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn translucent_metal_composites_over_complete_cpu_store() {
+    if isolate_vulkan_graphical_test("translucent_metal_composites_over_complete_cpu_store") {
+        return;
+    }
+    let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let overlay = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 60,
+            height: 40,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("Metal foreground image");
+    for (img, color) in [
+        (&background, [0.0, 0.0, 1.0, 1.0]),
+        (&overlay, [0.0, 1.0, 0.0, 1.0]),
+    ] {
+        gpu.one_shot(|device, cb| unsafe {
+            device.cmd_clear_color_image(
+                cb,
+                img.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: color },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .expect("fill source");
+    }
+    let foreground = appkit::view::Frame {
+        x: 30,
+        y: 20,
+        width: 60,
+        height: 40,
+        ..whole
+    };
+    let metal_coverage = Region {
+        x: 30,
+        y: 20,
+        width: 60,
+        height: 40,
+    };
+    assert!(
+        scene_regions(
+            window as usize,
+            window as usize,
+            true,
+            &whole,
+            &[metal_coverage]
+        )
+        .is_none(),
+        "Metal coverage wrongly excised CPU pixels needed under translucent content"
+    );
+    assert!(
+        scene_regions(
+            window as usize,
+            window as usize,
+            false,
+            &whole,
+            &[metal_coverage]
+        )
+        .is_some(),
+        "non-scene legacy occlusion contract unexpectedly changed"
+    );
+    let metal_id = 100usize;
+    let cpu_id = window as usize;
+    state.layers.push(cpu_id);
+    state.note_scene_frame(cpu_id, &whole);
+    assert_eq!(
+        state.stage_composite_layer(
+            cpu_id,
+            &whole,
+            &background,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.layers.push(metal_id);
+    state.synchronize_scene(
+        cpu_id,
+        &[ScenePlacement {
+            id: metal_id,
+            frame: DirectFrame::from_frame(&foreground),
+            opacity: 0.5,
+            opaque: true,
+            clip: None,
+        }],
+    );
+    assert_eq!(
+        state.stage_composite_layer(
+            metal_id,
+            &foreground,
+            &overlay,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 5, 5),
+        [0, 0, 255, 255]
+    );
+    let half = read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 55, 35);
+    assert_eq!(half[0], 0);
+    assert!((126..=129).contains(&half[1]) && (126..=129).contains(&half[2]));
+    assert_eq!(half[3], 255);
+    // The foreground drawable remains static. Only its CA opacity changes.
+    assert!(state.synchronize_scene(
+        cpu_id,
+        &[ScenePlacement {
+            id: metal_id,
+            frame: DirectFrame::from_frame(&foreground),
+            opacity: 0.25,
+            opaque: true,
+            clip: None,
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(cpu_id), Ok(true));
+    state.idle();
+    let quarter = read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 55, 35);
+    assert_eq!(quarter[0], 0);
+    assert!(
+        (62..=65).contains(&quarter[1]),
+        "lost green over blue: {quarter:?}"
+    );
+    assert!(
+        (190..=193).contains(&quarter[2]),
+        "lost CPU blue behind Metal: {quarter:?}"
+    );
+    assert_eq!(quarter[3], 255);
+    // Genuine opaque upper AppKit regions continue to mask a Metal drawable.
+    assert!(scene_regions(metal_id, cpu_id, true, &foreground, &[metal_coverage]).is_some());
+    drop(state);
+    gpu.destroy_image(background);
+    gpu.destroy_image(overlay);
+    sdl3::video::destroy_window(window);
+}
+
+/// Switching a lone full-window drawable to 50% CA alpha must recompose its
+/// last frame even without a new Metal present: both direct and FIFO paths.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
+    if isolate_vulkan_graphical_test(
+        "lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, blue, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            blue.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 1.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("full-window blue");
+    let id = 101usize;
+    state.layers.push(id);
+    state.note_scene_frame(id, &whole);
+    if matches!(
+        state.present_mode,
+        vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+    ) {
+        assert_eq!(
+            state.stage_composite_layer(id, &whole, &blue, None, &mut SourceOwner(None), false),
+            Ok(Some(true))
+        );
+        assert!(
+            state.scene_layers.is_empty(),
+            "FIFO fast path unexpectedly allocated a retained source"
+        );
+    } else {
+        state.queue_direct(
+            id,
+            &whole,
+            PresentSource::from(&blue),
+            &mut SourceOwner(None),
+            None,
+        );
+        assert!(state.direct.is_some(), "test did not exercise direct WSI");
+    }
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 0.5,
+            opaque: true,
+            clip: None,
+        }]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(
+        state.direct.is_none(),
+        "translucent scene incorrectly remains direct WSI"
+    );
+    let image = state.composite.as_ref().expect("CA blend compositor").image;
+    let half = read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 40, 40);
+    assert_eq!(half[0], 0);
+    assert_eq!(half[1], 0);
+    assert!(
+        (126..=129).contains(&half[2]),
+        "CA alpha bypassed shader: {half:?}"
+    );
+    assert!(
+        (126..=129).contains(&half[3]),
+        "alpha not premultiplied: {half:?}"
+    );
+    // -setOpaque:NO is independent from opacity=1. A drawable containing
+    // half-transparent premultiplied pixels must still use the scene shader.
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+        }]
+    ));
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            blue.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.5, 0.5],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("half-transparent drawable");
+    assert_eq!(
+        state.stage_composite_layer(id, &whole, &blue, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.idle();
+    assert!(
+        state.direct.is_none(),
+        "non-opaque layer bypassed the compositor"
+    );
+    let half_alpha = read_scene_pixel(gpu, image, whole.window_width, whole.window_height, 40, 40);
+    assert_eq!(half_alpha[0], 0);
+    assert_eq!(half_alpha[1], 0);
+    assert!(
+        (126..=129).contains(&half_alpha[2]),
+        "source alpha lost: {half_alpha:?}"
+    );
+    assert!(
+        (126..=129).contains(&half_alpha[3]),
+        "source alpha lost: {half_alpha:?}"
+    );
+    drop(state);
+    gpu.destroy_image(blue);
+    sdl3::video::destroy_window(window);
+}
+
+/// Manual release-only 4K GPU staging benchmark. The control mirrors the
+/// old incremental subrectangle blit, not an installed upstream binary. No
+/// timing assertion: these numbers are hardware and driver specific.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn benchmark_4k_static_background_with_animated_128px_foreground() {
+    if std::env::var_os("ROSEMARY_BENCH_SCENE_4K").is_none() {
+        return;
+    }
+    if isolate_vulkan_graphical_test(
+        "benchmark_4k_static_background_with_animated_128px_foreground",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, unused_source, mut frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.destroy_image(unused_source);
+    let (width, height) = (3840u32, 2160u32);
+    state.extent = vk::Extent2D { width, height };
+    state.requested = state.extent;
+    frame.width = width;
+    frame.height = height;
+    frame.window_width = width;
+    frame.window_height = height;
+    let foreground = appkit::view::Frame {
+        x: 1900,
+        y: 1000,
+        width: 128,
+        height: 128,
+        ..frame
+    };
+    let make_image = |w: u32, h: u32| {
+        gpu.create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: w,
+            height: h,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .expect("benchmark Vulkan image")
+    };
+    let background = make_image(width, height);
+    let overlay = make_image(128, 128);
+    let control = make_image(width, height);
+    for (image, color) in [
+        (&background, [0.0, 0.0, 1.0, 1.0]),
+        (&overlay, [0.0, 1.0, 0.0, 1.0]),
+    ] {
+        gpu.one_shot(|device, cb| unsafe {
+            device.cmd_clear_color_image(
+                cb,
+                image.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue { float32: color },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .expect("initialize benchmark source");
+    }
+    let background_id = 1usize;
+    let foreground_id = 2usize;
+    state.layers.push(background_id);
+    state.note_scene_frame(background_id, &frame);
+    assert_eq!(
+        state.stage_composite_layer(
+            background_id,
+            &frame,
+            &background,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.layers.push(foreground_id);
+    assert_eq!(
+        state.stage_composite_layer(
+            foreground_id,
+            &foreground,
+            &overlay,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(foreground_id, &foreground);
+    state.idle();
+    let control_update = || {
+        gpu.one_shot(|device, cb| unsafe {
+            let sync = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(control.image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                cb,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[sync],
+            );
+            blit(
+                device,
+                cb,
+                overlay.image,
+                [
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: 128,
+                        y: 128,
+                        z: 1,
+                    },
+                ],
+                control.image,
+                vk::ImageLayout::GENERAL,
+                [
+                    vk::Offset3D {
+                        x: foreground.x,
+                        y: foreground.y,
+                        z: 0,
+                    },
+                    vk::Offset3D {
+                        x: foreground.x + 128,
+                        y: foreground.y + 128,
+                        z: 1,
+                    },
+                ],
+            );
+        })
+        .expect("control subrectangle GPU blit");
+    };
+    let mut retained_update = || {
+        assert_eq!(
+            state.stage_composite_layer(
+                foreground_id,
+                &foreground,
+                &overlay,
+                None,
+                &mut SourceOwner(None),
+                false
+            ),
+            Ok(Some(true))
+        );
+        state.idle();
+    };
+    // The work is repeated after full warmup to remove one-time allocation
+    // and shader pipeline compilation from the per-frame latency figure.
+    for _ in 0..6 {
+        control_update();
+        retained_update();
+    }
+    let iterations = 40;
+    let mut control_us = Vec::new();
+    let mut retained_us = Vec::new();
+    for _ in 0..iterations {
+        let start = Instant::now();
+        control_update();
+        control_us.push(start.elapsed().as_secs_f64() * 1e6);
+        let start = Instant::now();
+        retained_update();
+        retained_us.push(start.elapsed().as_secs_f64() * 1e6);
+    }
+    let average = |values: &[f64]| values.iter().sum::<f64>() / values.len() as f64;
+    let mut control_p95 = control_us.clone();
+    let mut retained_p95 = retained_us.clone();
+    control_p95.sort_by(|a, b| a.total_cmp(b));
+    retained_p95.sort_by(|a, b| a.total_cmp(b));
+    eprintln!(
+        "4K small-foreground benchmark: {iterations} serialized warmed-up samples, window={}x{}, overlay=128x128, WSI mode={:?}",
+        width, height, state.present_mode
+    );
+    eprintln!(
+        "4K upstream-style incremental blit proxy (NOT actual upstream binary): mean_us={:.1}, p95_us={:.1}",
+        average(&control_us),
+        control_p95[(iterations * 95 / 100) as usize]
+    );
+    eprintln!(
+        "4K retained scene full redraw: mean_us={:.1}, p95_us={:.1}, ratio={:.2}x",
+        average(&retained_us),
+        retained_p95[(iterations * 95 / 100) as usize],
+        average(&retained_us) / average(&control_us)
+    );
+    eprintln!(
+        "4K static background footprint: {} bytes; overlay footprint: {} bytes",
+        u64::from(width) * u64::from(height) * 4,
+        128 * 128 * 4
+    );
+    drop(state);
+    gpu.destroy_image(background);
+    gpu.destroy_image(overlay);
+    gpu.destroy_image(control);
+    sdl3::video::destroy_window(window);
+}
+
 /// Clipping a single full-window Metal layer must not route it through the
 /// unmasked legacy blit or the direct WSI fast path. Outside its ancestor's
 /// rectangle the window accumulator must stay transparent.
@@ -2738,6 +3326,7 @@ fn one_layer_with_clipping_parent_keeps_outside_pixels_transparent() {
             id: 1,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
+            opaque: true,
             clip: Some(DirectFrame::from_frame(&clip)),
         }],
     );
@@ -2990,12 +3579,14 @@ fn static_foreground_survives_repeated_background_submissions() {
                 id: 1,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
+                opaque: true,
                 clip: None,
             },
             ScenePlacement {
                 id: 2,
                 frame: DirectFrame::from_frame(&foreground),
                 opacity: 0.5,
+                opaque: true,
                 clip: None,
             },
         ]
@@ -3053,12 +3644,14 @@ fn static_foreground_survives_repeated_background_submissions() {
                 id: 1,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
+                opaque: true,
                 clip: None
             },
             ScenePlacement {
                 id: 2,
                 frame: DirectFrame::from_frame(&foreground),
                 opacity: 0.5,
+                opaque: true,
                 clip: Some(restricted)
             },
         ]
@@ -3402,6 +3995,7 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
             id: 1,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
+            opaque: true,
             clip: None,
         }]
     ));

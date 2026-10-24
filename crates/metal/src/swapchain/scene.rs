@@ -11,6 +11,7 @@ pub(super) struct SceneLayer {
     pub(super) snapshot: Arc<BackingImageLease>,
     spare: Vec<Arc<BackingImageLease>>,
     opacity: f32,
+    opaque: bool,
     clip: Option<DirectFrame>,
     regions: Option<Vec<Region>>,
     pub(super) ready: bool,
@@ -242,6 +243,7 @@ pub(super) struct ScenePlacement {
     pub id: usize,
     pub frame: DirectFrame,
     pub opacity: f32,
+    pub opaque: bool,
     pub clip: Option<DirectFrame>,
 }
 
@@ -352,6 +354,22 @@ impl Swapchain {
             }
         }
         let mut changed = self.layers != ordered;
+        if self.layers.len() == 1
+            && self.scene_layers.is_empty()
+            && live
+                .iter()
+                .any(|p| p.id == self.layers[0] && (p.opacity < 1.0 || !p.opaque))
+        {
+            changed = true;
+        }
+        if let Some(direct) = self.direct.as_ref() {
+            if live
+                .iter()
+                .any(|p| p.id == direct.layer && (p.opacity < 1.0 || !p.opaque))
+            {
+                changed = true;
+            }
+        }
         self.layers = ordered;
         self.scene_placements = live.to_vec();
         if self
@@ -386,10 +404,12 @@ impl Swapchain {
             {
                 if scene.frame != placement.frame
                     || scene.opacity != placement.opacity
+                    || scene.opaque != placement.opaque
                     || scene.clip != placement.clip
                 {
                     scene.frame = placement.frame;
                     scene.opacity = placement.opacity;
+                    scene.opaque = placement.opaque;
                     scene.clip = placement.clip;
                     changed = true;
                 }
@@ -415,7 +435,14 @@ impl Swapchain {
             .and_then(|entry| entry.clip)
     }
 
-    fn scene_opacity(&self, id: usize) -> f32 {
+    pub(super) fn scene_opaque(&self, id: usize) -> bool {
+        self.scene_placements
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_none_or(|entry| entry.opaque)
+    }
+
+    pub(super) fn scene_opacity(&self, id: usize) -> f32 {
         self.scene_placements
             .iter()
             .find(|entry| entry.id == id)
@@ -437,7 +464,12 @@ impl Swapchain {
         let source_is_clipped = self
             .scene_clip(id)
             .is_some_and(|clip| !scene_clip_contains(&clip.frame(), frame));
-        if self.layers.len() <= 1 && self.scene_layers.is_empty() && !source_is_clipped {
+        if self.layers.len() <= 1
+            && self.scene_layers.is_empty()
+            && !source_is_clipped
+            && self.scene_opacity(id) >= 1.0
+            && self.scene_opaque(id)
+        {
             return Ok(ScenePrepared::SingleLayer);
         }
         if self.layers.len() > MAX_SCENE_LAYERS {
@@ -532,12 +564,14 @@ impl Swapchain {
                 snapshot,
                 spare: Vec::new(),
                 opacity: self.scene_opacity(old),
+                opaque: self.scene_opaque(old),
                 clip: self.scene_clip(old),
                 regions: None,
                 ready: false,
             });
         }
         let opacity = self.scene_opacity(id);
+        let opaque = self.scene_opaque(id);
         let clip = self.scene_clip(id);
         if let Some(existing) = existing {
             let layer = &mut self.scene_layers[existing];
@@ -561,6 +595,7 @@ impl Swapchain {
             }
             layer.frame = DirectFrame::from_frame(frame);
             layer.opacity = opacity;
+            layer.opaque = opaque;
             layer.clip = clip;
             layer.regions = regions.map(|r| r.to_vec());
             layer.ready = false;
@@ -571,6 +606,7 @@ impl Swapchain {
                 snapshot: fresh,
                 spare: Vec::new(),
                 opacity,
+                opaque,
                 clip,
                 regions: regions.map(|r| r.to_vec()),
                 ready: false,
@@ -849,9 +885,87 @@ impl Swapchain {
         Ok(())
     }
 
+    /// Materialize a source image from FIFO's last opaque one-layer result
+    /// only if a CA-only scene change needs to blend it with opacity.
+    fn capture_single_scene_from_composite(&mut self) -> Result<(), String> {
+        let id = self.layers[0];
+        let accumulated = self
+            .composite
+            .as_ref()
+            .ok_or("single-layer accumulator absent")?;
+        let snapshot = scene_image(self.gpu, PresentSource::from(accumulated))?;
+        let src = accumulated.image;
+        let dst = snapshot.image.image;
+        let extent = self.extent;
+        self.gpu.one_shot(|device, cb| unsafe {
+            scene_sync(
+                device,
+                cb,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                &[(
+                    src,
+                    vk::AccessFlags::MEMORY_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                )],
+            );
+            let area = [
+                vk::Offset3D::default(),
+                vk::Offset3D {
+                    x: extent.width as i32,
+                    y: extent.height as i32,
+                    z: 1,
+                },
+            ];
+            blit(device, cb, src, area, dst, vk::ImageLayout::GENERAL, area);
+        })?;
+        let window = self
+            .scene_frames
+            .iter()
+            .find(|(known, _)| *known == id)
+            .map_or(0, |(_, frame)| frame.window);
+        self.scene_layers.push(SceneLayer {
+            id,
+            frame: DirectFrame {
+                window,
+                x: 0,
+                y: 0,
+                width: extent.width,
+                height: extent.height,
+                window_width: extent.width,
+                window_height: extent.height,
+            },
+            snapshot,
+            spare: Vec::new(),
+            opacity: self.scene_opacity(id),
+            opaque: self.scene_opaque(id),
+            clip: self.scene_clip(id),
+            regions: None,
+            ready: true,
+        });
+        Ok(())
+    }
+
     /// Queue one retained-scene repaint after visibility, geometry or order
     /// changes. No SDL/Objective-C operation is performed under a Vulkan lock.
     pub(super) fn redisplay_scene(&mut self, window: usize) -> Result<bool, String> {
+        if let Some(direct) = self.direct.as_ref() {
+            if self.scene_opacity(direct.layer) < 1.0 || !self.scene_opaque(direct.layer) {
+                // A CA-only opacity update must reuse the last drawable's
+                // retained image, not leave its old opaque direct WSI copy.
+                return self
+                    .stage_direct_snapshot(true)
+                    .map(|done| done == Some(true));
+            }
+        }
+        if self.layers.len() == 1
+            && self.scene_layers.is_empty()
+            && (self.scene_opacity(self.layers[0]) < 1.0 || !self.scene_opaque(self.layers[0]))
+        {
+            // FIFO's previously opaque single-layer blit has no separately
+            // retained GPU snapshot. Cache it now for CA-only alpha changes.
+            self.capture_single_scene_from_composite()?;
+        }
         if self.layers.len() == 1 {
             if self
                 .direct
@@ -876,9 +990,11 @@ impl Swapchain {
                     scene.regions.as_deref(),
                     self.corners.is_some(),
                     true,
-                ) && scene
-                    .clip
-                    .is_none_or(|clip| scene_clip_contains(&clip.frame(), &frame))
+                ) && scene.opacity >= 1.0
+                    && scene.opaque
+                    && scene
+                        .clip
+                        .is_none_or(|clip| scene_clip_contains(&clip.frame(), &frame))
                 {
                     let snapshot = Arc::clone(&scene.snapshot);
                     let source = PresentSource::from(&snapshot.image);

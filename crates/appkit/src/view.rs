@@ -89,6 +89,7 @@ pub struct MetalSceneLayer {
     pub layer: usize,
     pub frame: Frame,
     pub opacity: f32,
+    pub opaque: bool,
     /// Clip from enclosing AppKit/CA bounds, expressed in physical window pixels.
     pub clip: Option<Frame>,
 }
@@ -131,7 +132,15 @@ fn capture_metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
     }
     let content = crate::window::content_view_of(nswindow);
     let mut result = Vec::new();
-    visit_metal_scene(content, window, &mut result, None, 0);
+    visit_metal_scene(
+        content,
+        window,
+        &mut result,
+        None,
+        1.0,
+        std::ptr::null_mut(),
+        0,
+    );
     Some(result)
 }
 
@@ -140,23 +149,31 @@ fn visit_metal_scene(
     window: sdl3::Window,
     scene: &mut Vec<MetalSceneLayer>,
     inherited_clip: Option<Frame>,
+    inherited_layer_opacity: f32,
+    parent_layer: Id,
     depth: usize,
 ) {
     if depth >= 64 || !is_view(view) || view_of(view).hidden != 0 {
         return;
     }
     let layer = view_of(view).layer;
-    if !layer.is_null()
-        && crate::layer::is_metal(layer)
-        && !crate::coreanimation::scene_hidden(layer)
-    {
+    let (hidden, own_layer_opacity) = if layer.is_null() {
+        (false, 1.0)
+    } else {
+        crate::coreanimation::scene_properties_below(layer, parent_layer)
+    };
+    if hidden {
+        return;
+    }
+    let layer_opacity = inherited_layer_opacity * own_layer_opacity;
+    if !layer.is_null() && crate::layer::is_metal(layer) {
         if let Some(frame) = unsafe { presentation_frame(view) } {
             if frame.window == window {
                 scene.push(MetalSceneLayer {
                     layer: layer as usize,
                     frame,
-                    opacity: (effective_alpha(view) as f32)
-                        * crate::coreanimation::scene_opacity(layer),
+                    opacity: (effective_alpha(view) as f32) * layer_opacity,
+                    opaque: crate::layer::opaque_of(layer),
                     clip: inherited_clip,
                 });
             }
@@ -174,7 +191,15 @@ fn visit_metal_scene(
     if let Some(children) = unsafe { corefoundation::collections::array(children as *const c_void) }
     {
         for &child in &children.values {
-            visit_metal_scene(child as Id, window, scene, child_clip, depth + 1);
+            visit_metal_scene(
+                child as Id,
+                window,
+                scene,
+                child_clip,
+                layer_opacity,
+                if layer.is_null() { parent_layer } else { layer },
+                depth + 1,
+            );
         }
     }
 }
@@ -2975,6 +3000,13 @@ mod tests {
         let current = metal_scene(sdl).expect("published layer snapshot");
         assert_eq!(current.len(), 2);
         assert!((current[1].opacity - 0.5).abs() <= f32::EPSILON);
+        assert!(current[1].opaque, "CAMetalLayer should default to opaque");
+        let set_opaque: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_opaque(second, objc::sel::get("setOpaque:"), 0) };
+        assert!(!metal_scene(sdl).unwrap()[1].opaque);
+        unsafe { set_opaque(second, objc::sel::get("setOpaque:"), 1) };
+        assert!(metal_scene(sdl).unwrap()[1].opaque);
         // Moving a live Metal layer changes placement without requiring it to
         // submit another drawable. Sibling reordering changes compositing
         // order even if neither layer publishes a new frame.
@@ -3017,6 +3049,31 @@ mod tests {
             add_subview(container, objc::sel::get("addSubview:"), b);
         }
         assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // The parent view's ordinary CA backing layer is not necessarily a
+        // superlayer of its child's CAMetalLayer. Its hidden/opacity state
+        // must nonetheless be inherited by the child view's presentation.
+        let ca = objc::class::lookup(c"CALayer").expect("CALayer");
+        let parent_layer = unsafe { make(ca as *const _ as Id, maker) };
+        unsafe { set_layer(container, objc::sel::get("setLayer:"), parent_layer) };
+        let ca_opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let ca_hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { ca_opacity(parent_layer, objc::sel::get("setOpacity:"), 0.4) };
+        assert!((metal_scene(sdl).unwrap()[1].opacity - 0.2).abs() < 0.0001);
+        unsafe { ca_hidden(parent_layer, objc::sel::get("setHidden:"), 1) };
+        assert_eq!(ids(sdl), [first as usize]);
+        unsafe { ca_hidden(parent_layer, objc::sel::get("setHidden:"), 0) };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        // A genuinely linked CA superlayer must not be multiplied twice.
+        let ca_add: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { ca_add(parent_layer, objc::sel::get("addSublayer:"), second) };
+        assert!((metal_scene(sdl).unwrap()[1].opacity - 0.2).abs() < 0.0001);
+        // NSView alpha remains independent from the ordinary CA opacity.
+        unsafe { set_alpha_value(container, objc::sel::get("setAlphaValue:"), 0.5) };
+        assert!((metal_scene(sdl).unwrap()[1].opacity - 0.1).abs() < 0.0001);
+        unsafe { ca_opacity(parent_layer, objc::sel::get("setOpacity:"), 1.0) };
         let before_container_move = metal_scene(sdl).unwrap()[1].frame;
         unsafe {
             set_frame_origin(
