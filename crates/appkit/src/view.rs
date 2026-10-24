@@ -89,6 +89,8 @@ pub struct MetalSceneLayer {
     pub layer: usize,
     pub frame: Frame,
     pub opacity: f32,
+    /// Clip from enclosing AppKit/CA bounds, expressed in physical window pixels.
+    pub clip: Option<Frame>,
 }
 
 // SAFETY: a snapshot owns only integer layer identities and a copied SDL
@@ -129,7 +131,7 @@ fn capture_metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
     }
     let content = crate::window::content_view_of(nswindow);
     let mut result = Vec::new();
-    visit_metal_scene(content, window, &mut result, 0);
+    visit_metal_scene(content, window, &mut result, None, 0);
     Some(result)
 }
 
@@ -137,6 +139,7 @@ fn visit_metal_scene(
     view: Id,
     window: sdl3::Window,
     scene: &mut Vec<MetalSceneLayer>,
+    inherited_clip: Option<Frame>,
     depth: usize,
 ) {
     if depth >= 64 || !is_view(view) || view_of(view).hidden != 0 {
@@ -154,16 +157,41 @@ fn visit_metal_scene(
                     frame,
                     opacity: (effective_alpha(view) as f32)
                         * crate::coreanimation::scene_opacity(layer),
+                    clip: inherited_clip,
                 });
             }
         }
     }
+    let current_masks = view_of(view).layer_backing & CLIPS_TO_BOUNDS != 0
+        || (!layer.is_null() && crate::coreanimation::scene_masks_to_bounds(layer));
+    let child_clip = if current_masks {
+        unsafe { presentation_frame(view) }
+            .map(|frame| inherited_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
+    } else {
+        inherited_clip
+    };
     let children = view_of(view).subviews;
     if let Some(children) = unsafe { corefoundation::collections::array(children as *const c_void) }
     {
         for &child in &children.values {
-            visit_metal_scene(child as Id, window, scene, depth + 1);
+            visit_metal_scene(child as Id, window, scene, child_clip, depth + 1);
         }
+    }
+}
+
+/// Clipping uses independently rounded window-pixel bounds. Saturating i64
+/// endpoints prevent a malformed guest view rectangle from wrapping i32.
+fn intersect_scene_clips(a: Frame, b: Frame) -> Frame {
+    let left = i64::from(a.x).max(i64::from(b.x));
+    let top = i64::from(a.y).max(i64::from(b.y));
+    let right = (i64::from(a.x) + i64::from(a.width)).min(i64::from(b.x) + i64::from(b.width));
+    let bottom = (i64::from(a.y) + i64::from(a.height)).min(i64::from(b.y) + i64::from(b.height));
+    Frame {
+        x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width: right.saturating_sub(left).clamp(0, i64::from(u32::MAX)) as u32,
+        height: bottom.saturating_sub(top).clamp(0, i64::from(u32::MAX)) as u32,
+        ..a
     }
 }
 
@@ -599,6 +627,7 @@ unsafe extern "C" fn set_layer_contents_placement(receiver: Id, _sel: Sel, place
 /// `masksToBounds`.
 unsafe extern "C" fn set_clips_to_bounds(receiver: Id, _sel: Sel, clips: u8) {
     let view = view_of(receiver);
+    let was_clipped = view.layer_backing & CLIPS_TO_BOUNDS != 0;
     if clips != 0 {
         view.layer_backing |= CLIPS_TO_BOUNDS;
     } else {
@@ -607,6 +636,9 @@ unsafe extern "C" fn set_clips_to_bounds(receiver: Id, _sel: Sel, clips: u8) {
     let layer = view.layer;
     if !layer.is_null() {
         crate::layer::set_masks_to_bounds_of(layer, clips != 0);
+    }
+    if was_clipped != (clips != 0) {
+        notify_metal_scene(receiver);
     }
 }
 
@@ -2995,6 +3027,26 @@ mod tests {
         };
         let after_container_move = metal_scene(sdl).unwrap()[1].frame;
         assert_ne!(after_container_move.x, before_container_move.x);
+        // A clipped parent must constrain a retained descendant's pixels
+        // even when the descendant never submits another drawable.
+        unsafe {
+            set_frame(
+                container,
+                objc::sel::get("setFrame:"),
+                rect(35.0, 22.0, 60.0, 45.0),
+            );
+            set_clips_to_bounds(container, objc::sel::get("setClipsToBounds:"), 1);
+        }
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(scene.len(), 2);
+        let expected = unsafe { presentation_frame(container) }.unwrap();
+        let clip = scene[1].clip.expect("subview not clipped to parent bounds");
+        assert_eq!(
+            (clip.x, clip.y, clip.width, clip.height),
+            (expected.x, expected.y, expected.width, expected.height)
+        );
+        unsafe { set_clips_to_bounds(container, objc::sel::get("setClipsToBounds:"), 0) };
+        assert!(metal_scene(sdl).unwrap()[1].clip.is_none());
         unsafe { set_hidden(container, objc::sel::get("setHidden:"), 1) };
         assert_eq!(ids(sdl), [first as usize]);
         unsafe { set_hidden(container, objc::sel::get("setHidden:"), 0) };

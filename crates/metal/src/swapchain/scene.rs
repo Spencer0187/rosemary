@@ -11,6 +11,7 @@ pub(super) struct SceneLayer {
     pub(super) snapshot: Arc<BackingImageLease>,
     spare: Vec<Arc<BackingImageLease>>,
     opacity: f32,
+    clip: Option<DirectFrame>,
     regions: Option<Vec<Region>>,
     pub(super) ready: bool,
 }
@@ -241,6 +242,7 @@ pub(super) struct ScenePlacement {
     pub id: usize,
     pub frame: DirectFrame,
     pub opacity: f32,
+    pub clip: Option<DirectFrame>,
 }
 
 fn scene_image(gpu: &'static Gpu, source: PresentSource) -> Result<Arc<BackingImageLease>, String> {
@@ -303,6 +305,30 @@ unsafe fn scene_sync(
     }
 }
 
+/// Does a retained ancestor clipping rectangle fully contain the drawable?
+/// Only then may a full-window image bypass scene composition.
+pub(super) fn scene_clip_contains(clip: &appkit::view::Frame, frame: &appkit::view::Frame) -> bool {
+    i64::from(clip.x) <= i64::from(frame.x)
+        && i64::from(clip.y) <= i64::from(frame.y)
+        && i64::from(clip.x) + i64::from(clip.width) >= i64::from(frame.x) + i64::from(frame.width)
+        && i64::from(clip.y) + i64::from(clip.height)
+            >= i64::from(frame.y) + i64::from(frame.height)
+}
+
+fn intersection_for_scene(a: &appkit::view::Frame, b: &appkit::view::Frame) -> appkit::view::Frame {
+    let left = i64::from(a.x).max(i64::from(b.x));
+    let top = i64::from(a.y).max(i64::from(b.y));
+    let right = (i64::from(a.x) + i64::from(a.width)).min(i64::from(b.x) + i64::from(b.width));
+    let bottom = (i64::from(a.y) + i64::from(a.height)).min(i64::from(b.y) + i64::from(b.height));
+    appkit::view::Frame {
+        x: left.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: top.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width: right.saturating_sub(left).clamp(0, i64::from(u32::MAX)) as u32,
+        height: bottom.saturating_sub(top).clamp(0, i64::from(u32::MAX)) as u32,
+        ..*a
+    }
+}
+
 impl Swapchain {
     pub(super) fn note_scene_frame(&mut self, id: usize, frame: &appkit::view::Frame) {
         if let Some((_, previous)) = self.scene_frames.iter_mut().find(|(known, _)| *known == id) {
@@ -358,9 +384,13 @@ impl Swapchain {
                 .iter_mut()
                 .find(|scene| scene.id == placement.id)
             {
-                if scene.frame != placement.frame || scene.opacity != placement.opacity {
+                if scene.frame != placement.frame
+                    || scene.opacity != placement.opacity
+                    || scene.clip != placement.clip
+                {
                     scene.frame = placement.frame;
                     scene.opacity = placement.opacity;
+                    scene.clip = placement.clip;
                     changed = true;
                 }
             }
@@ -376,6 +406,13 @@ impl Swapchain {
             self.scene_repaint_needed = true;
         }
         changed
+    }
+
+    fn scene_clip(&self, id: usize) -> Option<DirectFrame> {
+        self.scene_placements
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.clip)
     }
 
     fn scene_opacity(&self, id: usize) -> f32 {
@@ -395,7 +432,12 @@ impl Swapchain {
         source: PresentSource,
         regions: Option<&[Region]>,
     ) -> Result<ScenePrepared, String> {
-        if self.layers.len() <= 1 && self.scene_layers.is_empty() {
+        // A clipped single layer cannot take the historical full-frame blit
+        // path: the accumulator must remain transparent outside its ancestor.
+        let source_is_clipped = self
+            .scene_clip(id)
+            .is_some_and(|clip| !scene_clip_contains(&clip.frame(), frame));
+        if self.layers.len() <= 1 && self.scene_layers.is_empty() && !source_is_clipped {
             return Ok(ScenePrepared::SingleLayer);
         }
         if self.layers.len() > MAX_SCENE_LAYERS {
@@ -490,11 +532,13 @@ impl Swapchain {
                 snapshot,
                 spare: Vec::new(),
                 opacity: self.scene_opacity(old),
+                clip: self.scene_clip(old),
                 regions: None,
                 ready: false,
             });
         }
         let opacity = self.scene_opacity(id);
+        let clip = self.scene_clip(id);
         if let Some(existing) = existing {
             let layer = &mut self.scene_layers[existing];
             if !Arc::ptr_eq(&layer.snapshot, &fresh) {
@@ -517,6 +561,7 @@ impl Swapchain {
             }
             layer.frame = DirectFrame::from_frame(frame);
             layer.opacity = opacity;
+            layer.clip = clip;
             layer.regions = regions.map(|r| r.to_vec());
             layer.ready = false;
         } else {
@@ -526,6 +571,7 @@ impl Swapchain {
                 snapshot: fresh,
                 spare: Vec::new(),
                 opacity,
+                clip,
                 regions: regions.map(|r| r.to_vec()),
                 ready: false,
             });
@@ -730,7 +776,21 @@ impl Swapchain {
             )?;
             scene_index += 1;
             let frame = scene.frame.frame();
-            let draw = |clip: &appkit::view::Frame| {
+            let window_clip = appkit::view::Frame {
+                x: 0,
+                y: 0,
+                width: self.extent.width,
+                height: self.extent.height,
+                ..frame
+            };
+            let draw = |area: &appkit::view::Frame| {
+                // Clamp dispatch dimensions to actual physical window pixels,
+                // rather than wasting an unbounded number of GPU workgroups
+                // for an offscreen or oversized guest layout rectangle.
+                let clip = intersection_for_scene(area, &window_clip);
+                let clip = scene.clip.map_or(clip, |ancestor| {
+                    intersection_for_scene(&clip, &ancestor.frame())
+                });
                 let placement = crate::overlay::Placement {
                     x: frame.x,
                     y: frame.y,
@@ -816,7 +876,10 @@ impl Swapchain {
                     scene.regions.as_deref(),
                     self.corners.is_some(),
                     true,
-                ) {
+                ) && scene
+                    .clip
+                    .is_none_or(|clip| scene_clip_contains(&clip.frame(), &frame))
+                {
                     let snapshot = Arc::clone(&scene.snapshot);
                     let source = PresentSource::from(&snapshot.image);
                     self.queue_direct(

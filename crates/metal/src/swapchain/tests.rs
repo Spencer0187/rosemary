@@ -16,6 +16,7 @@ fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
             id,
             frame,
             opacity: 1.0,
+            clip: None,
         }]
     };
     let pending = Mutex::new(None);
@@ -2686,6 +2687,143 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
     gpu.destroy_image(source);
 }
 
+/// Clipping a single full-window Metal layer must not route it through the
+/// unmasked legacy blit or the direct WSI fast path. Outside its ancestor's
+/// rectangle the window accumulator must stay transparent.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn one_layer_with_clipping_parent_keeps_outside_pixels_transparent() {
+    if isolate_vulkan_graphical_test(
+        "one_layer_with_clipping_parent_keeps_outside_pixels_transparent",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, image, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    match std::env::var("ROSEMARY_METAL_PRESENTATION_MODE").as_deref() {
+        Ok("immediate") => assert_eq!(state.present_mode, vk::PresentModeKHR::IMMEDIATE),
+        Ok("mailbox") => assert_eq!(state.present_mode, vk::PresentModeKHR::MAILBOX),
+        _ => {}
+    }
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            image.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 0.0, 1.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .expect("blue guest drawable");
+    let clip = appkit::view::Frame {
+        x: 20,
+        y: 15,
+        width: 45,
+        height: 35,
+        ..whole
+    };
+    state.layers.push(1);
+    state.synchronize_scene(
+        window as usize,
+        &[ScenePlacement {
+            id: 1,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+            clip: Some(DirectFrame::from_frame(&clip)),
+        }],
+    );
+    assert_eq!(
+        state.stage_composite_layer(1, &whole, &image, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.idle();
+    assert_eq!(
+        state.scene_layers.len(),
+        1,
+        "single clipped layer bypassed the scene compositor"
+    );
+    let composite = state
+        .composite
+        .as_ref()
+        .expect("clipped window image")
+        .image;
+    let buffer = gpu
+        .create_buffer(u64::from(whole.window_width) * u64::from(whole.window_height) * 4)
+        .expect("GPU readback");
+    gpu.one_shot(|device, cb| unsafe {
+        let sync = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(composite)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[sync],
+        );
+        device.cmd_copy_image_to_buffer(
+            cb,
+            composite,
+            vk::ImageLayout::GENERAL,
+            buffer.buffer,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: whole.window_width,
+                    height: whole.window_height,
+                    depth: 1,
+                })],
+        );
+    })
+    .expect("read back clipped window");
+    let pixel = |x: usize, y: usize| {
+        let at = (y * whole.window_width as usize + x) * 4;
+        unsafe { std::slice::from_raw_parts(buffer.contents.add(at), 4) }.to_vec()
+    };
+    assert_eq!(
+        pixel(4, 4),
+        [0, 0, 0, 0],
+        "out-of-clip pixels were incorrectly composited"
+    );
+    assert_eq!(
+        pixel(30, 25),
+        [0, 0, 255, 255],
+        "inside-clipped blue layer disappeared"
+    );
+    gpu.destroy_buffer(buffer);
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
+}
+
 /// A background can submit another drawable after an opaque foreground
 /// overlay stops submitting. The *pixels*, not just layer-count metadata,
 /// must still contain the static foreground after the background update.
@@ -2851,12 +2989,14 @@ fn static_foreground_survives_repeated_background_submissions() {
             ScenePlacement {
                 id: 1,
                 frame: DirectFrame::from_frame(&whole),
-                opacity: 1.0
+                opacity: 1.0,
+                clip: None,
             },
             ScenePlacement {
                 id: 2,
                 frame: DirectFrame::from_frame(&foreground),
-                opacity: 0.5
+                opacity: 0.5,
+                clip: None,
             },
         ]
     ));
@@ -2897,6 +3037,49 @@ fn static_foreground_survives_repeated_background_submissions() {
         translucent[3], 255,
         "premultiplied source-over must end opaque"
     );
+    // A clipping ancestor changes visibility without a new B drawable.
+    // Recompose just from retained GPU snapshots using B's new clip.
+    let restricted = DirectFrame::from_frame(&appkit::view::Frame {
+        x: foreground.x + 14,
+        y: foreground.y + 10,
+        width: 30,
+        height: 20,
+        ..foreground
+    });
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[
+            ScenePlacement {
+                id: 1,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                clip: None
+            },
+            ScenePlacement {
+                id: 2,
+                frame: DirectFrame::from_frame(&foreground),
+                opacity: 0.5,
+                clip: Some(restricted)
+            },
+        ]
+    ));
+    assert!(
+        state
+            .redisplay_scene(window as usize)
+            .expect("clip changed without new drawable")
+    );
+    state.idle();
+    fetch();
+    assert_eq!(
+        pixel(35, 35),
+        [0, 0, 255, 255],
+        "pixels outside ancestor bounds leaked from static foreground"
+    );
+    let inside = pixel(55, 35);
+    assert_eq!(inside[0], 0);
+    assert!((126..=129).contains(&inside[1]));
+    assert!((126..=129).contains(&inside[2]));
+    assert_eq!(inside[3], 255);
     gpu.destroy_buffer(read);
     drop(state);
     gpu.destroy_image(background);
@@ -3219,6 +3402,7 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
             id: 1,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
+            clip: None,
         }]
     ));
     assert_eq!(state.layers, [1]);

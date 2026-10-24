@@ -338,6 +338,7 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
             id: layer.layer,
             frame: DirectFrame::from_frame(&layer.frame),
             opacity: layer.opacity,
+            clip: layer.clip.map(|frame| DirectFrame::from_frame(&frame)),
         })
         .collect();
     *entry.pending_scene.lock().expect("AppKit scene pending") = Some(ordered);
@@ -1311,6 +1312,7 @@ fn present_impl(
                 id: item.layer,
                 frame: DirectFrame::from_frame(&item.frame),
                 opacity: item.opacity,
+                clip: item.clip.map(|frame| DirectFrame::from_frame(&frame)),
             })
             .collect::<Vec<_>>()
     });
@@ -1377,7 +1379,12 @@ fn present_impl(
             regions.as_deref(),
             swapchain.corners.is_some(),
             owner.0.is_some() || backing.is_some(),
-        );
+        ) && swapchain
+            .scene_placements
+            .iter()
+            .find(|placement| placement.id == layer)
+            .and_then(|placement| placement.clip)
+            .is_none_or(|clip| scene::scene_clip_contains(&clip.frame(), frame));
         let converting = !direct && swapchain.direct.is_some();
         let converted = if converting {
             swapchain.stage_direct_snapshot(true)

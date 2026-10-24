@@ -230,6 +230,12 @@ fn root_of(layer: Id) -> Id {
 /// A superlayer's visibility and opacity apply to its entire subtree, just as
 /// an enclosing NSView's properties do. Traverse a single immutable snapshot
 /// under one lock to avoid mixing two layer-tree revisions.
+/// Whether this CA layer clips the sublayers/views it contains. The AppKit
+/// scene snapshots the boolean on its mutator thread, not on the GPU worker.
+pub(crate) fn scene_masks_to_bounds(layer: Id) -> bool {
+    read_node(layer, |node| node.is_some_and(|node| node.masks_to_bounds))
+}
+
 pub(crate) fn scene_hidden(layer: Id) -> bool {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(nodes) = nodes.as_ref() else {
