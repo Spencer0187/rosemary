@@ -348,6 +348,25 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
                     radius: clip.radius,
                 })
                 .collect(),
+            occluded: Some(
+                layer
+                    .occluded
+                    .into_iter()
+                    .map(|r| Region {
+                        x: r.x,
+                        y: r.y,
+                        width: r.width.min(i32::MAX as u32) as i32,
+                        height: r.height.min(i32::MAX as u32) as i32,
+                    })
+                    .collect(),
+            ),
+            native: native_scene_source(
+                layer.native_pixels,
+                layer.native_dmabuf,
+                layer.native_revision,
+                layer.frame.width,
+                layer.frame.height,
+            ),
         })
         .collect();
     *entry.pending_scene.lock().expect("AppKit scene pending") = Some(ordered);
@@ -1331,6 +1350,24 @@ fn present_impl(
                         radius: clip.radius,
                     })
                     .collect(),
+                occluded: Some(
+                    item.occluded
+                        .into_iter()
+                        .map(|r| Region {
+                            x: r.x,
+                            y: r.y,
+                            width: r.width.min(i32::MAX as u32) as i32,
+                            height: r.height.min(i32::MAX as u32) as i32,
+                        })
+                        .collect(),
+                ),
+                native: native_scene_source(
+                    item.native_pixels,
+                    item.native_dmabuf,
+                    item.native_revision,
+                    item.frame.width,
+                    item.frame.height,
+                ),
             })
             .collect::<Vec<_>>()
     });
@@ -1354,7 +1391,9 @@ fn present_impl(
     // over any other hole the source is still what the window shows.
     let holes: Vec<Region> = holes
         .iter()
-        .filter(|(owner, _)| *owner != layer && swapchain.layers.contains(owner))
+        .filter(|(owner, _)| {
+            *owner != layer && (*owner == window || swapchain.layers.contains(owner))
+        })
         .map(|(_, region)| *region)
         .collect();
     // In the retained scene the CPU backing store is the bottom layer,
@@ -1362,7 +1401,11 @@ fn present_impl(
     // describe Metal coverage, not true occlusion. Conversely, the Metal
     // drawable's holes describe opaque AppKit views above it and must still
     // be respected to keep native controls in front of the guest drawable.
-    let regions = scene_regions(layer, window, live_scene.is_some(), frame, &holes);
+    let regions = if live_scene.is_some() && layer != window {
+        swapchain.live_scene_regions(layer, frame)
+    } else {
+        scene_regions(layer, window, live_scene.is_some(), frame, &holes)
+    };
     // Core Animation combines independent layers into one window image.
     // Host WSI presentation mode only determines how that completed image
     // reaches the display; never enqueue one host present per Metal layer.
@@ -1604,6 +1647,10 @@ fn fast_direct_scene(
         swapchain.corners.is_some(),
         owned,
     ) && !appkit::view::metal_scene_pending()
+        && !swapchain
+            .scene_placements
+            .iter()
+            .any(|p| p.id != layer && p.native.is_some())
         && swapchain.scene_opacity(layer) >= 1.0
         && swapchain.scene_opaque(layer)
         && swapchain.scene_rounded(layer).is_empty()
@@ -1652,6 +1699,161 @@ fn requeue_scene(pending: &Mutex<Option<Vec<ScenePlacement>>>, consumed: Vec<Sce
         .lock()
         .expect("AppKit scene pending")
         .get_or_insert(consumed);
+}
+
+/// A DMA-BUF-only native view needs a transparent source below its imported
+/// image. Cap the pixel allocation so an invalid/oversized guest geometry can
+/// never allocate unbounded process memory on the event thread.
+fn native_scene_source(
+    pixels: Option<Arc<Vec<u8>>>,
+    dmabuf: Option<Arc<appkit::backing::Dmabuf>>,
+    revision: u64,
+    width: u32,
+    height: u32,
+) -> Option<scene::NativeCpuSceneSource> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)?;
+    if bytes == 0 || bytes > 64 * 1024 * 1024 {
+        return None;
+    }
+    let pixels = match (pixels, dmabuf.as_ref()) {
+        (Some(pixels), _) if pixels.len() as u64 == bytes => pixels,
+        (None, Some(_)) => Arc::new(vec![0u8; bytes as usize]),
+        _ => return None,
+    };
+    Some(scene::NativeCpuSceneSource {
+        bytes: pixels,
+        revision,
+        dmabuf,
+    })
+}
+
+/// Upload native AppKit pixels exclusively on the window's worker, then copy
+/// to the same fence-retained scene snapshot used for Metal drawables. AppKit
+/// publishes immutable bytes but never blocks on a Vulkan queue.
+fn stage_native_scene_source(
+    state: &mut Swapchain,
+    layer: &ScenePlacement,
+) -> Result<bool, String> {
+    let Some(native) = layer.native.as_ref() else {
+        return Ok(true);
+    };
+    // A direct WSI source is not a retained scene image. Materialize it
+    // *before* recording the newly appearing native layer, or the latter's
+    // transparent regions will permanently erase the still-static Metal
+    // drawable. A busy frame must defer the entire scene transaction.
+    if state.direct.is_some() && state.stage_direct_snapshot(true)? != Some(true) {
+        return Ok(false);
+    }
+    if state.scene_layers.iter().any(|s| {
+        s.id == layer.id
+            && s.ready
+            && s.native_revision == Some(native.revision)
+            && s.snapshot.image.width == layer.frame.width
+            && s.snapshot.image.height == layer.frame.height
+    }) {
+        return Ok(true);
+    }
+    let frame = layer.frame.frame();
+    if frame.width == 0
+        || frame.height == 0
+        || u64::from(frame.width)
+            .saturating_mul(u64::from(frame.height))
+            .saturating_mul(4)
+            != native.bytes.len() as u64
+    {
+        return Err("invalid native AppKit scene pixel extent".into());
+    }
+    let gpu = state.gpu;
+    let image = gpu.create_image(&ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: frame.width,
+        height: frame.height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    })?;
+    let lease = BackingImageLease::new(gpu, image);
+    let staging = gpu.create_buffer(native.bytes.len() as u64)?;
+    unsafe {
+        std::ptr::copy_nonoverlapping(native.bytes.as_ptr(), staging.contents, native.bytes.len())
+    };
+    let upload = gpu.one_shot(|device, cb| unsafe {
+        device.cmd_copy_buffer_to_image(
+            cb,
+            staging.buffer,
+            lease.image.image,
+            vk::ImageLayout::GENERAL,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: frame.width,
+                    height: frame.height,
+                    depth: 1,
+                })],
+        );
+    });
+    gpu.destroy_buffer(staging);
+    upload?;
+    // The existing DMA-BUF importer already validates external memory and
+    // performs acquire/release barriers. Render onto a transparent (or CPU
+    // backed) native source *before* staging that source as an ordered scene
+    // layer. A failed import cannot be silently treated as transparent.
+    let blended = if let Some(picture) = native.dmabuf.as_ref() {
+        let mut description = crate::overlay::target_description(frame.width, frame.height);
+        description.usage |= gpu::USAGE_SHADER_READ;
+        let output = BackingImageLease::new(gpu, gpu.create_image(&description)?);
+        let overlay = [appkit::backing::GpuOverlay {
+            picture: Arc::clone(picture),
+            rect: appkit::backing::Rect {
+                x: 0,
+                y: 0,
+                width: i64::from(frame.width),
+                height: i64::from(frame.height),
+            },
+        }];
+        if !crate::overlay::blend(gpu, &lease.image, &output.image, &overlay)?.is_empty() {
+            appkit::backing::refuse_dmabufs(frame.window);
+            return Ok(false);
+        }
+        Some(output)
+    } else {
+        None
+    };
+    let source = blended.as_ref().unwrap_or(&lease);
+    let joined = !state.layers.contains(&layer.id);
+    if joined {
+        state.layers.push(layer.id);
+    }
+    let mut owner = SourceOwner(None);
+    let staged =
+        state.stage_composite_layer(layer.id, &frame, &source.image, None, &mut owner, true);
+    if !matches!(staged, Ok(Some(true))) {
+        if joined {
+            state.layers.retain(|&id| id != layer.id);
+        }
+        return staged.map(|_| false);
+    }
+    let slot = state.frame.wrapping_sub(1) % state.frames.len();
+    debug_assert!(state.frames[slot].backing.is_none());
+    state.frames[slot].backing = Some(blended.unwrap_or(lease));
+    if let Some(scene) = state.scene_layers.iter_mut().find(|s| s.id == layer.id) {
+        scene.native_revision = Some(native.revision);
+    }
+    state.note_scene_frame(layer.id, &frame);
+    Ok(true)
 }
 
 fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
@@ -1723,29 +1925,58 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             let mut device_lost = false;
             if let Some(live) = snapshot {
                 let mut state = entry.state.lock().expect("window swapchain");
+                // New native source placements must be authoritative before
+                // their first GPU staging (including opacity and CA masks).
                 state.synchronize_scene(window, &live);
-                if state.scene_repaint_needed {
-                    match state.redisplay_scene(window) {
-                        Ok(true) => {
-                            state.scene_repaint_needed = false;
-                            wake_compositor_worker(&entry);
-                        }
+                let mut native_ready = true;
+                for layer in live.iter().filter(|p| p.native.is_some()) {
+                    match stage_native_scene_source(&mut state, layer) {
+                        Ok(true) => {}
                         Ok(false) => {
-                            // An unfinished staging fence cannot consume the
-                            // only notification for a visibility change.
-                            requeue_scene(&entry.pending_scene, live);
-                            retry_delay = Some(Duration::from_millis(1));
+                            native_ready = false;
+                            break;
                         }
-                        Err(error) => {
-                            gpu::trace(format!("recomposing changed layer tree failed: {error}"));
-                            device_lost = error.contains("ERROR_DEVICE_LOST")
+                        Err(reason) => {
+                            gpu::trace(format!("native AppKit scene staging failed: {reason}"));
+                            device_lost = reason.contains("ERROR_DEVICE_LOST")
                                 || entry.gpu.lost.load(Ordering::Acquire);
-                            if !device_lost {
-                                // A transient recording/submission error must
-                                // not discard scene-only damage. Keep any
-                                // newer AppKit snapshot ahead of this retry.
+                            native_ready = false;
+                            break;
+                        }
+                    }
+                }
+                if !native_ready {
+                    if !device_lost {
+                        requeue_scene(&entry.pending_scene, live);
+                        retry_delay = Some(Duration::from_millis(10));
+                    }
+                } else {
+                    state.synchronize_scene(window, &live);
+                    if state.scene_repaint_needed {
+                        match state.redisplay_scene(window) {
+                            Ok(true) => {
+                                state.scene_repaint_needed = false;
+                                wake_compositor_worker(&entry);
+                            }
+                            Ok(false) => {
+                                // An unfinished staging fence cannot consume the
+                                // only notification for a visibility change.
                                 requeue_scene(&entry.pending_scene, live);
-                                retry_delay = Some(Duration::from_millis(10));
+                                retry_delay = Some(Duration::from_millis(1));
+                            }
+                            Err(error) => {
+                                gpu::trace(format!(
+                                    "recomposing changed layer tree failed: {error}"
+                                ));
+                                device_lost = error.contains("ERROR_DEVICE_LOST")
+                                    || entry.gpu.lost.load(Ordering::Acquire);
+                                if !device_lost {
+                                    // A transient recording/submission error must
+                                    // not discard scene-only damage. Keep any
+                                    // newer AppKit snapshot ahead of this retry.
+                                    requeue_scene(&entry.pending_scene, live);
+                                    retry_delay = Some(Duration::from_millis(10));
+                                }
                             }
                         }
                     }
@@ -1985,11 +2216,12 @@ impl Swapchain {
             return Ok(None);
         };
         let mut owner = SourceOwner(direct.owner.take());
+        let regions = self.live_scene_regions(direct.layer, &direct.frame.frame());
         let result = self.stage_composite_source(
             direct.layer,
             &direct.frame.frame(),
             direct.source,
-            None,
+            regions.as_deref(),
             &mut owner,
             nonblocking,
         );

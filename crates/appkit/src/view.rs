@@ -102,6 +102,14 @@ pub struct MetalSceneLayer {
     /// Clip from enclosing AppKit/CA bounds, expressed in physical window pixels.
     pub clip: Option<Frame>,
     pub rounded: Vec<RoundedSceneClip>,
+    /// Live opaque AppKit/native coverage above this Metal layer, in window
+    /// pixels. The compositor must not retain coverage from a past drawable.
+    pub occluded: Vec<Frame>,
+    /// Independent CPU-backed native content stacked above a Metal layer.
+    /// None for actual CAMetalLayers. The GPU worker uploads immutable bytes.
+    pub native_pixels: Option<std::sync::Arc<Vec<u8>>>,
+    pub native_dmabuf: Option<std::sync::Arc<crate::backing::Dmabuf>>,
+    pub native_revision: u64,
 }
 
 // SAFETY: a snapshot owns only integer layer identities and a copied SDL
@@ -269,6 +277,21 @@ pub fn set_metal_scene_changed(hook: fn(sdl3::Window, Vec<MetalSceneLayer>)) {
 /// Capture visible CAMetalLayer views in the order their enclosing NSViews
 /// would paint: ancestors precede descendants, later siblings are on top.
 /// A missing AppKit window is distinct from a window with no Metal layers.
+/// Fast notification gate for CPU backing redraws: unrelated software-only
+/// windows must not initiate a global scene recapture on every `drawRect:`.
+pub(crate) fn native_metal_scene_active(window: sdl3::Window) -> bool {
+    METAL_SCENES
+        .lock()
+        .expect("AppKit scene snapshots")
+        .as_ref()
+        .and_then(|all| all.get(&(window as usize)))
+        .is_some_and(|scene| {
+            scene
+                .iter()
+                .any(|layer| layer.native_pixels.is_some() || layer.native_dmabuf.is_some())
+        })
+}
+
 pub fn metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
     METAL_SCENES
         .lock()
@@ -277,11 +300,47 @@ pub fn metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
         .and_then(|all| all.get(&(window as usize)).cloned())
 }
 
+/// Evaluate CA opacity/visibility of every NSView backing layer from the
+/// view root down. The CA superlayer chain can omit an NSView's enclosing
+/// view layer; scene_properties_below stops at that enclosing layer so the
+/// two representations of the same ancestor are not multiplied twice.
+/// This function is only valid on AppKit's event thread.
+pub(crate) fn native_scene_ca_opacity(view: Id, now: f64) -> f32 {
+    let mut chain = Vec::new();
+    let mut at = view;
+    for _ in 0..64 {
+        if at.is_null() || !is_view(at) {
+            break;
+        }
+        chain.push(at);
+        at = view_of(at).superview;
+    }
+    let mut opacity = 1.0;
+    let mut parent_layer = std::ptr::null_mut();
+    for &view in chain.iter().rev() {
+        let layer = view_of(view).layer;
+        if layer.is_null() {
+            continue;
+        }
+        let (hidden, local_opacity) =
+            crate::coreanimation::scene_properties_below(layer, parent_layer, now);
+        if hidden {
+            return 0.0;
+        }
+        opacity *= local_opacity;
+        parent_layer = layer;
+    }
+    opacity
+}
+
 /// Only invoked on the AppKit mutator thread, not from Metal's presenter.
 fn capture_metal_scene(
     window: sdl3::Window,
     now: f64,
 ) -> Option<(Vec<MetalSceneLayer>, Vec<usize>)> {
+    // CA content reads may release their last guest reference. Defer such
+    // releases until no backing/view locks are held by this capture.
+    let _owed = crate::coreanimation::defer_releases();
     let nswindow = crate::window::window_for(window);
     if nswindow.is_null() {
         return None;
@@ -289,11 +348,13 @@ fn capture_metal_scene(
     let content = crate::window::content_view_of(nswindow);
     let mut result = Vec::new();
     let mut roots = Vec::new();
+    let mut seen_metal = false;
     visit_metal_scene(
         content,
         window,
         &mut result,
         &mut roots,
+        &mut seen_metal,
         None,
         1.0,
         std::ptr::null_mut(),
@@ -301,6 +362,23 @@ fn capture_metal_scene(
         now,
         0,
     );
+    // Live native occlusion is orthogonal to drawable submission order: a
+    // toolbar may move after Metal's last present or before CPU backing exists.
+    for (layer, coverage) in crate::backing::live_metal_occlusion(window) {
+        if let Some(scene) = result.iter_mut().find(|item| item.layer == layer) {
+            scene.occluded = coverage
+                .into_iter()
+                .map(|rect| Frame {
+                    window,
+                    x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                    width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
+                    height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                    ..scene.frame
+                })
+                .collect();
+        }
+    }
     #[cfg(test)]
     METAL_SCENE_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some((result, roots))
@@ -311,6 +389,7 @@ fn visit_metal_scene(
     window: sdl3::Window,
     scene: &mut Vec<MetalSceneLayer>,
     roots: &mut Vec<usize>,
+    seen_metal: &mut bool,
     inherited_clip: Option<Frame>,
     inherited_layer_opacity: f32,
     parent_layer: Id,
@@ -367,7 +446,39 @@ fn visit_metal_scene(
                     opaque: crate::layer::opaque_of(layer),
                     clip: inherited_clip,
                     rounded: rounded.clone(),
+                    occluded: Vec::new(),
+                    native_pixels: None,
+                    native_dmabuf: None,
+                    native_revision: 0,
                 });
+                *seen_metal = true;
+            }
+        }
+    }
+    // Per-view native content needs its own source above the preceding
+    // drawable. The high bit reserves an identity namespace distinct from
+    // user-space Objective-C layer pointers and SDL window identities.
+    if *seen_metal && (layer.is_null() || !crate::layer::is_metal(layer)) {
+        if let Some(frame) = unsafe { presentation_frame(view) } {
+            if frame.window == window {
+                let cpu = crate::backing::native_scene_pixels(view, frame.width, frame.height);
+                let dma = crate::backing::native_dma_overlay(view);
+                if cpu.is_some() || dma.is_some() {
+                    let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
+                        ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
+                    scene.push(MetalSceneLayer {
+                        layer: (view as usize) | (1usize << (usize::BITS - 1)),
+                        frame,
+                        opacity: (effective_alpha(view) as f32) * layer_opacity,
+                        opaque: false,
+                        clip: inherited_clip,
+                        rounded: rounded.clone(),
+                        occluded: Vec::new(),
+                        native_pixels: cpu.map(|(pixels, _)| pixels),
+                        native_dmabuf: dma.map(|(picture, _)| picture),
+                        native_revision: revision,
+                    });
+                }
             }
         }
     }
@@ -386,6 +497,7 @@ fn visit_metal_scene(
                 window,
                 scene,
                 roots,
+                seen_metal,
                 child_clip,
                 layer_opacity,
                 if layer.is_null() { parent_layer } else { layer },
@@ -446,6 +558,10 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
                 && a.opacity == b.opacity
                 && a.opaque == b.opaque
                 && a.clip == b.clip
+                && a.occluded == b.occluded
+                && a.native_revision == b.native_revision
+                && a.native_pixels.is_some() == b.native_pixels.is_some()
+                && a.native_dmabuf.is_some() == b.native_dmabuf.is_some()
                 && a.rounded.len() == b.rounded.len()
                 && a.rounded
                     .iter()
@@ -3141,6 +3257,223 @@ mod tests {
         // SAFETY: both are objects this runtime allocated.
         unsafe { set_window(parent, window) };
         assert_eq!(unsafe { window_of(child) }, window);
+    }
+
+    #[test]
+    fn opaque_native_occlusion_responds_to_ancestor_ca_opacity() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let parent = view(rect(0.0, 0.0, 320.0, 240.0));
+        let native = view(rect(40.0, 35.0, 30.0, 25.0));
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make_metal(metal_cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), parent);
+            add_subview(parent, objc::sel::get("addSubview:"), native);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [0u8, 0, 255, 255].repeat(30 * 25),
+        );
+        let covers = || {
+            crate::backing::live_metal_occlusion(sdl)
+                .into_iter()
+                .find(|(id, _)| *id == metal as usize)
+                .unwrap()
+                .1
+        };
+        assert_eq!(
+            covers().len(),
+            1,
+            "fully opaque native pixels should occlude metal"
+        );
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let make_ca: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let ancestor = unsafe { make_ca(ca as *const _ as Id, maker) };
+        unsafe { set_layer(parent, objc::sel::get("setLayer:"), ancestor) };
+        let opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { opacity(ancestor, objc::sel::get("setOpacity:"), 0.5) };
+        assert!(
+            covers().is_empty(),
+            "fractional ancestor CA opacity incorrectly punched a metal hole"
+        );
+        unsafe { opacity(ancestor, objc::sel::get("setOpacity:"), 1.0) };
+        assert_eq!(covers().len(), 1);
+        let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { hidden(ancestor, objc::sel::get("setHidden:"), 1) };
+        assert!(
+            covers().is_empty(),
+            "hidden ancestor CA layer still occluded metal"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn native_cpu_pixels_are_separate_above_metal_and_underneath_below_it() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let native = view(rect(40.0, 35.0, 30.0, 25.0));
+        let cls = objc::class::lookup(c"CAMetalLayer").expect("CAMetalLayer");
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let metal = unsafe { make(cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), native);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [0u8, 0, 128, 128].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).expect("live AppKit Metal/native scene");
+        assert_eq!(scene.len(), 2);
+        assert_eq!(scene[0].layer, metal as usize);
+        assert_eq!(
+            scene[1].layer,
+            (native as usize) | (1usize << (usize::BITS - 1))
+        );
+        assert_eq!(scene[1].native_pixels.as_ref().unwrap().len(), 30 * 25 * 4);
+        // Software-backed view overlays follow the same above-Metal order,
+        // rather than being silently baked into the bottom CPU image.
+        crate::backing::set_overlay(
+            native,
+            crate::backing::Overlay {
+                width: 30,
+                height: 25,
+                picture: crate::backing::Picture::Pixels([0u8, 0, 64, 128].repeat(30 * 25)),
+            },
+        );
+        invalidate_metal_scene(false);
+        flush_metal_scenes();
+        let with_overlay = metal_scene(sdl).unwrap();
+        assert_eq!(
+            &with_overlay[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 127, 191]
+        );
+        crate::backing::remove_overlay(native);
+        invalidate_metal_scene(false);
+        flush_metal_scenes();
+        // Root Core Animation opacity belongs in the scene placement, not in
+        // pre-faded CPU pixels. That would double-fade CA content while view
+        // drawRect pixels remained unaffected.
+        let ordinary = objc::class::lookup(c"CALayer").expect("CALayer");
+        let native_layer = unsafe {
+            let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = std::mem::transmute(
+                ordinary
+                    .metaclass()
+                    .method(objc::sel::get("layer"))
+                    .unwrap()
+                    .implementation(),
+            );
+            make(ordinary as *const _ as Id, objc::sel::get("layer"))
+        };
+        unsafe { set_layer(native, objc::sel::get("setLayer:"), native_layer) };
+        unsafe { crate::coreanimation::set_opacity_for_test(native_layer, 0.5) };
+        flush_metal_scenes();
+        let faded = metal_scene(sdl).unwrap();
+        assert!((faded[1].opacity - 0.5).abs() <= f32::EPSILON);
+        assert_eq!(
+            &faded[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 128, 128]
+        );
+        unsafe { crate::coreanimation::set_opacity_for_test(native_layer, 1.0) };
+        flush_metal_scenes();
+        let flat = crate::backing::Store::new(320, 240);
+        let underneath = crate::backing::gpu_under_metal(sdl, &flat)
+            .expect("native top view requires separately composited bottom source");
+        let old = scene[1].frame;
+        let pixel = &underneath.pixels[(old.y as usize * 320 + old.x as usize) * 4..][..4];
+        assert_eq!(
+            pixel,
+            &[237, 237, 237, 255],
+            "translucent top native pixels were incorrectly baked under Metal"
+        );
+        unsafe {
+            set_frame_origin(
+                native,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: 90.0, y: 60.0 },
+            )
+        };
+        flush_metal_scenes();
+        let moved = metal_scene(sdl).unwrap();
+        assert_ne!(moved[1].frame.x, old.x);
+        assert_eq!(moved[1].native_revision, scene[1].native_revision);
+        unsafe {
+            add_subview_positioned(
+                content,
+                objc::sel::get("addSubview:positioned:relativeTo:"),
+                native,
+                ORDER_BELOW,
+                metal_view,
+            )
+        };
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .map(|p| p.layer)
+                .collect::<Vec<_>>(),
+            [metal as usize],
+            "native content below Metal must remain in the base backing"
+        );
+        assert!(crate::backing::gpu_under_metal(sdl, &flat).is_none());
+        unsafe { remove_from_superview(native, objc::sel::get("removeFromSuperview")) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 1);
+        objc::arc::release(window);
     }
 
     /// The compositor consumes authoritative live AppKit order, not the order

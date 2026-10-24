@@ -19,6 +19,8 @@ fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     };
     let pending = Mutex::new(None);
@@ -2825,6 +2827,8 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }],
     );
     assert_eq!(
@@ -2878,6 +2882,8 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
@@ -2908,6 +2914,8 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
@@ -2932,6 +2940,8 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
                 opaque: true,
                 clip: None,
                 rounded: Vec::new(),
+                occluded: None,
+                native: None,
             },
             ScenePlacement {
                 id,
@@ -2940,6 +2950,8 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
                 opaque: true,
                 clip: None,
                 rounded: Vec::new(),
+                occluded: None,
+                native: None,
             },
         ]
     ));
@@ -3204,6 +3216,8 @@ fn fifo_flattened_static_drawable_recomposes_after_ca_mask_change() {
         opaque: true,
         clip: None,
         rounded: vec![],
+        occluded: None,
+        native: None,
     };
     state.layers.push(id);
     state.synchronize_scene(window as usize, &[base.clone()]);
@@ -3348,6 +3362,8 @@ fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
                 opaque: true,
                 clip: None,
                 rounded: vec![],
+                occluded: None,
+                native: None,
             },
             ScenePlacement {
                 id: foreground,
@@ -3356,6 +3372,8 @@ fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
                 opaque: false,
                 clip: None,
                 rounded: vec![],
+                occluded: None,
+                native: None,
             },
         ],
     );
@@ -3402,6 +3420,456 @@ fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
     drop(state);
     gpu.destroy_image(bottom);
     gpu.destroy_image(top);
+    sdl3::video::destroy_window(window);
+}
+
+/// Independent native CPU pixels must be composited *above* or *below*
+/// a static Metal drawable according to AppKit order, including alpha blend
+/// and later geometry removal without another Metal drawable submission.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn independent_translucent_native_scene_respects_metal_order_and_motion() {
+    if isolate_vulkan_graphical_test(
+        "independent_translucent_native_scene_respects_metal_order_and_motion",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let metal_id = 900usize;
+    let native_id = (1usize << (usize::BITS - 1)) | 1234;
+    let native_frame = appkit::view::Frame {
+        x: 40,
+        y: 35,
+        width: 30,
+        height: 25,
+        ..whole
+    };
+    let red: Vec<u8> =
+        [0u8, 0, 128, 128].repeat((native_frame.width * native_frame.height) as usize);
+    let native_source = scene::NativeCpuSceneSource {
+        bytes: Arc::new(red),
+        revision: 1,
+        dmabuf: None,
+    };
+    let metal_placement = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let native_placement = ScenePlacement {
+        id: native_id,
+        frame: DirectFrame::from_frame(&native_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(native_source),
+    };
+    state.layers.push(metal_id);
+    state.synchronize_scene(
+        window as usize,
+        &[metal_placement.clone(), native_placement.clone()],
+    );
+    assert_eq!(
+        state.stage_composite_layer(
+            metal_id,
+            &whole,
+            &metal,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(metal_id, &whole);
+    assert_eq!(
+        stage_native_scene_source(&mut state, &native_placement),
+        Ok(true)
+    );
+    state.synchronize_scene(
+        window as usize,
+        &[metal_placement.clone(), native_placement.clone()],
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let pixel = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            x,
+            y,
+        )
+    };
+    let above = pixel(&state, 45, 40);
+    for (actual, expected) in above.iter().zip([128u8, 127, 0, 255]) {
+        assert!(
+            (i32::from(*actual) - i32::from(expected)).abs() <= 2,
+            "native alpha was not blended over metal: {above:?}"
+        );
+    }
+    assert_eq!(pixel(&state, 90, 50), [0, 255, 0, 255]);
+    // The very same native source *below* an opaque Metal drawable is hidden.
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[native_placement.clone(), metal_placement.clone()]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(pixel(&state, 45, 40), [0, 255, 0, 255]);
+    // Return to above, then move the native view without changing its bytes.
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[metal_placement.clone(), native_placement.clone()]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let moved_frame = appkit::view::Frame {
+        x: 80,
+        y: 60,
+        ..native_frame
+    };
+    let moved = ScenePlacement {
+        frame: DirectFrame::from_frame(&moved_frame),
+        ..native_placement.clone()
+    };
+    assert!(state.synchronize_scene(window as usize, &[metal_placement.clone(), moved]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(pixel(&state, 45, 40), [0, 255, 0, 255]);
+    let relocated = pixel(&state, 90, 70);
+    assert!(
+        (i32::from(relocated[0]) - 128).abs() <= 2 && (i32::from(relocated[1]) - 127).abs() <= 2
+    );
+    // A DMA-BUF's revision can remain unchanged while AppKit resizes its
+    // native placement. Source dimensions must still be reuploaded.
+    let resized_frame = appkit::view::Frame {
+        width: 20,
+        height: 18,
+        ..moved_frame
+    };
+    let resized = ScenePlacement {
+        frame: DirectFrame::from_frame(&resized_frame),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(
+                [0u8, 0, 128, 128].repeat((resized_frame.width * resized_frame.height) as usize),
+            ),
+            revision: 1,
+            dmabuf: None,
+        }),
+        ..native_placement
+    };
+    state.synchronize_scene(window as usize, &[metal_placement.clone(), resized.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &resized), Ok(true));
+    state.synchronize_scene(window as usize, &[metal_placement.clone(), resized.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = &state
+        .scene_layers
+        .iter()
+        .find(|s| s.id == native_id)
+        .unwrap()
+        .snapshot
+        .image;
+    assert_eq!(
+        (image.width, image.height),
+        (resized_frame.width, resized_frame.height)
+    );
+    assert!(i32::from(pixel(&state, 90, 70)[0]).abs_diff(128) <= 2);
+    assert!(state.synchronize_scene(window as usize, &[metal_placement]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    // With only one opaque Metal source left, IMMEDIATE/MAILBOX may restore
+    // direct WSI instead of rewriting the now-unreferenced accumulator.
+    let displayed = state
+        .direct
+        .as_ref()
+        .map_or(state.composite.as_ref().unwrap().image, |direct| {
+            direct.source.image
+        });
+    assert_eq!(
+        read_scene_pixel(gpu, displayed, whole.width, whole.height, 90, 70),
+        [0, 255, 0, 255]
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// A native UI layer appearing after a static *direct WSI* Metal frame must
+/// force a retained snapshot of that direct source before uploading the UI.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
+    if isolate_vulkan_graphical_test(
+        "native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, green, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            green.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let metal_id = 991usize;
+    let metal_placement = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.push(metal_id);
+    state.synchronize_scene(window as usize, &[metal_placement.clone()]);
+    state.queue_direct(
+        metal_id,
+        &whole,
+        PresentSource::from(&green),
+        &mut SourceOwner(None),
+        None,
+    );
+    assert!(state.direct.is_some());
+    // The production present path also records the original Metal frame.
+    state.note_scene_frame(metal_id, &whole);
+    let child_frame = appkit::view::Frame {
+        x: 40,
+        y: 35,
+        width: 30,
+        height: 25,
+        ..whole
+    };
+    let native = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 992,
+        frame: DirectFrame::from_frame(&child_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(
+                [0u8, 0, 128, 128].repeat((child_frame.width * child_frame.height) as usize),
+            ),
+            revision: 1,
+            dmabuf: None,
+        }),
+    };
+    state.synchronize_scene(window as usize, &[metal_placement, native.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &native), Ok(true));
+    state.synchronize_scene(
+        window as usize,
+        &[
+            ScenePlacement {
+                id: metal_id,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                opaque: true,
+                clip: None,
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: None,
+            },
+            native,
+        ],
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let composite = state.composite.as_ref().unwrap();
+    assert_eq!(
+        read_scene_pixel(gpu, composite.image, whole.width, whole.height, 90, 50),
+        [0, 255, 0, 255],
+        "native source discarded the static WSI drawable during transition"
+    );
+    let native_pixel = read_scene_pixel(gpu, composite.image, whole.width, whole.height, 45, 40);
+    assert!(
+        (i32::from(native_pixel[0]) - 128).abs() <= 2
+            && (i32::from(native_pixel[1]) - 127).abs() <= 2,
+        "native overlay was not source-over green: {native_pixel:?}"
+    );
+    drop(state);
+    gpu.destroy_image(green);
+    sdl3::video::destroy_window(window);
+}
+
+/// A native opaque view is an authoritative occlusion source even before
+/// a CPU backing store has arrived. Moving/removing it must repaint a static
+/// retained Metal image without a new Metal drawable submission.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
+    if isolate_vulkan_graphical_test(
+        "live_native_occlusion_updates_without_new_drawable_or_initial_backing",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let id = 707usize;
+    let blocked = Region {
+        x: 12,
+        y: 17,
+        width: 35,
+        height: 30,
+    };
+    let placement = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![blocked]),
+        native: None,
+    };
+    state.layers.push(id);
+    state.synchronize_scene(window as usize, &[placement.clone()]);
+    assert!(state.live_scene_regions(id, &whole).is_some());
+    if matches!(
+        state.present_mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) {
+        assert!(
+            !fast_direct_scene(
+                &state,
+                id,
+                &whole,
+                state.live_scene_regions(id, &whole).as_deref(),
+                true
+            ),
+            "native covering view absent from fast WSI eligibility before any backing upload"
+        );
+    }
+    assert!(
+        !state.layers.contains(&(window as usize)),
+        "test backing store had registered too early"
+    );
+    let regions = state.live_scene_regions(id, &whole);
+    assert_eq!(
+        state.stage_composite_layer(
+            id,
+            &whole,
+            &metal,
+            regions.as_deref(),
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(id, &whole);
+    state.idle();
+    let pixel = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(pixel(&state, 20, 20), [0, 0, 0, 0]);
+    assert_eq!(pixel(&state, 90, 50), [0, 255, 0, 255]);
+    let moved = ScenePlacement {
+        occluded: Some(vec![Region {
+            x: 85,
+            y: 40,
+            width: 30,
+            height: 35,
+        }]),
+        ..placement.clone()
+    };
+    assert!(state.synchronize_scene(window as usize, &[moved.clone()]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        pixel(&state, 20, 20),
+        [0, 255, 0, 255],
+        "moved native view left a stale hole"
+    );
+    assert_eq!(
+        pixel(&state, 90, 50),
+        [0, 0, 0, 0],
+        "new opaque native view area reveals Metal"
+    );
+    let removed = ScenePlacement {
+        occluded: Some(vec![]),
+        ..moved
+    };
+    assert!(state.synchronize_scene(window as usize, &[removed]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    // Unoccluded IMMEDIATE/MAILBOX may restore direct WSI rather than keep a
+    // freshly composited accumulator. Check content only if still retained.
+    if state.direct.is_none() {
+        assert_eq!(pixel(&state, 90, 50), [0, 255, 0, 255]);
+    }
+    drop(state);
+    gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
 
@@ -3452,6 +3920,8 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
         opaque: true,
         clip: None,
         rounded: vec![],
+        occluded: None,
+        native: None,
     };
     state.layers.push(id);
     state.synchronize_scene(window as usize, &[base.clone()]);
@@ -3617,6 +4087,8 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
                 frame: first,
                 radius: 30.0,
             }],
+            occluded: None,
+            native: None,
         }],
     );
     assert!(
@@ -3674,6 +4146,8 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
                     radius: 20.0
                 },
             ],
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
@@ -3707,6 +4181,8 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
             opaque: true,
             clip: Some(second),
             rounded: nested,
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
@@ -3826,6 +4302,8 @@ fn translucent_metal_composites_over_complete_cpu_store() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }],
     );
     assert_eq!(
@@ -3859,6 +4337,8 @@ fn translucent_metal_composites_over_complete_cpu_store() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.redisplay_scene(cpu_id), Ok(true));
@@ -3947,6 +4427,8 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
@@ -3978,6 +4460,8 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
             opaque: false,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     ));
     gpu.one_shot(|device, cb| unsafe {
@@ -4298,6 +4782,8 @@ fn one_layer_with_clipping_parent_keeps_outside_pixels_transparent() {
             opaque: true,
             clip: Some(DirectFrame::from_frame(&clip)),
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }],
     );
     assert_eq!(
@@ -4552,6 +5038,8 @@ fn static_foreground_survives_repeated_background_submissions() {
                 opaque: true,
                 clip: None,
                 rounded: Vec::new(),
+                occluded: None,
+                native: None,
             },
             ScenePlacement {
                 id: 2,
@@ -4560,6 +5048,8 @@ fn static_foreground_survives_repeated_background_submissions() {
                 opaque: true,
                 clip: None,
                 rounded: Vec::new(),
+                occluded: None,
+                native: None,
             },
         ]
     ));
@@ -4619,6 +5109,8 @@ fn static_foreground_survives_repeated_background_submissions() {
                 opaque: true,
                 clip: None,
                 rounded: Vec::new(),
+                occluded: None,
+                native: None,
             },
             ScenePlacement {
                 id: 2,
@@ -4627,6 +5119,8 @@ fn static_foreground_survives_repeated_background_submissions() {
                 opaque: true,
                 clip: Some(restricted),
                 rounded: Vec::new(),
+                occluded: None,
+                native: None,
             },
         ]
     ));
@@ -4972,6 +5466,8 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
             opaque: true,
             clip: None,
             rounded: Vec::new(),
+            occluded: None,
+            native: None,
         }]
     ));
     assert_eq!(state.layers, [1]);

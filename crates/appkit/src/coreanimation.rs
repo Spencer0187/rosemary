@@ -176,6 +176,31 @@ struct Running {
 
 static NODES: Mutex<Option<HashMap<usize, Node>>> = Mutex::new(None);
 
+/// Only the layers that have a live opacity animation. Most applications
+/// never animate opacity; avoid locking/scanning all CA nodes every pump.
+static OPACITY_ANIMATION_LAYERS: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+static OPACITY_ANIMATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn update_opacity_animation_registry(layer: Id) {
+    let active = read_node(layer, |node| {
+        node.is_some_and(|node| {
+            node.animations
+                .iter()
+                .any(|(_, a)| a.spec.key_path == "opacity")
+        })
+    });
+    let mut registered = OPACITY_ANIMATION_LAYERS
+        .lock()
+        .expect("CA opacity registry");
+    if active {
+        registered.insert(layer as usize);
+    } else {
+        registered.remove(&(layer as usize));
+    }
+    OPACITY_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
+}
+
 fn with_node<T>(layer: Id, f: impl FnOnce(&mut Node) -> T) -> T {
     let mut nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     f(nodes
@@ -201,6 +226,13 @@ pub(crate) fn forget(layer: Id) {
     let Some(node) = node else {
         return;
     };
+    {
+        let mut registered = OPACITY_ANIMATION_LAYERS
+            .lock()
+            .expect("CA opacity registry");
+        registered.remove(&(layer as usize));
+        OPACITY_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
+    }
     for sublayer in &node.sublayers {
         with_node(*sublayer as Id, |child| child.superlayer = 0);
         objc::arc::release(*sublayer as Id);
@@ -321,20 +353,59 @@ pub(crate) fn changed(layer: Id) {
 /// Whether a currently progressing opacity animation needs a new retained
 /// scene at the next video-thread pump, independent of drawable submissions.
 pub(crate) fn scene_opacity_animating(now: f64) -> Vec<usize> {
-    read_all_nodes(|nodes| {
-        nodes
-            .iter()
-            .filter_map(|(id, node)| {
-                node.animations
-                    .iter()
-                    .any(|(_, animation)| {
-                        animation.spec.key_path == "opacity"
-                            && !progress(&animation.spec, animation.start, now).1
+    if OPACITY_ANIMATION_COUNT.load(Ordering::Acquire) == 0 {
+        return Vec::new();
+    }
+    // Snapshot only registered layer IDs, not the full CA hierarchy. Never
+    // hold the registry lock while reading NODES or evaluating animations.
+    let ids: Vec<_> = OPACITY_ANIMATION_LAYERS
+        .lock()
+        .expect("CA opacity registry")
+        .iter()
+        .copied()
+        .collect();
+    let (active, expired) = read_all_nodes(|nodes| {
+        let mut active = Vec::new();
+        let mut expired = Vec::new();
+        for id in &ids {
+            let running = nodes.get(id).is_some_and(|node| {
+                node.animations.iter().any(|(_, animation)| {
+                    animation.spec.key_path == "opacity"
+                        && !progress(&animation.spec, animation.start, now).1
+                })
+            });
+            if running {
+                active.push(scene_root_key(nodes, *id));
+            } else {
+                expired.push(*id);
+            }
+        }
+        (active, expired)
+    });
+    if !expired.is_empty() {
+        let mut registered = OPACITY_ANIMATION_LAYERS
+            .lock()
+            .expect("CA opacity registry");
+        // A new animation may have been added after the node snapshot.
+        // Re-check only expired IDs, preserving a concurrent replacement.
+        let expired: Vec<_> = read_all_nodes(|nodes| {
+            expired
+                .into_iter()
+                .filter(|id| {
+                    !nodes.get(id).is_some_and(|node| {
+                        node.animations.iter().any(|(_, a)| {
+                            a.spec.key_path == "opacity" && !progress(&a.spec, a.start, now).1
+                        })
                     })
-                    .then(|| scene_root_key(nodes, *id))
-            })
-            .collect()
-    })
+                })
+                .collect()
+        });
+        for id in expired {
+            registered.remove(&id);
+        }
+        OPACITY_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
+    }
+    active
 }
 
 fn read_all_nodes<T>(f: impl FnOnce(&HashMap<usize, Node>) -> T) -> T {
@@ -1337,6 +1408,7 @@ unsafe extern "C" fn add_animation(receiver: Id, _sel: Sel, animation: Id, key: 
     if let Some(old) = replaced {
         release_running(&old);
     }
+    update_opacity_animation_registry(receiver);
     changed(receiver);
 }
 
@@ -1365,6 +1437,7 @@ unsafe extern "C" fn remove_animation_for_key(receiver: Id, _sel: Sel, key: Id) 
     });
     if let Some(running) = removed {
         release_running(&running);
+        update_opacity_animation_registry(receiver);
         changed(receiver);
     }
 }
@@ -1374,6 +1447,7 @@ unsafe extern "C" fn remove_all_animations(receiver: Id, _sel: Sel) {
     for (_, running) in &removed {
         release_running(running);
     }
+    update_opacity_animation_registry(receiver);
     changed(receiver);
 }
 
@@ -1613,9 +1687,15 @@ fn retire(layer: Id, now: f64) -> bool {
             .any(|(_, r)| !progress(&r.spec, r.start, now).1);
         (done, running)
     });
+    let removed = !done.is_empty();
     for (object, spec) in done {
         spec.release_objects();
         objc::arc::release(object as Id);
+    }
+    // Static CA layers are rendered far more often than animations change.
+    // Registry refreshes belong to a real removal, not every draw traversal.
+    if removed {
+        update_opacity_animation_registry(layer);
     }
     running
 }
@@ -2206,6 +2286,22 @@ pub(crate) enum Pass {
 /// Draw `view`'s layer tree into `store`, where the view sits at `rect` and
 /// may show within `clip`. Whether anything in it is still animating.
 pub(crate) fn render(view: Id, store: &mut Store, rect: Rect, clip: Rect, pass: Pass) -> bool {
+    render_with_root_opacity(view, store, rect, clip, pass, None)
+}
+
+/// A retained native view is rendered at unit root CA opacity; the retained
+/// scene subsequently applies effective view/root/ancestor opacity to *all*
+/// of its content, including NSView pixels and Core Animation sublayers.
+/// Without this split, CA backgrounds were faded twice while drawRect pixels
+/// were not faded by the native layer's opacity at all.
+pub(crate) fn render_with_root_opacity(
+    view: Id,
+    store: &mut Store,
+    rect: Rect,
+    clip: Rect,
+    pass: Pass,
+    root_opacity: Option<f64>,
+) -> bool {
     let root = crate::view::layer_of(view);
     if root.is_null() || crate::layer::is_metal(root) {
         return false;
@@ -2215,7 +2311,10 @@ pub(crate) fn render(view: Id, store: &mut Store, rect: Rect, clip: Rect, pass: 
     };
     let view_bounds = mapping.view_bounds;
     let now = darwin::mach::media_time();
-    let root_presented = presentation(root, now);
+    let mut root_presented = presentation(root, now);
+    if let Some(root_opacity) = root_opacity {
+        root_presented.opacity = root_opacity;
+    }
     if root_presented.hidden {
         return false;
     }
@@ -3316,6 +3415,56 @@ mod tests {
 
         unsafe { corefoundation::api::CFRelease(image) };
         objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn empty_opacity_animation_registry_does_not_lock_static_ca_hierarchy() {
+        // Other unit tests may animate CALayers concurrently. Verify the
+        // uncontended O(1) contract in a fresh subprocess rather than making
+        // a globally shared count an intermittently failing CI assertion.
+        if std::env::var_os("ROSEMARY_CA_STATIC_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "coreanimation::tests::empty_opacity_animation_registry_does_not_lock_static_ca_hierarchy", "--nocapture"])
+                .env("ROSEMARY_CA_STATIC_CHILD", "1")
+                .output().expect("isolated CA registry benchmark");
+            assert!(
+                output.status.success(),
+                "CA registry test failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::bootstrap();
+        // Simulate a large static layer table. With zero opacity animations,
+        // the video-thread check must not even contend for its mutex.
+        let inserted: Vec<usize> = (0..20_000).map(|i| usize::MAX - i - 10).collect();
+        {
+            let mut nodes = NODES.lock().expect("CA nodes");
+            let nodes = nodes.get_or_insert_with(HashMap::new);
+            for &id in &inserted {
+                nodes.insert(id, Node::default());
+            }
+        }
+        assert_eq!(OPACITY_ANIMATION_COUNT.load(Ordering::Acquire), 0);
+        let nodes = NODES.lock().expect("CA nodes held during event-pump tick");
+        let start = std::time::Instant::now();
+        for _ in 0..10_000 {
+            assert!(scene_opacity_animating(darwin::mach::media_time()).is_empty());
+        }
+        let elapsed = start.elapsed();
+        drop(nodes);
+        let mut nodes = NODES.lock().expect("CA nodes");
+        if let Some(nodes) = nodes.as_mut() {
+            for id in inserted {
+                nodes.remove(&id);
+            }
+        }
+        eprintln!(
+            "static 20k-CA-node/10k-opactity-ticks wall_us={:.1}",
+            elapsed.as_secs_f64() * 1e6
+        );
     }
 
     #[test]

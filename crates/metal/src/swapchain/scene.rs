@@ -16,6 +16,7 @@ pub(super) struct SceneLayer {
     clip: Option<DirectFrame>,
     rounded: Vec<RoundedClip>,
     regions: Option<Vec<Region>>,
+    pub(super) native_revision: Option<u64>,
     pub(super) ready: bool,
 }
 
@@ -350,6 +351,13 @@ pub(super) struct RoundedClip {
 }
 
 #[derive(Clone)]
+pub(super) struct NativeCpuSceneSource {
+    pub bytes: Arc<Vec<u8>>,
+    pub revision: u64,
+    pub dmabuf: Option<Arc<appkit::backing::Dmabuf>>,
+}
+
+#[derive(Clone)]
 pub(super) struct ScenePlacement {
     pub id: usize,
     pub frame: DirectFrame,
@@ -357,6 +365,10 @@ pub(super) struct ScenePlacement {
     pub opaque: bool,
     pub clip: Option<DirectFrame>,
     pub rounded: Vec<RoundedClip>,
+    /// Some means a live AppKit-computed native occlusion set. Synthetic
+    /// fixtures use None because they supply clipping with drawable holes.
+    pub occluded: Option<Vec<Region>>,
+    pub native: Option<NativeCpuSceneSource>,
 }
 
 fn scene_image(gpu: &'static Gpu, source: PresentSource) -> Result<Arc<BackingImageLease>, String> {
@@ -473,6 +485,7 @@ impl Swapchain {
                 p.opacity < 1.0
                     || !p.opaque
                     || !p.rounded.is_empty()
+                    || p.occluded.as_ref().is_some_and(|r| !r.is_empty())
                     || p.clip
                         .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &p.frame.frame()))
                     || old.is_some_and(|old| {
@@ -481,6 +494,9 @@ impl Swapchain {
                             || old.opaque != p.opaque
                             || old.clip != p.clip
                             || old.rounded != p.rounded
+                            || old.occluded != p.occluded
+                            || old.native.as_ref().map(|n| n.revision)
+                                != p.native.as_ref().map(|n| n.revision)
                     })
             }) {
                 changed = true;
@@ -495,10 +511,14 @@ impl Swapchain {
                     || new.frame != old.frame
                     || new.clip != old.clip
                     || new.rounded != old.rounded
+                    || new.occluded != old.occluded
+                    || new.native.as_ref().map(|n| n.revision)
+                        != old.native.as_ref().map(|n| n.revision)
             }) || new.is_some_and(|p| {
                 p.opacity < 1.0
                     || !p.opaque
                     || !p.rounded.is_empty()
+                    || p.occluded.as_ref().is_some_and(|r| !r.is_empty())
                     || p.clip
                         .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &p.frame.frame()))
             }) {
@@ -542,12 +562,39 @@ impl Swapchain {
                     || scene.opaque != placement.opaque
                     || scene.clip != placement.clip
                     || scene.rounded != placement.rounded
+                    || placement.occluded.as_ref().is_some_and(|coverage| {
+                        let updated = (!coverage.is_empty()).then(|| {
+                            super::subtract(
+                                Region {
+                                    x: placement.frame.x,
+                                    y: placement.frame.y,
+                                    width: placement.frame.width.min(i32::MAX as u32) as i32,
+                                    height: placement.frame.height.min(i32::MAX as u32) as i32,
+                                },
+                                coverage,
+                            )
+                        });
+                        scene.regions != updated
+                    })
                 {
                     scene.frame = placement.frame;
                     scene.opacity = placement.opacity;
                     scene.opaque = placement.opaque;
                     scene.clip = placement.clip;
                     scene.rounded.clone_from(&placement.rounded);
+                    if let Some(coverage) = &placement.occluded {
+                        scene.regions = (!coverage.is_empty()).then(|| {
+                            super::subtract(
+                                Region {
+                                    x: placement.frame.x,
+                                    y: placement.frame.y,
+                                    width: placement.frame.width.min(i32::MAX as u32) as i32,
+                                    height: placement.frame.height.min(i32::MAX as u32) as i32,
+                                },
+                                coverage,
+                            )
+                        });
+                    }
                     changed = true;
                 }
             }
@@ -563,6 +610,30 @@ impl Swapchain {
             self.scene_repaint_needed = true;
         }
         changed
+    }
+
+    pub(super) fn live_scene_regions(
+        &self,
+        id: usize,
+        frame: &appkit::view::Frame,
+    ) -> Option<Vec<Region>> {
+        let coverage = self
+            .scene_placements
+            .iter()
+            .find(|p| p.id == id)
+            .and_then(|p| p.occluded.as_deref())?;
+        if coverage.is_empty() {
+            return None;
+        }
+        Some(super::subtract(
+            Region {
+                x: frame.x,
+                y: frame.y,
+                width: frame.width.min(i32::MAX as u32) as i32,
+                height: frame.height.min(i32::MAX as u32) as i32,
+            },
+            coverage,
+        ))
     }
 
     fn scene_clip(&self, id: usize) -> Option<DirectFrame> {
@@ -743,6 +814,7 @@ impl Swapchain {
                 clip: self.scene_clip(old),
                 rounded: self.scene_rounded(old).to_vec(),
                 regions: None,
+                native_revision: None,
                 ready: false,
             });
         }
@@ -788,6 +860,7 @@ impl Swapchain {
                 clip,
                 rounded,
                 regions: regions.map(|r| r.to_vec()),
+                native_revision: None,
                 ready: false,
             });
         }
@@ -1213,6 +1286,7 @@ impl Swapchain {
             clip: self.scene_clip(id),
             rounded: self.scene_rounded(id).to_vec(),
             regions: None,
+            native_revision: None,
             ready: true,
         });
         Ok(())
@@ -1227,6 +1301,7 @@ impl Swapchain {
             let needs_scene = self.scene_opacity(layer) < 1.0
                 || !self.scene_opaque(layer)
                 || !self.scene_rounded(layer).is_empty()
+                || self.live_scene_regions(layer, &source_frame).is_some()
                 || self
                     .scene_clip(layer)
                     .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &source_frame));

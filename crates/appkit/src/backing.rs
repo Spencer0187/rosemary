@@ -1220,7 +1220,11 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
     };
     placed[first + 1..]
         .iter()
-        .filter(|p| !p.clip.is_empty() && p.alpha >= 1.0)
+        .filter(|p| {
+            !p.clip.is_empty()
+                && p.alpha >= 1.0
+                && crate::view::native_scene_ca_opacity(p.view, darwin::mach::media_time()) >= 1.0
+        })
         .filter(|p| {
             stores.get(&(p.view as usize)).is_some_and(|store| {
                 i64::from(store.width) >= p.rect.width
@@ -1230,6 +1234,195 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
         })
         .map(|p| p.view as usize)
         .collect()
+}
+
+/// Authoritative opaque native-view coverage, recomputed from live AppKit
+/// stacking order on the video thread. Independent of whether a CPU window
+/// backing image has *ever* been submitted to the Metal scene.
+pub(crate) fn live_metal_occlusion(sdl: sdl3::Window) -> Vec<(usize, Vec<Rect>)> {
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return Vec::new();
+    }
+    let placed = place_tree(window, sdl);
+    let opaque = opaque_views(&placed);
+    // DMA-BUF and software overlays may have fractional alpha. Unlike the
+    // legacy CPU-hole path, a retained Metal scene handles them as independent
+    // source-over layers, so their rectangles must not be an opacity-blind
+    // subtraction from the Metal source.
+    placed
+        .iter()
+        .enumerate()
+        .filter_map(|(index, p)| {
+            let layer = crate::view::layer_of(p.view);
+            if !crate::layer::is_metal(layer) || p.clip.is_empty() {
+                return None;
+            }
+            Some((
+                layer as usize,
+                placed[index + 1..]
+                    .iter()
+                    .filter(|v| opaque.contains(&(v.view as usize)))
+                    .map(|v| v.clip.intersection(&p.clip))
+                    .filter(|rect| !rect.is_empty())
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+/// Render the native content of one NSView into a transparent, view-local
+/// source. The Metal presenter retains its own copy; no Objective-C pointer
+/// crosses onto the GPU worker. A CPU-owned view above Metal must be sampled
+/// *after* that Metal source, not flattened into the window's bottom image.
+pub(crate) fn native_scene_pixels(
+    view: Id,
+    width: u32,
+    height: u32,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    let bytes = u64::from(width)
+        .checked_mul(u64::from(height))?
+        .checked_mul(4)?;
+    if bytes == 0 || bytes > 64 * 1024 * 1024 {
+        return None;
+    }
+    let layer = crate::view::layer_of(view);
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let source = views.as_ref().and_then(|all| all.get(&(view as usize)));
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let overlay = overlays
+        .iter()
+        .find(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
+        .map(|(_, entry)| entry);
+    if source.is_none() && overlay.is_none() && !crate::coreanimation::has_tree(layer) {
+        return None;
+    }
+    let mut output = Store::new(width, height);
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(width),
+        height: i64::from(height),
+    };
+    use crate::coreanimation::{Pass, render_with_root_opacity};
+    render_with_root_opacity(view, &mut output, whole, whole, Pass::Background, Some(1.0));
+    if let Some(source) = source {
+        // CA/view opacity is applied by the retained scene, not a second time
+        // during this isolated pixel capture.
+        blend_at(&mut output, source, 0, 0, whole, 1.0);
+    }
+    if let Some(overlay) = overlay {
+        // Software overlays (including CPU-backed web content) are also
+        // separate native layers; previously they were irreversibly composed
+        // under the later Metal drawable in the full window store.
+        blend_overlay_clipped(&mut output, overlay, 0, 0, width, height, whole);
+    }
+    render_with_root_opacity(view, &mut output, whole, whole, Pass::Sublayers, Some(1.0));
+    if output
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|pixel| pixel[3] == 0)
+    {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    output.pixels.hash(&mut hasher);
+    Some((std::sync::Arc::new(output.pixels), hasher.finish()))
+}
+
+/// Window backing source excluding native views painted *above* the first
+/// Metal layer. Those views are separately retained and placed above Metal.
+/// The original full CPU store remains unmodified for non-Vulkan fallbacks.
+pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
+    let _owed = crate::coreanimation::defer_releases();
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return None;
+    }
+    let placed = place_tree(window, sdl);
+    let first = placed
+        .iter()
+        .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))?;
+    // Never remove native pixels from the GPU base unless the owner thread
+    // has already published a corresponding independent source for *every*
+    // visible native view above the first Metal drawable. Oversized or not-
+    // yet-ready native sources must remain visible, even if ordering cannot
+    // be fully resolved during that transitional frame.
+    let captured: std::collections::HashSet<_> = crate::view::metal_scene(sdl)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|layer| layer.native_pixels.is_some() || layer.native_dmabuf.is_some())
+        .map(|layer| layer.layer)
+        .collect();
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut any = false;
+    for p in &placed[first + 1..] {
+        if crate::layer::is_metal(crate::view::layer_of(p.view)) {
+            continue;
+        }
+        let drawn = views
+            .as_ref()
+            .is_some_and(|stores| stores.contains_key(&(p.view as usize)))
+            || overlays.iter().any(|(id, _)| *id == p.view as usize)
+            || crate::coreanimation::has_tree(crate::view::layer_of(p.view));
+        if !drawn {
+            continue;
+        }
+        any = true;
+        if !captured.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
+            return None;
+        }
+    }
+    if !any {
+        return None;
+    }
+    let mut bottom = Store::new(source.width, source.height);
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(source.width),
+        height: i64::from(source.height),
+    };
+    let background = crate::window::background_pixel(window).unwrap_or(DEFAULT_BACKGROUND);
+    for pixel in bottom.pixels.as_chunks_mut::<4>().0 {
+        *pixel = background;
+    }
+    for p in &placed[..first] {
+        let clip = p.clip.intersection(&whole);
+        use crate::coreanimation::{Pass, render};
+        render(p.view, &mut bottom, p.rect, clip, Pass::Background);
+        if let Some(source) = views
+            .as_ref()
+            .and_then(|stores| stores.get(&(p.view as usize)))
+        {
+            blend_at(&mut bottom, source, p.rect.x, p.rect.y, clip, p.alpha);
+        }
+        // CPU overlays painted below the first Metal drawable belong in its
+        // underlay; those above it are separate scene sources instead.
+        if let Some((_, overlay)) = overlays
+            .iter()
+            .find(|(id, o)| *id == p.view as usize && matches!(o.picture, Picture::Pixels(_)))
+        {
+            blend_overlay_clipped(
+                &mut bottom,
+                overlay,
+                p.rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                p.rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                p.rect.width.clamp(0, i64::from(u32::MAX)) as u32,
+                p.rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                clip,
+            );
+        }
+        render(p.view, &mut bottom, p.rect, clip, Pass::Sublayers);
+    }
+    if let Some(chrome) = crate::decor::pixels(sdl) {
+        copy_chrome(&mut bottom, &chrome);
+    }
+    Some(bottom)
 }
 
 /// Bring a window's composite up to date with its views: recompose what was
@@ -1430,6 +1623,12 @@ fn compose_window(window: Id) {
         copy_chrome(store, chrome);
     }
     store.touch();
+    // Only windows with independent native-over-Metal sources require this
+    // additional snapshot when CPU content changes; ordinary AppKit-only
+    // windows must not pay the hierarchy walk on every backing repaint.
+    if crate::view::native_metal_scene_active(sdl) {
+        crate::view::invalidate_metal_scene(false);
+    }
 }
 
 /// Put a window's chrome over the top rows of its store.
@@ -1553,6 +1752,19 @@ pub(crate) fn cpu_fallback_calls_for_tests(window: sdl3::Window) -> usize {
         .iter()
         .filter(|&&key| key == window as usize)
         .count()
+}
+
+#[cfg(test)]
+pub(crate) fn set_native_view_pixels_for_tests(view: Id, width: u32, height: u32, pixels: Vec<u8>) {
+    assert_eq!(pixels.len(), width as usize * height as usize * 4);
+    let mut store = Store::new(width, height);
+    store.pixels = pixels;
+    VIEW_STORES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(view as usize, store);
+    crate::view::invalidate_metal_scene(false);
 }
 
 #[cfg(test)]
@@ -1782,6 +1994,66 @@ pub enum Picture {
 
 /// Keyed by the view's address, in the order the overlays were first set.
 static OVERLAYS: Mutex<Vec<(usize, Overlay)>> = Mutex::new(Vec::new());
+static OVERLAY_REVISIONS: std::sync::LazyLock<Mutex<HashMap<usize, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_OVERLAY_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Capture the DMA-BUF identity and setter revision on the AppKit owner
+/// thread; no guest view pointer or mutable overlay crosses to the GPU worker.
+pub(crate) fn native_dma_overlay(view: Id) -> Option<(std::sync::Arc<Dmabuf>, u64)> {
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, overlay) = overlays.iter().find(|(id, overlay)| {
+        *id == view as usize && matches!(overlay.picture, Picture::Dmabuf(_))
+    })?;
+    let Picture::Dmabuf(picture) = &overlay.picture else {
+        unreachable!()
+    };
+    let revision = OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(view as usize))
+        .copied()
+        .unwrap_or(0);
+    Some((std::sync::Arc::clone(picture), revision))
+}
+
+/// Only DMA-BUF sources that have an independently retained native scene
+/// layer may be excluded from the bottom window-store overlay blending.
+pub fn native_dma_above_metal(sdl: sdl3::Window) -> Vec<std::sync::Arc<Dmabuf>> {
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return Vec::new();
+    }
+    let placed = place_tree(window, sdl);
+    let Some(first) = placed
+        .iter()
+        .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))
+    else {
+        return Vec::new();
+    };
+    let native: std::collections::HashSet<_> = crate::view::metal_scene(sdl)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|layer| layer.native_dmabuf.is_some())
+        .map(|layer| layer.layer)
+        .collect();
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    placed[first + 1..]
+        .iter()
+        .filter_map(|p| {
+            if !native.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
+                return None;
+            }
+            let (_, overlay) = overlays.iter().find(|(id, o)| {
+                *id == p.view as usize && matches!(o.picture, Picture::Dmabuf(_))
+            })?;
+            let Picture::Dmabuf(picture) = &overlay.picture else {
+                unreachable!()
+            };
+            Some(std::sync::Arc::clone(picture))
+        })
+        .collect()
+}
 
 /// Show `overlay` over `view`'s rectangle from the next present on.
 ///
@@ -1794,7 +2066,15 @@ pub fn set_overlay(view: Id, overlay: Overlay) {
             None => overlays.push((view as usize, overlay)),
         }
     }
+    OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            view as usize,
+            NEXT_OVERLAY_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
     mark_window_of(view);
+    crate::view::invalidate_metal_scene(false);
 }
 
 pub fn remove_overlay(view: Id) {
@@ -1805,7 +2085,12 @@ pub fn remove_overlay(view: Id) {
         overlays.len() != before
     };
     if removed {
+        OVERLAY_REVISIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(view as usize));
         mark_window_of(view);
+        crate::view::invalidate_metal_scene(false);
     }
 }
 

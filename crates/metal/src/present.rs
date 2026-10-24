@@ -1894,6 +1894,28 @@ pub(crate) fn forget_backing_store_for_test(window: sdl3::Window) {
 
 /// CPU backing-store contents and overlay references owned through completion
 /// of an asynchronous GPU upload. The SDL event thread only copies the bytes.
+/// On the AppKit thread, omit only DMA-BUF overlays that the native-scene
+/// compositor has already captured as independent ordered sources. Both
+/// generation equality and ownership comparisons must use this same filter.
+fn unflattened_dma_overlays(
+    window: sdl3::Window,
+    overlays: &[appkit::backing::GpuOverlay],
+) -> Vec<appkit::backing::GpuOverlay> {
+    let separate = appkit::backing::native_dma_above_metal(window);
+    overlays
+        .iter()
+        .filter(|overlay| {
+            !separate
+                .iter()
+                .any(|picture| std::sync::Arc::ptr_eq(picture, &overlay.picture))
+        })
+        .map(|overlay| appkit::backing::GpuOverlay {
+            picture: std::sync::Arc::clone(&overlay.picture),
+            rect: overlay.rect,
+        })
+        .collect()
+}
+
 struct StoreUpload {
     window: usize,
     identity: u32,
@@ -1911,21 +1933,22 @@ impl StoreUpload {
         holes: &[appkit::backing::Hole],
         overlays: &[appkit::backing::GpuOverlay],
     ) -> Self {
-        let mut owned = appkit::backing::Store::new(store.width, store.height);
-        owned.pixels.clone_from(&store.pixels);
+        // The CPU's full flattened store is retained for its SDL fallback.
+        // The retained Metal compositor needs only what is *below* its first
+        // layer here; native views painted later are uploaded separately as
+        // ordered AppKit scene sources, not irreversibly flattened underneath.
+        let owned = appkit::backing::gpu_under_metal(window, store).unwrap_or_else(|| {
+            let mut copy = appkit::backing::Store::new(store.width, store.height);
+            copy.pixels.clone_from(&store.pixels);
+            copy
+        });
         Self {
             window: window as usize,
             identity,
             generation: store.generation(),
             store: owned,
             holes: holes.to_vec(),
-            overlays: overlays
-                .iter()
-                .map(|overlay| appkit::backing::GpuOverlay {
-                    picture: std::sync::Arc::clone(&overlay.picture),
-                    rect: overlay.rect,
-                })
-                .collect(),
+            overlays: unflattened_dma_overlays(window, overlays),
         }
     }
 
@@ -1938,6 +1961,7 @@ impl StoreUpload {
     ) -> bool {
         // Not the pixels, which would compare a whole store on the event
         // thread for every finished upload.
+        let overlays = unflattened_dma_overlays(self.window as sdl3::Window, overlays);
         self.identity == identity
             && self.generation == store.generation()
             && self.store.width == store.width
@@ -1952,7 +1976,7 @@ impl StoreUpload {
             && self
                 .overlays
                 .iter()
-                .zip(overlays)
+                .zip(&overlays)
                 .all(|(a, b)| a.rect == b.rect && std::sync::Arc::ptr_eq(&a.picture, &b.picture))
     }
 }
