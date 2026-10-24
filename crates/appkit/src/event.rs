@@ -39,6 +39,9 @@ fn service_presentation() {
     sdl3::video::vulkan::service_surface_requests();
     let windows = window::sdl_windows();
     sdl3::video::publish_presentation_windows(&windows);
+    // Scene geometry consumes the *current* SDL pixel bounds, so it must
+    // capture after publishing these owner-thread window snapshots.
+    crate::view::flush_metal_scenes();
     // SDL_GetDisplayForWindow and SDL_GetDesktopDisplayMode require the
     // main thread. Publish their results for Metal's asynchronous presenter.
     // Mode change events invalidate immediately; poll less frequently as a

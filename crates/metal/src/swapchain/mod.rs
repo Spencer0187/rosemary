@@ -1384,21 +1384,13 @@ fn present_impl(
         // image by the same window worker, without an offscreen full-frame copy.
         // The retained drawable also supplies the initial snapshot if a second
         // layer joins later. Other cases must stage into the GPU accumulator.
-        let direct = fast_direct_layer(
-            swapchain.present_mode,
-            swapchain.layers.len(),
+        let direct = fast_direct_scene(
+            &swapchain,
+            layer,
             frame,
             regions.as_deref(),
-            swapchain.corners.is_some(),
             owner.0.is_some() || backing.is_some(),
-        ) && swapchain.scene_opacity(layer) >= 1.0
-            && swapchain.scene_opaque(layer)
-            && swapchain
-                .scene_placements
-                .iter()
-                .find(|placement| placement.id == layer)
-                .and_then(|placement| placement.clip)
-                .is_none_or(|clip| scene::scene_clip_contains(&clip.frame(), frame));
+        );
         let converting = !direct && swapchain.direct.is_some();
         let converted = if converting {
             swapchain.stage_direct_snapshot(true)
@@ -1593,6 +1585,34 @@ fn fast_direct_layer(
         && regions.is_none()
         && !corners
         && owned
+}
+
+/// Effective CA state is a hard eligibility requirement for bypassing the
+/// scene shader; rectangular and rounded masks must both be considered.
+fn fast_direct_scene(
+    swapchain: &Swapchain,
+    layer: usize,
+    frame: &appkit::view::Frame,
+    regions: Option<&[Region]>,
+    owned: bool,
+) -> bool {
+    fast_direct_layer(
+        swapchain.present_mode,
+        swapchain.layers.len(),
+        frame,
+        regions,
+        swapchain.corners.is_some(),
+        owned,
+    ) && !appkit::view::metal_scene_pending()
+        && swapchain.scene_opacity(layer) >= 1.0
+        && swapchain.scene_opaque(layer)
+        && swapchain.scene_rounded(layer).is_empty()
+        && swapchain
+            .scene_placements
+            .iter()
+            .find(|placement| placement.id == layer)
+            .and_then(|placement| placement.clip)
+            .is_none_or(|clip| scene::scene_clip_contains(&clip.frame(), frame))
 }
 
 /// Direct opaque presents have nothing to coalesce, so they do not wait for

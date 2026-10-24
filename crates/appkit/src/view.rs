@@ -119,6 +119,82 @@ static METAL_SCENES: std::sync::Mutex<
     Option<std::collections::HashMap<usize, Vec<MetalSceneLayer>>>,
 > = std::sync::Mutex::new(None);
 
+// No guest setter thread is allowed to borrow an NSView's subviews. Mark a
+// transaction dirty and let the video owner capture it once per event turn.
+static METAL_SCENE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static METAL_CA_DAMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static METAL_SCENE_WAS_ANIMATING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static METAL_SCENE_LAST_ANIM_FRAME: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+#[cfg(test)]
+static METAL_SCENE_CAPTURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Queue from any guest thread, including while AppKit is reparenting views.
+/// No Objective-C pointer or mutable NSView field is touched here.
+/// Until the main event pump captures an invalidation, the Metal fast path
+/// must fail closed: a previous snapshot can omit a newly installed CA mask.
+pub fn metal_scene_pending() -> bool {
+    METAL_SCENE_DIRTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub(crate) fn invalidate_metal_scene(ca_damage: bool) {
+    if ca_damage {
+        METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
+    }
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Called by the video-thread event pump after dispatching guest input.
+/// An invalidation racing a capture stays dirty for the following turn.
+/// Animation frames intentionally publish without waiting for new drawables.
+pub(crate) fn flush_metal_scenes() {
+    if !sdl3::video::is_video_thread() {
+        return;
+    }
+    let now = darwin::mach::media_time();
+    let animating = crate::coreanimation::scene_opacity_animating(now);
+    let was_animating =
+        METAL_SCENE_WAS_ANIMATING.swap(animating, std::sync::atomic::Ordering::AcqRel);
+    // Limit animation-only recaptures to 250 Hz even when a guest spins its
+    // event loop faster. Model/property changes always bypass this throttle.
+    if animating && !metal_scene_pending() {
+        let last = METAL_SCENE_LAST_ANIM_FRAME
+            .lock()
+            .expect("Metal animation tick");
+        if last.is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(4)) {
+            return;
+        }
+    }
+    let dirty = METAL_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let damage = METAL_CA_DAMAGE.swap(false, std::sync::atomic::Ordering::AcqRel);
+    if damage && !dirty {
+        // A CA setter can publish damage between the dirty-flag swap and
+        // this one. Carry both flags into the following turn.
+        METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
+        METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    }
+    if !dirty && !animating && !was_animating {
+        return;
+    }
+    if animating {
+        *METAL_SCENE_LAST_ANIM_FRAME
+            .lock()
+            .expect("Metal animation tick") = Some(std::time::Instant::now());
+    }
+    for window in crate::window::all() {
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        if sdl.is_null() {
+            continue;
+        }
+        if damage {
+            crate::backing::damage_view(crate::window::content_view_of(window));
+        }
+        publish_metal_scene_at(sdl, now);
+    }
+}
+
 pub fn set_metal_scene_changed(hook: fn(sdl3::Window, Vec<MetalSceneLayer>)) {
     let _ = METAL_SCENE_CHANGED.set(hook);
 }
@@ -135,7 +211,7 @@ pub fn metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
 }
 
 /// Only invoked on the AppKit mutator thread, not from Metal's presenter.
-fn capture_metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
+fn capture_metal_scene(window: sdl3::Window, now: f64) -> Option<Vec<MetalSceneLayer>> {
     let nswindow = crate::window::window_for(window);
     if nswindow.is_null() {
         return None;
@@ -150,8 +226,11 @@ fn capture_metal_scene(window: sdl3::Window) -> Option<Vec<MetalSceneLayer>> {
         1.0,
         std::ptr::null_mut(),
         &[],
+        now,
         0,
     );
+    #[cfg(test)]
+    METAL_SCENE_CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Some(result)
 }
 
@@ -163,6 +242,7 @@ fn visit_metal_scene(
     inherited_layer_opacity: f32,
     parent_layer: Id,
     inherited_rounded: &[RoundedSceneClip],
+    now: f64,
     depth: usize,
 ) {
     if depth >= 64 || !is_view(view) || view_of(view).hidden != 0 {
@@ -172,7 +252,7 @@ fn visit_metal_scene(
     let (hidden, own_layer_opacity) = if layer.is_null() {
         (false, 1.0)
     } else {
-        crate::coreanimation::scene_properties_below(layer, parent_layer)
+        crate::coreanimation::scene_properties_below(layer, parent_layer, now)
     };
     if hidden {
         return;
@@ -233,6 +313,7 @@ fn visit_metal_scene(
                 layer_opacity,
                 if layer.is_null() { parent_layer } else { layer },
                 &rounded,
+                now,
                 depth + 1,
             );
         }
@@ -255,16 +336,41 @@ fn intersect_scene_clips(a: Frame, b: Frame) -> Frame {
     }
 }
 
-fn publish_metal_scene(sdl: sdl3::Window) {
-    let scene = capture_metal_scene(sdl).unwrap_or_default();
-    METAL_SCENES
+fn publish_metal_scene_at(sdl: sdl3::Window, now: f64) {
+    debug_assert!(sdl3::video::is_video_thread());
+    let scene = capture_metal_scene(sdl, now).unwrap_or_default();
+    let changed = METAL_SCENES
         .lock()
         .expect("AppKit scene snapshots")
         .get_or_insert_with(std::collections::HashMap::new)
         .insert(sdl as usize, scene.clone());
-    if let Some(hook) = METAL_SCENE_CHANGED.get() {
-        hook(sdl, scene);
+    // Avoid waking the GPU worker for identical snapshots after a scene
+    // mutation or an animation that has reached its final presentation value.
+    // Metadata comparisons are value-only and never dereference guest IDs.
+    let differs = changed
+        .as_ref()
+        .is_none_or(|old| !same_metal_scene(old, &scene));
+    if differs {
+        if let Some(hook) = METAL_SCENE_CHANGED.get() {
+            hook(sdl, scene);
+        }
     }
+}
+
+fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            a.layer == b.layer
+                && a.frame == b.frame
+                && a.opacity == b.opacity
+                && a.opaque == b.opaque
+                && a.clip == b.clip
+                && a.rounded.len() == b.rounded.len()
+                && a.rounded
+                    .iter()
+                    .zip(&b.rounded)
+                    .all(|(a, b)| a.frame == b.frame && a.radius == b.radius)
+        })
 }
 
 pub fn forget_metal_scene(sdl: sdl3::Window) {
@@ -275,18 +381,11 @@ pub fn forget_metal_scene(sdl: sdl3::Window) {
     {
         cache.remove(&(sdl as usize));
     }
+    invalidate_metal_scene(false);
 }
 
-pub(crate) fn notify_metal_layer_tree_change(view: Id) {
-    notify_metal_scene(view);
-}
-
-fn notify_metal_scene(view: Id) {
-    let window = unsafe { window_of(view) };
-    let sdl = unsafe { crate::window::sdl_window(window) };
-    if !sdl.is_null() {
-        publish_metal_scene(sdl);
-    }
+fn notify_metal_scene(_view: Id) {
+    invalidate_metal_scene(false);
 }
 
 /// Post the frame and bounds notifications a resized view owes its observers.
@@ -819,7 +918,7 @@ pub unsafe fn detach_window(view: Id, window: Id) {
         let sdl = unsafe { crate::window::sdl_window(window) };
         view_of(view).window = std::ptr::null_mut();
         if !sdl.is_null() {
-            publish_metal_scene(sdl);
+            invalidate_metal_scene(false);
         }
     }
 }
@@ -1174,7 +1273,7 @@ pub unsafe fn input_frame(view: Id) -> Option<(sdl3::Window, sdl3::Rect)> {
 
 /// A view's layer as a window system sees it: a rectangle of pixels, and the
 /// window it is a rectangle of.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 pub struct Frame {
     pub window: sdl3::Window,
     pub x: i32,
@@ -3004,6 +3103,10 @@ mod tests {
             add_subview(content, objc::sel::get("addSubview:"), a);
             add_subview(content, objc::sel::get("addSubview:"), b);
         }
+        let metal_scene = |sdl| {
+            flush_metal_scenes();
+            super::metal_scene(sdl)
+        };
         let ids = |sdl| {
             metal_scene(sdl)
                 .unwrap()
@@ -3011,6 +3114,27 @@ mod tests {
                 .map(|entry| entry.layer)
                 .collect::<Vec<_>>()
         };
+        assert_eq!(ids(sdl), [first as usize, second as usize]);
+        let baseline = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        // Bulk CA mutations do not traverse views synchronously. The
+        // last model value is captured once at the event-pump boundary.
+        let set_opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        for index in 0..64 {
+            unsafe { set_opacity(second, objc::sel::get("setOpacity:"), index as f32 / 64.0) };
+        }
+        assert_eq!(
+            METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed),
+            baseline
+        );
+        flush_metal_scenes();
+        let after = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            after - baseline <= crate::window::all().len(),
+            "bulk layout triggered more than one scene capture per window"
+        );
+        assert!((metal_scene(sdl).unwrap()[1].opacity - 63.0 / 64.0).abs() < 0.0001);
+        unsafe { set_opacity(second, objc::sel::get("setOpacity:"), 1.0) };
         assert_eq!(ids(sdl), [first as usize, second as usize]);
         unsafe { set_hidden(b, objc::sel::get("setHidden:"), 1) };
         assert_eq!(ids(sdl), [first as usize]);
@@ -3036,6 +3160,67 @@ mod tests {
         assert_eq!(current.len(), 2);
         assert!((current[1].opacity - 0.5).abs() <= f32::EPSILON);
         assert!(current[1].opaque, "CAMetalLayer should default to opaque");
+        // The model opacity stays at 0.5 while the presentation-layer
+        // animation interpolates on each event turn, without new Metal pixels.
+        let animation_class =
+            objc::class::ptr(objc::class::lookup(c"CABasicAnimation").expect("CABasicAnimation"))
+                as Id;
+        let key = foundation::string::from_str("opacity");
+        let send_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let animation = unsafe {
+            send_obj(
+                animation_class,
+                objc::sel::get("animationWithKeyPath:"),
+                key,
+            )
+        };
+        let num = |value| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(
+                value,
+            )) as Id
+        };
+        let (from, to) = (num(0.0), num(1.0));
+        unsafe {
+            let set_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            let set_duration: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+                std::mem::transmute(objc::msg::entry());
+            let add: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+                std::mem::transmute(objc::msg::entry());
+            set_obj(animation, objc::sel::get("setFromValue:"), from);
+            set_obj(animation, objc::sel::get("setToValue:"), to);
+            set_duration(animation, objc::sel::get("setDuration:"), 0.16);
+            add(
+                second,
+                objc::sel::get("addAnimation:forKey:"),
+                animation,
+                key,
+            );
+        }
+        flush_metal_scenes();
+        let animated_start = metal_scene(sdl).unwrap()[1].opacity;
+        std::thread::sleep(std::time::Duration::from_millis(45));
+        flush_metal_scenes();
+        let animated_next = metal_scene(sdl).unwrap()[1].opacity;
+        assert!(
+            animated_next > animated_start + 0.10,
+            "presentation opacity did not advance without another drawable"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(160));
+        flush_metal_scenes();
+        assert!(
+            (metal_scene(sdl).unwrap()[1].opacity - 0.5).abs() < 0.001,
+            "removed-on-completion CA animation did not restore model alpha"
+        );
+        unsafe {
+            let remove: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+                std::mem::transmute(objc::msg::entry());
+            remove(second, objc::sel::get("removeAnimationForKey:"), key);
+        }
+        for value in [key, from, to] {
+            objc::arc::release(value);
+        }
         let set_opaque: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
             unsafe { std::mem::transmute(objc::msg::entry()) };
         unsafe { set_opaque(second, objc::sel::get("setOpaque:"), 0) };
@@ -3172,6 +3357,7 @@ mod tests {
         // first compositor before the second window can accept its drawable.
         let other_window =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        let mut other_sdl_for_teardown = std::ptr::null_mut();
         if unsafe {
             crate::window::init_with_content_rect_for_tests(
                 other_window,
@@ -3179,6 +3365,7 @@ mod tests {
             )
         } {
             let other_sdl = unsafe { crate::window::sdl_window(other_window) };
+            other_sdl_for_teardown = other_sdl;
             let other_content = view(rect(0.0, 0.0, 320.0, 240.0));
             unsafe {
                 let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
@@ -3194,11 +3381,122 @@ mod tests {
             assert_eq!(ids(other_sdl), [second as usize]);
             unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
             assert_eq!(ids(other_sdl), []);
+            // Another guest thread may mutate an ordinary CALayer while the
+            // video owner reparents and detaches its Metal view. Publication
+            // cannot borrow the reparented view from the setter thread.
+            std::thread::scope(|scope| {
+                let parent = parent_layer as usize;
+                let writer = scope.spawn(move || {
+                    let layer = parent as Id;
+                    for i in 0..256 {
+                        unsafe {
+                            crate::coreanimation::set_opacity_for_test(
+                                layer,
+                                (i % 100) as f32 / 100.0,
+                            )
+                        };
+                    }
+                });
+                for _ in 0..32 {
+                    unsafe {
+                        add_subview(content, objc::sel::get("addSubview:"), b);
+                        add_subview(other_content, objc::sel::get("addSubview:"), b);
+                    }
+                }
+                unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
+                writer.join().expect("CALayer mutation thread");
+            });
+            assert_eq!(ids(other_sdl), []);
+            assert_eq!(ids(sdl), [first as usize]);
         } else {
             unsafe { remove_from_superview(b, objc::sel::get("removeFromSuperview")) };
         }
         assert_eq!(ids(sdl), [first as usize]);
         objc::arc::release(other_window);
+        if !other_sdl_for_teardown.is_null() {
+            assert!(
+                super::metal_scene(other_sdl_for_teardown).is_none(),
+                "destroyed NSWindow retained stale Metal scene metadata"
+            );
+        }
+        objc::arc::release(window);
+    }
+
+    /// Opt-in AppKit owner-thread benchmark. Mutating N layered views in one
+    /// transaction should make one O(N) capture, not N O(N) captures.
+    #[test]
+    fn batch_metal_scene_capture_cost() {
+        if std::env::var_os("ROSEMARY_BENCH_APPKIT_SCENE").is_none() {
+            return;
+        }
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window =
+            objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 640.0, 480.0))
+        } {
+            return;
+        }
+        let content = view(rect(0.0, 0.0, 640.0, 480.0));
+        let attach: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { attach(window, objc::sel::get("setContentView:"), content) };
+        let metal = objc::class::lookup(c"CAMetalLayer").expect("CAMetalLayer");
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let mut layers = Vec::new();
+        for i in 0..128 {
+            let child = view(rect((i % 16 * 36) as f64, (i / 16 * 50) as f64, 34.0, 45.0));
+            let layer = unsafe { make(metal as *const _ as Id, maker) };
+            unsafe {
+                set_layer(child, objc::sel::get("setLayer:"), layer);
+                add_subview(content, objc::sel::get("addSubview:"), child);
+            }
+            layers.push(layer);
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        flush_metal_scenes();
+        let baseline = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        for i in 0..2048usize {
+            unsafe {
+                crate::coreanimation::set_opacity_for_test(
+                    layers[i % layers.len()],
+                    ((i % 97) as f32 + 1.0) / 100.0,
+                )
+            };
+        }
+        let mutations_us = start.elapsed().as_secs_f64() * 1e6;
+        let prior = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            baseline, prior,
+            "setter threads performed hierarchy captures"
+        );
+        let start = std::time::Instant::now();
+        flush_metal_scenes();
+        let one_us = start.elapsed().as_secs_f64() * 1e6;
+        let after = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(after - prior <= crate::window::all().len());
+        let start = std::time::Instant::now();
+        for _ in 0..128 {
+            let _ = capture_metal_scene(sdl, darwin::mach::media_time());
+        }
+        let naive_us = start.elapsed().as_secs_f64() * 1e6 / 128.0;
+        let start = std::time::Instant::now();
+        for _ in 0..2048 {
+            flush_metal_scenes();
+        }
+        let clean_us = start.elapsed().as_secs_f64() * 1e6 / 2048.0;
+        eprintln!(
+            "AppKit 128 metal-layer/2048 setter benchmark: queued-mutations-total-us={mutations_us:.1} one-pump-us={one_us:.1} forced-capture-mean-us={naive_us:.1} idle-clean-pump-mean-us={clean_us:.3} captures-per-transaction={}",
+            after - prior
+        );
+        assert_eq!(metal_scene(sdl).unwrap().len(), 128);
         objc::arc::release(window);
     }
 

@@ -3202,6 +3202,22 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
     });
     let id = 22;
     state.layers.push(id);
+    assert!(matches!(
+        state.present_mode,
+        vk::PresentModeKHR::IMMEDIATE
+            | vk::PresentModeKHR::MAILBOX
+            | vk::PresentModeKHR::FIFO
+            | vk::PresentModeKHR::FIFO_RELAXED
+    ));
+    // This is the exact eligibility predicate used by the live present path;
+    // in IMMEDIATE/MAILBOX, the otherwise eligible full-window opaque source
+    // must stop being direct as soon as a rounded ancestor mask appears.
+    if matches!(
+        state.present_mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) {
+        assert!(fast_direct_scene(&state, id, &whole, None, true));
+    }
     state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
@@ -3215,6 +3231,10 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
                 radius: 30.0,
             }],
         }],
+    );
+    assert!(
+        !fast_direct_scene(&state, id, &whole, None, true),
+        "rounded CA mask erroneously permits WSI direct presentation"
     );
     assert_eq!(
         state.stage_composite_layer(id, &whole, &green, None, &mut SourceOwner(None), false),

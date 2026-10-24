@@ -214,24 +214,12 @@ pub(crate) fn forget(layer: Id) {
 }
 
 /// The layer at the top of `layer`'s tree.
-fn root_of(layer: Id) -> Id {
-    let mut at = layer;
-    for _ in 0..256 {
-        let up = read_node(at, |node| node.map_or(0, |node| node.superlayer));
-        if up == 0 {
-            break;
-        }
-        at = up as Id;
-    }
-    at
-}
-
 /// Local CA state up to (but excluding) the nearest ancestor NSView layer.
 /// When that ancestor also appears in the child's CA superlayer chain its
 /// opacity has already been applied by the parent view traversal.
 /// A missing ancestor link is intentional: NSView backing layers need not be
 /// structurally linked as Core Animation superlayers.
-pub(crate) fn scene_properties_below(layer: Id, ancestor: Id) -> (bool, f32) {
+pub(crate) fn scene_properties_below(layer: Id, ancestor: Id, now: f64) -> (bool, f32) {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(nodes) = nodes.as_ref() else {
         return (false, 1.0);
@@ -245,7 +233,7 @@ pub(crate) fn scene_properties_below(layer: Id, ancestor: Id) -> (bool, f32) {
         }
         let Some(node) = nodes.get(&at) else { break };
         hidden |= node.hidden;
-        opacity *= node.opacity;
+        opacity *= presented(&node.animations, "opacity", node.opacity, now);
         at = node.superlayer;
     }
     (hidden, opacity.clamp(0.0, 1.0) as f32)
@@ -304,13 +292,35 @@ pub(crate) fn scene_opacity(layer: Id) -> f32 {
     opacity.clamp(0.0, 1.0) as f32
 }
 
-/// Have the view showing `layer`'s tree recomposed.
-pub(crate) fn changed(layer: Id) {
-    // SAFETY: a layer of this crate's.
-    let view = unsafe { crate::layer::view_of(root_of(layer)) };
-    if !view.is_null() {
-        crate::backing::damage_view(view);
-        crate::view::notify_metal_layer_tree_change(view);
+#[cfg(test)]
+pub(crate) unsafe fn set_opacity_for_test(layer: Id, opacity: f32) {
+    unsafe { set_opacity(layer, objc::sel::get("setOpacity:"), opacity) };
+}
+
+/// A layer setter may execute on a guest thread other than AppKit's.
+/// Mark a transaction dirty rather than dereferencing a mutable NSView.
+pub(crate) fn changed(_layer: Id) {
+    crate::view::invalidate_metal_scene(true);
+}
+
+/// Whether a currently progressing opacity animation needs a new retained
+/// scene at the next video-thread pump, independent of drawable submissions.
+pub(crate) fn scene_opacity_animating(now: f64) -> bool {
+    read_all_nodes(|nodes| {
+        nodes.values().any(|node| {
+            node.animations.iter().any(|(_, animation)| {
+                animation.spec.key_path == "opacity"
+                    && !progress(&animation.spec, animation.start, now).1
+            })
+        })
+    })
+}
+
+fn read_all_nodes<T>(f: impl FnOnce(&HashMap<usize, Node>) -> T) -> T {
+    let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+    match nodes.as_ref() {
+        Some(nodes) => f(nodes),
+        None => f(&HashMap::new()),
     }
 }
 

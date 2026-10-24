@@ -549,7 +549,7 @@ impl Swapchain {
             .and_then(|entry| entry.clip)
     }
 
-    fn scene_rounded(&self, id: usize) -> &[RoundedClip] {
+    pub(super) fn scene_rounded(&self, id: usize) -> &[RoundedClip] {
         self.scene_placements
             .iter()
             .find(|entry| entry.id == id)
