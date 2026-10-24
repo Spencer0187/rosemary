@@ -721,6 +721,22 @@ impl Swapchain {
         bytes
     }
 
+    /// Lower bound on scene capacity with *all* previous submissions retired.
+    /// This is the non-evictable set; a new native source which cannot fit
+    /// alongside it will not become stageable by polling fences or sleeping.
+    pub(super) fn committed_scene_bytes(&self) -> u64 {
+        self.scene_layers
+            .iter()
+            .filter(|layer| layer.ready)
+            .map(|layer| scene_image_bytes(PresentSource::from(&layer.snapshot.image)))
+            .sum::<u64>()
+            .saturating_add(
+                self.composite
+                    .as_ref()
+                    .map_or(0, |image| scene_image_bytes(PresentSource::from(image))),
+            )
+    }
+
     /// Spares are only an optimization. Drop them on budget pressure; Arc
     /// leases held by unfinished GPU commands remain alive and stay charged
     /// through Frame::scene_reads until their completion fences retire.

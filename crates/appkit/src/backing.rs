@@ -218,6 +218,8 @@ struct NativeCapture {
     layer: usize,
     width: u32,
     height: u32,
+    crop_x: i64,
+    crop_y: i64,
     view_generation: Option<u64>,
     overlay_generation: u64,
     ca_content_revision: u64,
@@ -1409,7 +1411,35 @@ pub(crate) fn native_scene_pixels(
     width: u32,
     height: u32,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    if !native_scene_extent_supported(width, height) {
+    native_scene_pixels_cropped(
+        view,
+        width,
+        height,
+        Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(width),
+            height: i64::from(height),
+        },
+    )
+}
+
+/// Rasterize only the visible window-pixel portion of a larger NSView. Keep
+/// the full logical source extent for CA and overlay coordinate projection;
+/// otherwise a clipped view's backing content gets scaled to its crop.
+pub fn native_scene_pixels_cropped(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    if crop.x < 0
+        || crop.y < 0
+        || crop.is_empty()
+        || crop.x.checked_add(crop.width)? > i64::from(width)
+        || crop.y.checked_add(crop.height)? > i64::from(height)
+        || !native_scene_extent_supported(crop.width as u32, crop.height as u32)
+    {
         return None;
     }
     let layer = crate::view::layer_of(view);
@@ -1445,8 +1475,10 @@ pub(crate) fn native_scene_pixels(
             .get(&(view as usize))
             .filter(|hit| {
                 hit.layer == layer as usize
-                    && hit.width == width
-                    && hit.height == height
+                    && hit.width == crop.width as u32
+                    && hit.height == crop.height as u32
+                    && hit.crop_x == crop.x
+                    && hit.crop_y == crop.y
                     && hit.view_generation == view_generation
                     && hit.overlay_generation == overlay_generation
                     && hit.ca_content_revision == ca_content_revision
@@ -1457,27 +1489,55 @@ pub(crate) fn native_scene_pixels(
     }
     #[cfg(test)]
     NATIVE_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut output = Store::new(width, height);
+    let mut output = Store::new(crop.width as u32, crop.height as u32);
     let whole = Rect {
         x: 0,
         y: 0,
+        width: crop.width,
+        height: crop.height,
+    };
+    let logical = Rect {
+        x: -crop.x,
+        y: -crop.y,
         width: i64::from(width),
         height: i64::from(height),
     };
     use crate::coreanimation::{Pass, render_with_root_opacity};
-    render_with_root_opacity(view, &mut output, whole, whole, Pass::Background, Some(1.0));
+    render_with_root_opacity(
+        view,
+        &mut output,
+        logical,
+        whole,
+        Pass::Background,
+        Some(1.0),
+    );
     if let Some(source) = source {
         // CA/view opacity is applied by the retained scene, not a second time
         // during this isolated pixel capture.
-        blend_at(&mut output, source, 0, 0, whole, 1.0);
+        blend_at(&mut output, source, -crop.x, -crop.y, whole, 1.0);
     }
     if let Some(overlay) = overlay {
         // Software overlays (including CPU-backed web content) are also
         // separate native layers; previously they were irreversibly composed
         // under the later Metal drawable in the full window store.
-        blend_overlay_clipped(&mut output, overlay, 0, 0, width, height, whole);
+        blend_overlay_clipped(
+            &mut output,
+            overlay,
+            (-crop.x).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            (-crop.y).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            width,
+            height,
+            whole,
+        );
     }
-    render_with_root_opacity(view, &mut output, whole, whole, Pass::Sublayers, Some(1.0));
+    render_with_root_opacity(
+        view,
+        &mut output,
+        logical,
+        whole,
+        Pass::Sublayers,
+        Some(1.0),
+    );
     if output
         .pixels
         .as_chunks::<4>()
@@ -1504,8 +1564,10 @@ pub(crate) fn native_scene_pixels(
             view as usize,
             NativeCapture {
                 layer: layer as usize,
-                width,
-                height,
+                width: crop.width as u32,
+                height: crop.height as u32,
+                crop_x: crop.x,
+                crop_y: crop.y,
                 view_generation,
                 overlay_generation,
                 ca_content_revision,
@@ -1928,7 +1990,7 @@ fn compose_window(window: Id) {
     // additional snapshot when CPU content changes; ordinary AppKit-only
     // windows must not pay the hierarchy walk on every backing repaint.
     if crate::view::native_metal_scene_active(sdl) {
-        crate::view::invalidate_metal_scene(false);
+        crate::view::invalidate_metal_scene_for_window(sdl);
     }
 }
 
@@ -2120,7 +2182,7 @@ pub(crate) fn set_native_view_pixels_for_tests(view: Id, width: u32, height: u32
         .unwrap()
         .get_or_insert_with(HashMap::new)
         .insert(view as usize, store);
-    crate::view::invalidate_metal_scene(false);
+    crate::view::invalidate_metal_scene_for_view(view);
 }
 
 #[cfg(test)]
@@ -2427,7 +2489,7 @@ pub fn set_overlay(view: Id, overlay: Overlay) {
             NEXT_OVERLAY_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         );
     mark_window_of(view);
-    crate::view::invalidate_metal_scene(false);
+    crate::view::invalidate_metal_scene_for_view(view);
 }
 
 pub fn remove_overlay(view: Id) {
@@ -2443,7 +2505,7 @@ pub fn remove_overlay(view: Id) {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&(view as usize));
         mark_window_of(view);
-        crate::view::invalidate_metal_scene(false);
+        crate::view::invalidate_metal_scene_for_view(view);
     }
 }
 

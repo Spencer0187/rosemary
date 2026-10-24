@@ -69,6 +69,20 @@ impl GpuCharge {
     }
 }
 
+fn window_gpu_capacity_available(window: usize, incoming: u64) -> bool {
+    if incoming > WINDOW_GPU_PAYLOAD_BUDGET {
+        return false;
+    }
+    let registry = WINDOW_GPU_BUDGETS
+        .lock()
+        .expect("window GPU budget registry");
+    let held = registry
+        .get(&window)
+        .and_then(std::sync::Weak::upgrade)
+        .map_or(0, |budget| budget.held.load(Ordering::Acquire));
+    held <= WINDOW_GPU_PAYLOAD_BUDGET - incoming
+}
+
 impl Drop for GpuCharge {
     fn drop(&mut self) {
         self.budget.held.fetch_sub(self.bytes, Ordering::AcqRel);
@@ -1858,6 +1872,9 @@ fn native_scene_source(
 #[cfg(test)]
 static NATIVE_IMAGE_UPLOAD_ATTEMPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static NATIVE_HARD_BUDGET_REFUSALS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn stage_native_scene_source(
     state: &mut Swapchain,
@@ -1923,10 +1940,28 @@ fn stage_native_scene_source(
             if native.dmabuf.is_some() {
                 appkit::backing::refuse_dmabufs(frame.window);
             }
-            // This is not a transient per-frame pool collision. Preserve the
-            // previously committed scene and report the bounded refusal.
+            // Fence-held retired leases may clear shortly. A committed
+            // snapshot and its accumulator cannot disappear without new
+            // scene membership. Distinguish those cases so a permanently
+            // impossible native revision never spins the GPU presentation
+            // worker in a 10-ms retry loop.
+            if scene::fits_scene_budget(
+                state.committed_scene_bytes(),
+                image_bytes.saturating_mul(scratch_count),
+            ) {
+                return Ok(false);
+            }
             return Err("native AppKit GPU scene budget exhausted".into());
         }
+    }
+    // Unlike an impossible committed-scene footprint, transient backing
+    // and fence-retained window allocations may retire without a scene edit.
+    // Defer these without allocating or permanently rejecting this revision.
+    if !window_gpu_capacity_available(
+        frame.window as usize,
+        image_bytes.saturating_mul(scratch_count),
+    ) {
+        return Ok(false);
     }
     #[cfg(test)]
     NATIVE_IMAGE_UPLOAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -2090,7 +2125,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
     let mut acquire_timeouts = 0u32;
     // Do not request a CPU redraw for an identical rejected producer frame on
     // every unrelated CA transaction. New native revisions can request again.
-    let mut refused_revisions = std::collections::HashMap::<usize, u64>::new();
+    let mut refused_revisions = std::collections::HashMap::<usize, (u64, u64)>::new();
     loop {
         // Wait without polling when clean. The writer sets composite_dirty under
         // the same mutex before signaling us, so notifications are not lost.
@@ -2167,23 +2202,48 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 let mut native_ready = true;
                 let mut refused = Vec::new();
                 for layer in live.iter().filter(|p| p.native.is_some()) {
+                    let revision = layer.native.as_ref().expect("filtered").revision;
+                    let committed = state.committed_scene_bytes();
+                    // A hard-rejected revision cannot become admissible until
+                    // the committed footprint drops or the source changes.
+                    if refused_revisions
+                        .get(&layer.id)
+                        .is_some_and(|&(old, floor)| old == revision && committed >= floor)
+                    {
+                        refused.push(layer.id);
+                        continue;
+                    }
                     match stage_native_scene_source(&mut state, layer) {
                         Ok(true) => {}
                         Ok(false) => {
                             native_ready = false;
                             break;
                         }
-                        Err(reason) if reason == "native-dmabuf-import-refused" => {
+                        Err(reason)
+                            if reason == "native-dmabuf-import-refused"
+                                || reason == "native AppKit GPU scene budget exhausted" =>
+                        {
                             // Keep the last successfully published window
                             // image. Its producer will receive the changed
                             // importer capability and next supply CPU pixels;
                             // retries of the unchanged DMA-BUF cannot help.
-                            let revision = layer.native.as_ref().unwrap().revision;
-                            if refused_revisions.insert(layer.id, revision) != Some(revision) {
-                                appkit::view::request_native_cpu_fallback(
-                                    window as sdl3::Window,
-                                    layer.id,
-                                );
+                            if refused_revisions.insert(layer.id, (revision, committed))
+                                != Some((revision, committed))
+                            {
+                                #[cfg(test)]
+                                if reason.contains("budget") {
+                                    NATIVE_HARD_BUDGET_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                                }
+                                gpu::trace(format!(
+                                    "native AppKit source {} revision {} permanently refused: {}",
+                                    layer.id, revision, reason
+                                ));
+                                if reason == "native-dmabuf-import-refused" {
+                                    appkit::view::request_native_cpu_fallback(
+                                        window as sdl3::Window,
+                                        layer.id,
+                                    );
+                                }
                             }
                             refused.push(layer.id);
                             // Continue staging unaffected native sources. The

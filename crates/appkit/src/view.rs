@@ -132,6 +132,12 @@ static METAL_SCENES: std::sync::Mutex<
 static METAL_SCENE_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static METAL_VIEW_SCENE_DIRTY: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+/// SDL window identities are published without borrowing NSViews. Targeted
+/// AppKit changes only recapture the affected window; unresolved reparenting
+/// still goes through the process-wide fallback flag above.
+static METAL_VIEW_DIRTY_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 static METAL_CA_DAMAGE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// CA roots are numerical identities; only the video owner associates them
 /// with live windows after walking the NSView tree.
@@ -148,7 +154,7 @@ pub fn request_native_cpu_fallback(window: sdl3::Window, scene_layer: usize) {
     if !pending.contains(&(window as usize, scene_layer)) {
         pending.push((window as usize, scene_layer));
     }
-    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+    invalidate_metal_scene_for_window(window);
 }
 
 fn find_scene_native_view(root: Id, scene_layer: usize, depth: usize) -> Option<Id> {
@@ -225,6 +231,34 @@ pub(crate) fn invalidate_metal_scene(ca_damage: bool) {
     METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
 }
 
+/// Safe on any thread: only numeric SDL identities cross this queue.
+pub(crate) fn invalidate_metal_scene_for_window(sdl: sdl3::Window) {
+    if sdl.is_null() {
+        invalidate_metal_scene(false);
+        return;
+    }
+    METAL_VIEW_DIRTY_WINDOWS
+        .lock()
+        .expect("view dirty windows")
+        .insert(sdl as usize);
+    METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Ordinary view setters run in AppKit's owner context. Never dereference an
+/// NSView on a Metal presentation worker or other unknown guest thread.
+pub(crate) fn invalidate_metal_scene_for_view(view: Id) {
+    if !sdl3::video::is_video_thread() || !is_view(view) {
+        invalidate_metal_scene(false);
+        return;
+    }
+    let window = unsafe { window_of(view) };
+    if window.is_null() {
+        invalidate_metal_scene(false);
+        return;
+    }
+    invalidate_metal_scene_for_window(unsafe { crate::window::sdl_window(window) });
+}
+
 /// Called by the video-thread event pump after dispatching guest input.
 /// An invalidation racing a capture stays dirty for the following turn.
 /// Animation frames intentionally publish without waiting for new drawables.
@@ -249,13 +283,19 @@ pub(crate) fn flush_metal_scenes() {
     let dirty = METAL_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
     let damage = METAL_CA_DAMAGE.swap(false, std::sync::atomic::Ordering::AcqRel);
     let view_dirty = METAL_VIEW_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
-    if (damage || view_dirty) && !dirty {
+    let targeted =
+        std::mem::take(&mut *METAL_VIEW_DIRTY_WINDOWS.lock().expect("view dirty windows"));
+    if (damage || view_dirty || !targeted.is_empty()) && !dirty {
         if damage {
             METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
         }
         if view_dirty {
             METAL_VIEW_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
         }
+        METAL_VIEW_DIRTY_WINDOWS
+            .lock()
+            .expect("view dirty windows")
+            .extend(targeted.iter().copied());
         METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
     }
     if !dirty && !animating && !was_animating {
@@ -296,9 +336,10 @@ pub(crate) fn flush_metal_scenes() {
         }
     }
     drop(owners);
-    // View hierarchy mutations have no trusted target identifier: capture all
-    // live windows. CA changes with a published root affect only their owner.
+    // Known view/overlay/window mutations only affect that live SDL owner.
+    // Unknown lifecycle owners and unscoped CA damage conservatively fan out.
     let global = damage || view_dirty || unknown;
+    affected.extend(targeted);
     for window in crate::window::all() {
         let sdl = unsafe { crate::window::sdl_window(window) };
         if sdl.is_null() {
@@ -612,7 +653,38 @@ fn visit_metal_scene(
     if *seen_metal && (layer.is_null() || !crate::layer::is_metal(layer)) {
         if let Some(frame) = unsafe { presentation_frame(view) } {
             if frame.window == window {
-                let cpu = crate::backing::native_scene_pixels(view, frame.width, frame.height);
+                // A 6K NSView clipped into a small Metal window only needs
+                // that visible rectangle in GPU memory. Preserve source-local
+                // coordinates while publishing the cropped frame in window
+                // pixels; Metal never gets the flattened-underlay version.
+                let viewport = Frame {
+                    x: 0,
+                    y: 0,
+                    width: frame.window_width,
+                    height: frame.window_height,
+                    ..frame
+                };
+                let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
+                    intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
+                });
+                let crop = crate::backing::Rect {
+                    x: i64::from(visible.x) - i64::from(frame.x),
+                    y: i64::from(visible.y) - i64::from(frame.y),
+                    width: i64::from(visible.width),
+                    height: i64::from(visible.height),
+                };
+                let bounded =
+                    crate::backing::native_scene_extent_supported(frame.width, frame.height);
+                let cpu = if bounded {
+                    crate::backing::native_scene_pixels(view, frame.width, frame.height)
+                } else {
+                    crate::backing::native_scene_pixels_cropped(
+                        view,
+                        frame.width,
+                        frame.height,
+                        crop,
+                    )
+                };
                 // Source admission must agree with both Vulkan's native-scene
                 // converter and the backing-overlay exclusion decision. An
                 // unsupported extent stays in the original full-window path.
@@ -625,7 +697,11 @@ fn visit_metal_scene(
                         ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
                     scene.push(MetalSceneLayer {
                         layer: (view as usize) | (1usize << (usize::BITS - 1)),
-                        frame,
+                        frame: if !bounded && cpu.is_some() {
+                            visible
+                        } else {
+                            frame
+                        },
                         opacity: (effective_alpha(view) as f32) * layer_opacity,
                         opaque: false,
                         clip: ca_clip,
@@ -739,11 +815,11 @@ pub fn forget_metal_scene(sdl: sdl3::Window) {
     {
         cache.remove(&(sdl as usize));
     }
-    invalidate_metal_scene(false);
+    invalidate_metal_scene_for_window(sdl);
 }
 
-fn notify_metal_scene(_view: Id) {
-    invalidate_metal_scene(false);
+fn notify_metal_scene(view: Id) {
+    invalidate_metal_scene_for_view(view);
 }
 
 /// Post the frame and bounds notifications a resized view owes its observers.
@@ -1262,7 +1338,11 @@ pub unsafe fn set_window(view: Id, window: Id) {
     if !is_view(view) {
         return;
     }
+    let previous = unsafe { window_of(view) };
     view_of(view).window = window;
+    if !previous.is_null() {
+        invalidate_metal_scene_for_window(unsafe { crate::window::sdl_window(previous) });
+    }
     notify_metal_scene(view);
 }
 
@@ -1276,7 +1356,7 @@ pub unsafe fn detach_window(view: Id, window: Id) {
         let sdl = unsafe { crate::window::sdl_window(window) };
         view_of(view).window = std::ptr::null_mut();
         if !sdl.is_null() {
-            invalidate_metal_scene(false);
+            invalidate_metal_scene_for_window(sdl);
         }
     }
 }
@@ -4451,6 +4531,193 @@ mod tests {
             assert_eq!(f(layer, get_masks), 0);
         }
         objc::arc::release(view);
+    }
+
+    #[test]
+    fn oversized_native_cpu_foreground_crops_visible_pixels_above_metal() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let oversized = view(rect(-43.0, -27.0, 6016.0, 3384.0));
+        let cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let metal = unsafe { make(cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), oversized);
+        }
+        let width = 6016usize;
+        let height = 3384usize;
+        let mut pixels = vec![0u8; width * height * 4];
+        for row in 0..height {
+            for column in 0..width {
+                let at = (row * width + column) * 4;
+                pixels[at..at + 4].copy_from_slice(&[
+                    (column % 256) as u8,
+                    (row % 256) as u8,
+                    220,
+                    255,
+                ]);
+            }
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            oversized,
+            width as u32,
+            height as u32,
+            pixels,
+        );
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(scene.len(), 2, "oversize view disappeared beneath Metal");
+        assert_eq!(scene[0].layer, metal as usize);
+        assert_eq!(
+            scene[1].layer,
+            (oversized as usize) | (1usize << (usize::BITS - 1))
+        );
+        let frame = scene[1].frame;
+        let logical = unsafe { presentation_frame(oversized) }.unwrap();
+        assert_eq!((frame.x, frame.y), (0, 0));
+        assert!(frame.width <= frame.window_width && frame.height <= frame.window_height);
+        let crop_x = (i64::from(frame.x) - i64::from(logical.x)) as usize;
+        let crop_y = (i64::from(frame.y) - i64::from(logical.y)) as usize;
+        let source = scene[1].native_pixels.as_ref().unwrap();
+        assert_eq!(
+            source.len(),
+            frame.width as usize * frame.height as usize * 4,
+            "full 6K source was copied instead of bounded visible crop"
+        );
+        assert_eq!(
+            &source[..4],
+            &[(crop_x % 256) as u8, (crop_y % 256) as u8, 220, 255]
+        );
+        let at = (20 * frame.width as usize + 15) * 4;
+        assert_eq!(
+            &source[at..at + 4],
+            &[
+                ((crop_x + 15) % 256) as u8,
+                ((crop_y + 20) % 256) as u8,
+                220,
+                255
+            ]
+        );
+        assert!(
+            crate::backing::gpu_under_metal(sdl, &crate::backing::Store::new(320, 240)).is_some()
+        );
+        // A move without new pixels has to recapture the different viewport.
+        unsafe {
+            set_frame_origin(
+                oversized,
+                objc::sel::get("setFrameOrigin:"),
+                NSPoint { x: -58.0, y: -47.0 },
+            )
+        };
+        flush_metal_scenes();
+        let next = metal_scene(sdl).unwrap();
+        let moved = unsafe { presentation_frame(oversized) }.unwrap();
+        let cropped = next[1].frame;
+        let moved_x = (i64::from(cropped.x) - i64::from(moved.x)) as usize;
+        let moved_y = (i64::from(cropped.y) - i64::from(moved.y)) as usize;
+        assert_eq!(
+            &next[1].native_pixels.as_ref().unwrap()[..4],
+            &[(moved_x % 256) as u8, (moved_y % 256) as u8, 220, 255]
+        );
+        assert_ne!((crop_x, crop_y), (moved_x, moved_y));
+        crate::backing::forget(oversized);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn changing_one_native_view_does_not_recapture_other_windows() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(cls.metaclass().method(maker).unwrap().implementation()) };
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = Vec::new();
+        let mut natives = Vec::new();
+        let mut sdl = Vec::new();
+        for _ in 0..2 {
+            let window =
+                objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            if !unsafe {
+                crate::window::init_with_content_rect_for_tests(
+                    window,
+                    rect(0.0, 0.0, 160.0, 120.0),
+                )
+            } {
+                for old in windows {
+                    objc::arc::release(old);
+                }
+                return;
+            }
+            let content = view(rect(0.0, 0.0, 160.0, 120.0));
+            unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+            let metal_view = view(rect(0.0, 0.0, 160.0, 120.0));
+            let native = view(rect(10.0, 10.0, 60.0, 40.0));
+            unsafe {
+                set_layer(
+                    metal_view,
+                    objc::sel::get("setLayer:"),
+                    make(cls as *const _ as Id, maker),
+                );
+                add_subview(content, objc::sel::get("addSubview:"), metal_view);
+                add_subview(content, objc::sel::get("addSubview:"), native);
+            }
+            crate::backing::set_native_view_pixels_for_tests(
+                native,
+                60,
+                40,
+                [0, 0, 255, 255].repeat(60 * 40),
+            );
+            windows.push(window);
+            natives.push(native);
+            sdl.push(unsafe { crate::window::sdl_window(window) });
+        }
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl[0]).unwrap().len(), 2);
+        assert_eq!(metal_scene(sdl[1]).unwrap().len(), 2);
+        for n in 0..12 {
+            let old = METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed);
+            crate::backing::set_native_view_pixels_for_tests(
+                natives[0],
+                60,
+                40,
+                [n as u8, 0, 255, 255].repeat(60 * 40),
+            );
+            flush_metal_scenes();
+            assert_eq!(
+                METAL_SCENE_CAPTURES.load(std::sync::atomic::Ordering::Relaxed) - old,
+                1,
+                "native mutation in window A recaptured unrelated window B"
+            );
+        }
+        for native in natives {
+            crate::backing::forget(native);
+        }
+        for window in windows {
+            objc::arc::release(window);
+        }
     }
 
     #[test]

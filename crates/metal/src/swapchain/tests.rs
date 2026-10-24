@@ -4278,6 +4278,270 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     sdl3::video::destroy_window(window);
 }
 
+/// External backing pool reservations or fence-held leases are not a hard
+/// scene-size impossibility. Deferred native staging must avoid a wasted
+/// Vulkan upload and resume when unrelated GPU image ownership retires.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal() {
+    if isolate_vulkan_graphical_test(
+        "temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let bytes = 48u32 * 44 * 4;
+    let pressured = GpuCharge::reserve(
+        window as usize,
+        WINDOW_GPU_PAYLOAD_BUDGET - u64::from(bytes),
+    )
+    .unwrap();
+    let view = appkit::view::Frame {
+        x: 12,
+        y: 16,
+        width: 48,
+        height: 44,
+        ..whole
+    };
+    let native = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0x91ab,
+        frame: DirectFrame::from_frame(&view),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0, 0, 255, 255].repeat((48 * 44) as usize)),
+            revision: 1,
+            dmabuf: None,
+        }),
+    };
+    let before = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    let rejected = NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed);
+    assert_eq!(
+        stage_native_scene_source(&mut state, &native),
+        Ok(false),
+        "temporary ledger ownership pressure was mistaken for an impossible source"
+    );
+    assert_eq!(NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed), before);
+    assert_eq!(
+        NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed),
+        rejected
+    );
+    drop(pressured);
+    assert_eq!(stage_native_scene_source(&mut state, &native), Ok(true));
+    state.synchronize_scene(window as usize, &[native]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            24,
+            30
+        ),
+        [255, 0, 0, 255]
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Real Vulkan/WSI regression: six individually valid 4096² CPU native
+/// sources exceed the aggregate retained-scene budget in combination. The
+/// unstageable sixth revision must neither loop nor starve an existing Metal
+/// layer's scene-only repaint or subsequent WSI publication.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn hard_cpu_native_budget_refusal_does_not_spin_or_starve_wsi_worker() {
+    if isolate_vulkan_graphical_test(
+        "hard_cpu_native_budget_refusal_does_not_spin_or_starve_wsi_worker",
+    ) {
+        return;
+    }
+    let _retire_guard = AwaitTestWindowRetirements;
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"CPU hard-budget WSI", 160, 120, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).expect("owner SDL snapshot");
+    let metal = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 160,
+            height: 120,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 160,
+        height: 120,
+        window_width: 160,
+        window_height: 120,
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let metal_id = window as usize;
+    assert_eq!(present(gpu, metal_id, &whole, &metal, &[]), Ok(true));
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&metal_id)
+        .unwrap()
+        .clone();
+    let base = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let huge = appkit::view::Frame {
+        width: 4096,
+        height: 4096,
+        ..whole
+    };
+    let mut scene = vec![base.clone()];
+    for index in 0..6usize {
+        let id = (1usize << (usize::BITS - 1)) | (0x41000 + index);
+        scene.push(ScenePlacement {
+            id,
+            frame: DirectFrame::from_frame(&huge),
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: Some(scene::NativeCpuSceneSource {
+                bytes: Arc::new([index as u8, 0, 255, 255].repeat(4096 * 4096)),
+                revision: index as u64 + 1,
+                dmabuf: None,
+            }),
+        });
+    }
+    let before_refused = NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed);
+    let before_upload = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    *entry.pending_scene.lock().unwrap() = Some(scene.clone());
+    ensure_layer_compositor_worker(window as usize, &entry);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let refused = NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed);
+        let settled = entry.pending_scene.lock().unwrap().is_none();
+        let state = entry.state.lock().unwrap();
+        let ready = state
+            .scene_layers
+            .iter()
+            .filter(|layer| layer.native_revision.is_some())
+            .count();
+        if refused > before_refused && settled && ready >= 4 && !state.composite_dirty {
+            assert_eq!(entry.present_failure.load(Ordering::Relaxed), 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WSI worker stalled on a permanently refused CPU source: ready={ready}, refused={refused}, settled={settled}"
+        );
+        drop(state);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let initial_frame = entry.state.lock().unwrap().frame;
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed),
+        before_refused + 1,
+        "same permanently rejected CPU revision retried without a scene change"
+    );
+    let uploaded = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    assert!(uploaded > before_upload);
+    // Recompose static metal after changing only its alpha, with the identical
+    // rejected CPU revision still supplied. No repeated failed large upload.
+    let changed = ScenePlacement {
+        opacity: 0.6,
+        ..base
+    };
+    scene[0] = changed;
+    *entry.pending_scene.lock().unwrap() = Some(scene);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = entry.state.lock().unwrap();
+        if entry.pending_scene.lock().unwrap().is_none()
+            && state
+                .scene_placements
+                .iter()
+                .find(|p| p.id == metal_id)
+                .is_some_and(|p| p.opacity == 0.6)
+            && !state.composite_dirty
+            && state.frame > initial_frame
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "unchanged rejected CPU source starved subsequent WSI scene repaint"
+        );
+        drop(state);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed),
+        before_refused + 1
+    );
+    assert_eq!(
+        NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed),
+        uploaded
+    );
+    forget_window(window);
+    drop(entry);
+    sdl3::video::destroy_window(window);
+    gpu.destroy_image(metal);
+}
+
 /// A native opaque view is an authoritative occlusion source even before
 /// a CPU backing store has arrived. Moving/removing it must repaint a static
 /// retained Metal image without a new Metal drawable submission.
@@ -4409,6 +4673,156 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
     if state.direct.is_none() {
         assert_eq!(pixel(&state, 90, 50), [0, 255, 0, 255]);
     }
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// A large CPU-backed NSView is clipped to a small visible slice without
+/// losing view-local texture coordinates or falling underneath a static Metal
+/// drawable. Verify the real AppKit capture bytes in the *final* Vulkan image.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
+    if isolate_vulkan_graphical_test(
+        "oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    appkit::bootstrap();
+    let cls = objc::class::lookup(c"NSView").expect("native NSView");
+    let native_view = objc::object::create_instance(cls, 0);
+    // Source width 6016 x height 3384 exceeds the 64 MiB AppKit capture cap.
+    let mut pixels = [0u8, 0, 255, 255].repeat(6016);
+    for (index, texel) in pixels.chunks_exact_mut(4).enumerate() {
+        if index >= 3000 {
+            texel.copy_from_slice(&[255, 0, 0, 255]); // blue in BGRA
+        }
+    }
+    appkit::backing::set_overlay(
+        native_view,
+        appkit::backing::Overlay {
+            width: 6016,
+            height: 1,
+            picture: appkit::backing::Picture::Pixels(pixels),
+        },
+    );
+    let capture = |left| {
+        appkit::backing::native_scene_pixels_cropped(
+            native_view,
+            6016,
+            3384,
+            appkit::backing::Rect {
+                x: left,
+                y: 40,
+                width: 80,
+                height: 60,
+            },
+        )
+        .expect("window-visible native crop")
+    };
+    let first = capture(3000);
+    assert_eq!(first.0.len(), 80 * 60 * 4);
+    assert_eq!(&first.0[..4], &[255, 0, 0, 255]);
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let metal_id = 0x6d01usize;
+    let native_id = (1usize << (usize::BITS - 1)) | (native_view as usize);
+    let bottom = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let native_frame = appkit::view::Frame {
+        x: 35,
+        y: 20,
+        width: 80,
+        height: 60,
+        ..whole
+    };
+    let foreground = |capture: (Arc<Vec<u8>>, u64)| ScenePlacement {
+        id: native_id,
+        frame: DirectFrame::from_frame(&native_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: capture.0,
+            revision: capture.1,
+            dmabuf: None,
+        }),
+    };
+    let native = foreground(first);
+    state.layers.push(metal_id);
+    state.synchronize_scene(window as usize, &[bottom.clone(), native.clone()]);
+    assert_eq!(
+        state.stage_composite_layer(
+            metal_id,
+            &whole,
+            &metal,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(metal_id, &whole);
+    assert_eq!(stage_native_scene_source(&mut state, &native), Ok(true));
+    state.synchronize_scene(window as usize, &[bottom.clone(), native]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let read = |s: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            s.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(read(&state, 40, 30), [0, 0, 255, 255]);
+    assert_eq!(
+        read(&state, 10, 10),
+        [0, 255, 0, 255],
+        "oversize native was flattened beneath Metal or punched a hole"
+    );
+    // Moving the giant view changes the crop but not the Metal drawable.
+    let changed = foreground(capture(0));
+    assert_eq!(stage_native_scene_source(&mut state, &changed), Ok(true));
+    state.synchronize_scene(window as usize, &[bottom, changed]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(read(&state, 40, 30), [255, 0, 0, 255]);
+    assert_eq!(read(&state, 10, 10), [0, 255, 0, 255]);
+    appkit::backing::remove_overlay(native_view);
+    objc::arc::release(native_view);
     drop(state);
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
