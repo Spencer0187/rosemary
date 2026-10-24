@@ -37,9 +37,16 @@ pub(super) enum ScenePrepared {
     Ready(SceneWork),
 }
 
-// The allowance includes currently reusable and busy snapshots; an initial
-// snapshot for a newly visible layer is mandatory for correct composition.
-const SCENE_IMAGE_BUDGET: u64 = 256 * 1024 * 1024;
+// Hard per-window owned compositor GPU image ceiling, including the window
+// accumulator, scene snapshots, in-flight retired leases, and transient native
+// upload/blend images. Does not cover guest-owned drawable or WSI images.
+// A 6016x3384 DMA source can require four RGBA images during initial staging
+// (transparent base, blend output, retained layer, and window accumulator).
+const SCENE_IMAGE_BUDGET: u64 = 512 * 1024 * 1024;
+
+pub(super) fn fits_scene_budget(held: u64, incoming: u64) -> bool {
+    incoming <= SCENE_IMAGE_BUDGET && held <= SCENE_IMAGE_BUDGET - incoming
+}
 pub(super) const MAX_SCENE_IMAGES_PER_LAYER: usize = FRAMES_IN_FLIGHT;
 
 fn scene_image_bytes(source: PresentSource) -> u64 {
@@ -68,6 +75,7 @@ const INITIAL_SCENE_LAYERS: usize = 32;
 /// AppKit's DMA-BUF overlays. Descriptor updates are frame-slot isolated.
 pub(super) struct SceneBlender {
     gpu: &'static Gpu,
+    window: usize,
     layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     sampler: vk::Sampler,
@@ -78,10 +86,11 @@ pub(super) struct SceneBlender {
     pub(super) sets: Vec<Vec<vk::DescriptorSet>>,
     /// Each clip buffer belongs to one fence-protected frame slot.
     masks: Vec<Mutex<Option<GpuBuffer>>>,
+    mask_charges: Vec<Mutex<Option<GpuCharge>>>,
 }
 
 impl SceneBlender {
-    fn new(gpu: &'static Gpu) -> Result<Self, String> {
+    fn new(gpu: &'static Gpu, window: usize) -> Result<Self, String> {
         let device = &gpu.device;
         let set_layout = gpu.descriptor_set_layout(
             &[
@@ -134,6 +143,7 @@ impl SceneBlender {
         });
         let mut result = Self {
             gpu,
+            window,
             layout: layout.take(),
             pipeline: pipeline.take(),
             sampler: sampler.take(),
@@ -141,6 +151,7 @@ impl SceneBlender {
             set_layout,
             sets: vec![Vec::new(); FRAMES_IN_FLIGHT],
             masks: (0..FRAMES_IN_FLIGHT).map(|_| Mutex::new(None)).collect(),
+            mask_charges: (0..FRAMES_IN_FLIGHT).map(|_| Mutex::new(None)).collect(),
         };
         result.reserve_layers(INITIAL_SCENE_LAYERS)?;
         Ok(result)
@@ -229,10 +240,12 @@ impl SceneBlender {
             .as_ref()
             .is_none_or(|buffer| buffer.length < bytes as u64)
         {
+            let charge = GpuCharge::reserve(self.window, bytes as u64)?;
             let fresh = self.gpu.create_buffer(bytes as u64)?;
             if let Some(old) = guard.replace(fresh) {
                 self.gpu.destroy_buffer(old);
             }
+            *self.mask_charges[slot].lock().expect("clip budget") = Some(charge);
         }
         let buffer = guard.as_ref().expect("allocated mask buffer");
         unsafe {
@@ -330,10 +343,11 @@ impl Drop for SceneBlender {
             for pool in self.pools.drain(..) {
                 device.destroy_descriptor_pool(pool, None);
             }
-            for slot in &self.masks {
+            for (slot, charge) in self.masks.iter().zip(&self.mask_charges) {
                 if let Some(buffer) = slot.lock().expect("clip frame").take() {
                     self.gpu.destroy_buffer(buffer);
                 }
+                *charge.lock().expect("clip budget") = None;
             }
             device.destroy_sampler(self.sampler, None);
             device.destroy_pipeline(self.pipeline, None);
@@ -371,22 +385,29 @@ pub(super) struct ScenePlacement {
     pub native: Option<NativeCpuSceneSource>,
 }
 
-fn scene_image(gpu: &'static Gpu, source: PresentSource) -> Result<Arc<BackingImageLease>, String> {
-    let image = gpu.create_image(&ImageDescription {
-        image_type: vk::ImageType::TYPE_2D,
-        view_type: vk::ImageViewType::TYPE_2D,
-        format: source.format,
-        width: source.width,
-        height: source.height,
-        depth: 1,
-        levels: 1,
-        layers: 1,
-        samples: 1,
-        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
-        cube: false,
-        components: vk::ComponentMapping::default(),
-    })?;
-    Ok(BackingImageLease::new(gpu, image))
+fn scene_image(
+    gpu: &'static Gpu,
+    window: usize,
+    source: PresentSource,
+) -> Result<Arc<BackingImageLease>, String> {
+    BackingImageLease::create_for_window(
+        gpu,
+        window,
+        &ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: source.format,
+            width: source.width,
+            height: source.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        },
+    )
 }
 
 /// Synchronize transfers, sampled images and the storage compositor across
@@ -664,6 +685,51 @@ impl Swapchain {
             .map_or(1.0, |entry| entry.opacity)
     }
 
+    /// Count distinct *owned* GPU images, not Arc references: copies held by
+    /// the current scene and submitted frame leases refer to one allocation.
+    /// External guest drawables and WSI-owned images are deliberately excluded.
+    pub(super) fn scene_gpu_bytes(&self) -> u64 {
+        let mut seen = std::collections::HashSet::new();
+        let mut bytes = 0u64;
+        let mut count = |lease: &Arc<BackingImageLease>| {
+            if seen.insert(Arc::as_ptr(lease) as usize) {
+                bytes = bytes.saturating_add(scene_image_bytes(PresentSource::from(&lease.image)));
+            }
+        };
+        for layer in &self.scene_layers {
+            count(&layer.snapshot);
+            for spare in &layer.spare {
+                count(spare);
+            }
+        }
+        for frame in &self.frames {
+            if let Some(lease) = &frame.backing {
+                count(lease);
+            }
+            for lease in &frame.scene_reads {
+                count(lease);
+            }
+        }
+        if let Some(direct) = &self.direct {
+            if let Some(lease) = &direct.backing {
+                count(lease);
+            }
+        }
+        if let Some(composite) = &self.composite {
+            bytes = bytes.saturating_add(scene_image_bytes(PresentSource::from(composite)));
+        }
+        bytes
+    }
+
+    /// Spares are only an optimization. Drop them on budget pressure; Arc
+    /// leases held by unfinished GPU commands remain alive and stay charged
+    /// through Frame::scene_reads until their completion fences retire.
+    pub(super) fn shed_scene_spares(&mut self) {
+        for layer in &mut self.scene_layers {
+            layer.spare.clear();
+        }
+    }
+
     /// Create/rotate a snapshot allocation before a command references it.
     /// A dropped generation stays alive through Frame::scene_reads until its
     /// last GPU copy fence has signaled.
@@ -699,7 +765,7 @@ impl Swapchain {
             return Ok(ScenePrepared::SingleLayer);
         }
         if self.scene_blender.is_none() {
-            self.scene_blender = Some(SceneBlender::new(self.gpu)?);
+            self.scene_blender = Some(SceneBlender::new(self.gpu, self.window)?);
         }
         self.scene_blender
             .as_mut()
@@ -716,14 +782,23 @@ impl Swapchain {
         // Prepare both required allocations before mutating the live scene.
         // If the current layer's pool is saturated, leave the previous image
         // intact and ask the presenter to retry when a GPU source is free.
-        let previous_image = if previous.is_some() && self.composite.is_some() {
-            Some(scene_image(
-                self.gpu,
-                PresentSource::from(self.composite.as_ref().expect("checked above")),
-            )?)
-        } else {
-            None
-        };
+        let previous_image_source = previous
+            .and_then(|_| self.composite.as_ref())
+            .map(PresentSource::from);
+        if let Some(source) = previous_image_source {
+            if !fits_scene_budget(self.scene_gpu_bytes(), scene_image_bytes(source)) {
+                self.shed_scene_spares();
+                if !fits_scene_budget(self.scene_gpu_bytes(), scene_image_bytes(source)) {
+                    return Err(
+                        "retained scene GPU budget exhausted capturing previous layer".into(),
+                    );
+                }
+            }
+        }
+        let previous_image = previous_image_source
+            .map(|source| scene_image(self.gpu, self.window, source))
+            .transpose()?;
+        let previous_image_bytes = previous_image_source.map_or(0, scene_image_bytes);
         let existing = self.scene_layers.iter().position(|layer| layer.id == id);
         // Incremental repaint is only safe when a fully committed scene and
         // this layer's previous geometry/masking match the new submission.
@@ -764,28 +839,20 @@ impl Swapchain {
                 let layer = &self.scene_layers[index];
                 1 + layer.spare.len()
             });
-            let currently_held = self
-                .scene_layers
-                .iter()
-                .map(|layer| {
-                    std::iter::once(&layer.snapshot)
-                        .chain(layer.spare.iter())
-                        .map(|image| scene_image_bytes(PresentSource::from(&image.image)))
-                        .sum::<u64>()
-                })
-                .sum::<u64>();
-            let mandatory = existing.is_none()
-                || existing.is_some_and(|index| {
-                    !source_matches(&self.scene_layers[index].snapshot.image, source)
-                });
-            if !mandatory
-                && (count >= MAX_SCENE_IMAGES_PER_LAYER
-                    || currently_held.saturating_add(scene_image_bytes(source))
-                        > SCENE_IMAGE_BUDGET)
-            {
+            if count >= MAX_SCENE_IMAGES_PER_LAYER {
                 return Ok(ScenePrepared::Deferred);
             }
-            scene_image(self.gpu, source)?
+            // Budget all retained images, the full-window accumulator, prior
+            // source capture and in-flight/retired leases. No "mandatory"
+            // bypass: a new layer or resize can never overcommit GPU memory.
+            let incoming = previous_image_bytes.saturating_add(scene_image_bytes(source));
+            if !fits_scene_budget(self.scene_gpu_bytes(), incoming) {
+                self.shed_scene_spares();
+                if !fits_scene_budget(self.scene_gpu_bytes(), incoming) {
+                    return Err("retained scene GPU allocation budget exhausted".into());
+                }
+            }
+            scene_image(self.gpu, self.window, source)?
         };
         let prior = existing.map(|index| self.scene_layers[index].clone());
         if let (Some(old), Some(snapshot)) = (previous, previous_image) {
@@ -1237,7 +1304,7 @@ impl Swapchain {
             .composite
             .as_ref()
             .ok_or("single-layer accumulator absent")?;
-        let snapshot = scene_image(self.gpu, PresentSource::from(accumulated))?;
+        let snapshot = scene_image(self.gpu, self.window, PresentSource::from(accumulated))?;
         let src = accumulated.image;
         let dst = snapshot.image.image;
         let extent = self.extent;
@@ -1379,7 +1446,7 @@ impl Swapchain {
             }
         }
         if self.scene_blender.is_none() {
-            self.scene_blender = Some(SceneBlender::new(self.gpu)?);
+            self.scene_blender = Some(SceneBlender::new(self.gpu, self.window)?);
         }
         self.scene_blender
             .as_mut()
@@ -1459,5 +1526,28 @@ impl Swapchain {
             .filter(|layer| layer.ready)
             .map(|layer| Arc::clone(&layer.snapshot))
             .collect();
+    }
+}
+
+#[cfg(test)]
+mod budget_regressions {
+    use super::*;
+
+    #[test]
+    fn large_dma_staging_respects_a_hard_window_budget_across_sources_and_resize() {
+        // Four simultaneous BGRA images for an initial 6016x3384 native
+        // source (accumulator, transparent base, blend, scene snapshot).
+        let big = 6016u64 * 3384 * 4;
+        assert!(fits_scene_budget(0, 4 * big));
+        // The next visible DMA source requires additional base, blend and
+        // retained snapshot allocations; no "mandatory" bypass is allowed.
+        assert!(!fits_scene_budget(4 * big, 3 * big));
+        // Resize churn holds the old generation until a frame fence retires.
+        let replacement = 8192u64 * 4096 * 4;
+        assert!(!fits_scene_budget(4 * big, replacement * 2));
+        // After retirement releases old snapshot references, new allocation
+        // can progress rather than permanently poisoning the scene.
+        assert!(fits_scene_budget(0, replacement * 2));
+        assert!(!fits_scene_budget(SCENE_IMAGE_BUDGET - 1, 2));
     }
 }

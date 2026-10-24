@@ -1506,8 +1506,9 @@ fn make_backing_source(
     gpu: &'static Gpu,
     width: u32,
     height: u32,
+    window: Option<usize>,
 ) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String> {
-    gpu.create_image(&ImageDescription {
+    let description = ImageDescription {
         image_type: vk::ImageType::TYPE_2D,
         view_type: vk::ImageViewType::TYPE_2D,
         format: vk::Format::B8G8R8A8_UNORM,
@@ -1520,17 +1521,32 @@ fn make_backing_source(
         usage: gpu::USAGE_SHADER_READ,
         cube: false,
         components: vk::ComponentMapping::default(),
-    })
-    .map(|image| crate::swapchain::BackingImageLease::new(gpu, image))
+    };
+    match window {
+        Some(window) => {
+            crate::swapchain::BackingImageLease::create_for_window(gpu, window, &description)
+        }
+        None => gpu
+            .create_image(&description)
+            .map(|image| crate::swapchain::BackingImageLease::new(gpu, image)),
+    }
 }
 
 fn make_blended_source(
     gpu: &'static Gpu,
     width: u32,
     height: u32,
+    window: Option<usize>,
 ) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String> {
-    gpu.create_image(&crate::overlay::target_description(width, height))
-        .map(|image| crate::swapchain::BackingImageLease::new(gpu, image))
+    let description = crate::overlay::target_description(width, height);
+    match window {
+        Some(window) => {
+            crate::swapchain::BackingImageLease::create_for_window(gpu, window, &description)
+        }
+        None => gpu
+            .create_image(&description)
+            .map(|image| crate::swapchain::BackingImageLease::new(gpu, image)),
+    }
 }
 
 // A 4K BGRA8 image occupies about 31.6 MiB of pixel payload. This allowance
@@ -1586,6 +1602,8 @@ fn reserve_backing_source(
 /// A window's CPU-drawn contents on the device: see [`present_store`].
 struct StoreImage {
     gpu: &'static Gpu,
+    account_window: Option<usize>,
+    _staging_charge: Option<crate::swapchain::GpuCharge>,
     image: std::sync::Arc<crate::swapchain::BackingImageLease>,
     /// Recycle images only after every WSI copy and idle snapshot releases them.
     spare: Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
@@ -1607,31 +1625,43 @@ impl StoreImage {
     fn reserve_upload_source(&mut self) -> Result<bool, String> {
         let (width, height) = (self.image.width, self.image.height);
         let current_images = self.total_source_images();
+        let account_window = self.account_window;
         reserve_backing_source(
             &mut self.image,
             &mut self.spare,
             current_images,
             store_source_bytes(width, height),
-            || make_backing_source(self.gpu, width, height),
+            || make_backing_source(self.gpu, width, height, account_window),
         )
     }
 
     fn reserve_blended_source(&mut self) -> Result<bool, String> {
         let (width, height) = (self.image.width, self.image.height);
         if self.blended.is_none() {
-            // At very large extents the first source for each of the two
-            // formats is mandatory for forward progress. These two sources
-            // may exceed the soft per-window pixel-payload allowance.
-            self.blended = Some(make_blended_source(self.gpu, width, height)?);
+            // Even the first blend image must fit. Do not give mandatory
+            // backing images an unbounded exception to aggregate ownership.
+            if !budget_allows_store_source(
+                self.total_source_images(),
+                store_source_bytes(width, height),
+            ) {
+                return Ok(false);
+            }
+            self.blended = Some(make_blended_source(
+                self.gpu,
+                width,
+                height,
+                self.account_window,
+            )?);
         }
         let current_images = self.total_source_images();
         let blended = self.blended.as_mut().expect("made above");
+        let account_window = self.account_window;
         reserve_backing_source(
             blended,
             &mut self.blended_spare,
             current_images,
             store_source_bytes(width, height),
-            || make_blended_source(self.gpu, width, height),
+            || make_blended_source(self.gpu, width, height, account_window),
         )
     }
 
@@ -1679,12 +1709,15 @@ fn real_4k_backing_and_overlay_pools_respect_combined_budget() {
         .gpu()
         .expect("GPU device");
     let dimensions = (3840, 2160);
-    let image = make_backing_source(gpu, dimensions.0, dimensions.1).expect("4K backing image");
+    let image =
+        make_backing_source(gpu, dimensions.0, dimensions.1, None).expect("4K backing image");
     let staging = gpu
         .create_buffer(store_source_bytes(dimensions.0, dimensions.1))
         .expect("4K upload buffer");
     let mut store = StoreImage {
         gpu,
+        account_window: None,
+        _staging_charge: None,
         image,
         spare: Vec::new(),
         staging,
@@ -1769,12 +1802,14 @@ fn backing_upload_source_pool_is_bounded_and_reuses_released_images() {
     else {
         return;
     };
-    let first = make_backing_source(gpu, 32, 24).expect("initial backing source");
+    let first = make_backing_source(gpu, 32, 24, None).expect("initial backing source");
     let staging = gpu
         .create_buffer(32 * 24 * 4)
         .expect("upload staging buffer");
     let mut store = StoreImage {
         gpu,
+        account_window: None,
+        _staging_charge: None,
         image: first,
         spare: Vec::new(),
         staging,
@@ -2404,10 +2439,25 @@ pub(crate) fn present_store_synchronous(
             .push((old, FRAMES_RETIRED));
     }
     if at.is_none() || stale {
-        let image = match make_backing_source(gpu, store.width, store.height) {
+        if store_source_bytes(store.width, store.height) > STORE_SOURCE_BUDGET_BYTES {
+            return store_failure_outcome(window);
+        }
+        let image = match make_backing_source(gpu, store.width, store.height, Some(window as usize))
+        {
             Ok(image) => image,
             Err(reason) => {
                 gpu::trace(format!("window store image creation failed: {reason}"));
+                return store_failure_outcome(window);
+            }
+        };
+        let staging_charge = match crate::swapchain::GpuCharge::reserve(
+            window as usize,
+            store.pixels.len() as u64,
+        ) {
+            Ok(charge) => charge,
+            Err(reason) => {
+                drop(image);
+                gpu::trace(format!("window store staging budget exhausted: {reason}"));
                 return store_failure_outcome(window);
             }
         };
@@ -2423,6 +2473,8 @@ pub(crate) fn present_store_synchronous(
             window as usize,
             StoreImage {
                 gpu,
+                account_window: Some(window as usize),
+                _staging_charge: Some(staging_charge),
                 image,
                 spare: Vec::new(),
                 staging,

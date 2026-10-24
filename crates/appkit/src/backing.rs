@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -18,6 +19,10 @@ pub struct Store {
     /// Bumped by every change to what the store shows, so that a presenter
     /// can tell whether a copy it took is still current without comparing it.
     generation: u64,
+    /// 0 = unclassified, 1 = contains transparent pixels, 2 = fully opaque.
+    /// Invalidated by every Store::touch and Store::resize. Atomic so immutable
+    /// window snapshots remain shareable with the Vulkan worker.
+    alpha_class: AtomicU8,
 }
 
 impl Store {
@@ -34,6 +39,7 @@ impl Store {
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
+            alpha_class: AtomicU8::new(0),
         }
     }
 
@@ -43,8 +49,29 @@ impl Store {
 
     /// What the store shows changed, and has to be presented again.
     fn touch(&mut self) {
+        self.alpha_class.store(0, Ordering::Relaxed);
         self.dirty = true;
         self.generation = self.generation.wrapping_add(1);
+    }
+
+    fn fully_opaque(&self) -> bool {
+        match self.alpha_class.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                #[cfg(test)]
+                OPAQUE_ALPHA_SCANS.fetch_add(1, Ordering::Relaxed);
+                let opaque = self
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255);
+                self.alpha_class
+                    .store(if opaque { 2 } else { 1 }, Ordering::Relaxed);
+                opaque
+            }
+        }
     }
 
     /// Change the size, keeping what the top-left corner held.
@@ -65,6 +92,7 @@ impl Store {
             pixels,
             dirty: true,
             generation: self.generation.wrapping_add(1),
+            alpha_class: AtomicU8::new(0),
         };
     }
 }
@@ -169,6 +197,13 @@ pub struct Hole {
     pub rect: Rect,
 }
 
+#[cfg(test)]
+static OPAQUE_ALPHA_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn opaque_alpha_scan_count_for_tests() -> usize {
+    OPAQUE_ALPHA_SCANS.load(Ordering::Relaxed)
+}
+
 /// Each window's composite, keyed by the SDL window's address.
 static STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
 
@@ -185,7 +220,7 @@ struct NativeCapture {
     height: u32,
     view_generation: Option<u64>,
     overlay_generation: u64,
-    ca_epoch: u64,
+    ca_content_revision: u64,
     ca_descendant_revision: u64,
     pixels: std::sync::Arc<Vec<u8>>,
     revision: u64,
@@ -1280,7 +1315,7 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
             stores.get(&(p.view as usize)).is_some_and(|store| {
                 i64::from(store.width) >= p.rect.width
                     && i64::from(store.height) >= p.rect.height
-                    && store.pixels.as_chunks::<4>().0.iter().all(|t| t[3] == 255)
+                    && store.fully_opaque()
             })
         })
         .map(|p| p.view as usize)
@@ -1290,34 +1325,59 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
 /// Authoritative opaque native-view coverage, recomputed from live AppKit
 /// stacking order on the video thread. Independent of whether a CPU window
 /// backing image has *ever* been submitted to the Metal scene.
-pub(crate) fn live_metal_occlusion(sdl: sdl3::Window) -> Vec<(usize, Vec<Rect>)> {
+pub(crate) fn live_metal_occlusion(
+    sdl: sdl3::Window,
+    scene: &[crate::view::MetalSceneLayer],
+) -> Vec<(usize, Vec<Rect>)> {
     let window = crate::window::window_for(sdl);
     if window.is_null() {
         return Vec::new();
     }
-    let placed = place_tree(window, sdl);
-    let opaque = opaque_views(&placed);
-    // DMA-BUF and software overlays may have fractional alpha. Unlike the
-    // legacy CPU-hole path, a retained Metal scene handles them as independent
-    // source-over layers, so their rectangles must not be an opacity-blind
-    // subtraction from the Metal source.
-    placed
+    let opaque = opaque_views(&place_tree(window, sdl));
+    let native_id_bit = 1usize << (usize::BITS - 1);
+    scene
         .iter()
         .enumerate()
-        .filter_map(|(index, p)| {
-            let layer = crate::view::layer_of(p.view);
-            if !crate::layer::is_metal(layer) || p.clip.is_empty() {
-                return None;
-            }
-            Some((
-                layer as usize,
-                placed[index + 1..]
-                    .iter()
-                    .filter(|v| opaque.contains(&(v.view as usize)))
-                    .map(|v| v.clip.intersection(&p.clip))
-                    .filter(|rect| !rect.is_empty())
-                    .collect(),
-            ))
+        .filter(|(_, layer)| layer.layer & native_id_bit == 0)
+        .map(|(index, layer)| {
+            let metal = Rect {
+                x: i64::from(layer.frame.x),
+                y: i64::from(layer.frame.y),
+                width: i64::from(layer.frame.width),
+                height: i64::from(layer.frame.height),
+            };
+            let covered = scene[index + 1..]
+                .iter()
+                .filter(|native| {
+                    native.layer & native_id_bit != 0
+                        && opaque.contains(&(native.layer & !native_id_bit))
+                        && native.opacity >= 1.0
+                        // Rounded clips are not fully covered by any rectangle.
+                        && native.rounded.is_empty()
+                })
+                .map(|native| {
+                    let image = Rect {
+                        x: i64::from(native.frame.x),
+                        y: i64::from(native.frame.y),
+                        width: i64::from(native.frame.width),
+                        height: i64::from(native.frame.height),
+                    };
+                    // The *same* clip projected by visit_metal_scene for the
+                    // native GPU source, including intermediate rectangular CA
+                    // masks. Never subtract outside its drawn geometry.
+                    let clip = native.clip.map_or(image, |clip| {
+                        image.intersection(&Rect {
+                            x: i64::from(clip.x),
+                            y: i64::from(clip.y),
+                            width: i64::from(clip.width),
+                            height: i64::from(clip.height),
+                        })
+                    });
+                    clip.intersection(&metal)
+                })
+                .filter(|rect| !rect.is_empty())
+                .collect();
+            (layer.layer, covered)
         })
         .collect()
 }
@@ -1374,7 +1434,7 @@ pub(crate) fn native_scene_pixels(
         .get(&(view as usize))
         .copied()
         .unwrap_or(0);
-    let ca_epoch = crate::coreanimation::native_scene_content_epoch();
+    let ca_content_revision = crate::coreanimation::native_scene_content_revision(layer);
     let ca_descendant_revision = crate::coreanimation::native_scene_descendant_revision(layer);
     let content_animating =
         crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time());
@@ -1389,7 +1449,7 @@ pub(crate) fn native_scene_pixels(
                     && hit.height == height
                     && hit.view_generation == view_generation
                     && hit.overlay_generation == overlay_generation
-                    && hit.ca_epoch == ca_epoch
+                    && hit.ca_content_revision == ca_content_revision
                     && hit.ca_descendant_revision == ca_descendant_revision
             })
     {
@@ -1448,7 +1508,7 @@ pub(crate) fn native_scene_pixels(
                 height,
                 view_generation,
                 overlay_generation,
-                ca_epoch,
+                ca_content_revision,
                 ca_descendant_revision,
                 pixels: std::sync::Arc::clone(&pixels),
                 revision,
@@ -2481,6 +2541,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
             dirty: false,
             // An overlay that changes damages the store under it.
             generation: store.generation,
+            alpha_class: AtomicU8::new(0),
         });
         blend_overlay_clipped(
             target,
@@ -3264,7 +3325,33 @@ mod tests {
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
+            alpha_class: AtomicU8::new(0),
         }
+    }
+
+    #[test]
+    fn opaque_classification_is_cached_until_pixels_or_extent_change() {
+        let mut store = Store::new(32, 12);
+        let scanned = opaque_alpha_scan_count_for_tests();
+        for _ in 0..100 {
+            assert!(!store.fully_opaque());
+        }
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 1);
+        store
+            .pixels
+            .chunks_exact_mut(4)
+            .for_each(|pixel| pixel[3] = 255);
+        store.touch();
+        for _ in 0..100 {
+            assert!(store.fully_opaque());
+        }
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 2);
+        store.resize(24, 12);
+        assert!(store.fully_opaque());
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 3);
+        store.resize(33, 12);
+        assert!(!store.fully_opaque());
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 4);
     }
 
     #[test]

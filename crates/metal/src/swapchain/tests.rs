@@ -4414,6 +4414,152 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
     sdl3::video::destroy_window(window);
 }
 
+/// Final Vulkan pixels for an opaque native source with a *smaller rectangular*
+/// intermediate CALayer clip. AppKit independently verifies that it projects
+/// that exact rectangle into this scene metadata. Metal outside the mask must
+/// remain visible, including after the CA rectangle changes without a drawable.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
+    if isolate_vulkan_graphical_test(
+        "rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let metal_id = 0x6c01usize;
+    let native_id = (1usize << (usize::BITS - 1)) | 0x6c02;
+    let frame = appkit::view::Frame {
+        x: 10,
+        y: 10,
+        width: 60,
+        height: 45,
+        ..whole
+    };
+    let initial_clip = appkit::view::Frame {
+        x: 20,
+        y: 20,
+        width: 15,
+        height: 12,
+        ..whole
+    };
+    let clip_region = |clip: appkit::view::Frame| Region {
+        x: clip.x,
+        y: clip.y,
+        width: clip.width as i32,
+        height: clip.height as i32,
+    };
+    let bottom = |clip| ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![clip_region(clip)]),
+        native: None,
+    };
+    let native_source = scene::NativeCpuSceneSource {
+        bytes: Arc::new([0u8, 0, 255, 255].repeat((frame.width * frame.height) as usize)),
+        revision: 1,
+        dmabuf: None,
+    };
+    let native = |clip| ScenePlacement {
+        id: native_id,
+        frame: DirectFrame::from_frame(&frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: Some(DirectFrame::from_frame(&clip)),
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(native_source.clone()),
+    };
+    state.layers.push(metal_id);
+    state.synchronize_scene(
+        window as usize,
+        &[bottom(initial_clip), native(initial_clip)],
+    );
+    let regions = state.live_scene_regions(metal_id, &whole);
+    assert_eq!(
+        state.stage_composite_layer(
+            metal_id,
+            &whole,
+            &metal,
+            regions.as_deref(),
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true)),
+    );
+    state.note_scene_frame(metal_id, &whole);
+    assert_eq!(
+        stage_native_scene_source(&mut state, &native(initial_clip)),
+        Ok(true)
+    );
+    state.synchronize_scene(
+        window as usize,
+        &[bottom(initial_clip), native(initial_clip)],
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let pixel = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(pixel(&state, 22, 22), [255, 0, 0, 255]);
+    assert_eq!(pixel(&state, 15, 15), [0, 255, 0, 255]);
+    assert_eq!(
+        pixel(&state, 38, 22),
+        [0, 255, 0, 255],
+        "native NSView rectangle punched a hole outside its intermediate CA mask"
+    );
+    let changed_clip = appkit::view::Frame {
+        x: 20,
+        y: 20,
+        width: 25,
+        height: 18,
+        ..whole
+    };
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[bottom(changed_clip), native(changed_clip)]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(pixel(&state, 38, 22), [255, 0, 0, 255]);
+    assert_eq!(pixel(&state, 46, 22), [0, 255, 0, 255]);
+    assert_eq!(pixel(&state, 15, 15), [0, 255, 0, 255]);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 /// A CA-only property update must withdraw an already-published direct WSI
 /// image and recompose its *retained* last drawable with the new mask.
 #[test]

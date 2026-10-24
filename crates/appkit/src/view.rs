@@ -488,7 +488,7 @@ fn capture_metal_scene(
     );
     // Live native occlusion is orthogonal to drawable submission order: a
     // toolbar may move after Metal's last present or before CPU backing exists.
-    for (layer, coverage) in crate::backing::live_metal_occlusion(window) {
+    for (layer, coverage) in crate::backing::live_metal_occlusion(window, &result) {
         if let Some(scene) = result.iter_mut().find(|item| item.layer == layer) {
             scene.occluded = coverage
                 .into_iter()
@@ -3579,11 +3579,16 @@ mod tests {
             [0u8, 0, 255, 255].repeat(30 * 25),
         );
         let covers = || {
-            crate::backing::live_metal_occlusion(sdl)
-                .into_iter()
-                .find(|(id, _)| *id == metal as usize)
-                .unwrap()
-                .1
+            crate::backing::live_metal_occlusion(
+                sdl,
+                &capture_metal_scene(sdl, darwin::mach::media_time())
+                    .unwrap()
+                    .0,
+            )
+            .into_iter()
+            .find(|(id, _)| *id == metal as usize)
+            .unwrap()
+            .1
         };
         assert_eq!(
             covers().len(),
@@ -3624,6 +3629,55 @@ mod tests {
                 .any(|item| item.native_pixels.is_some() && !item.rounded.is_empty())
         );
         unsafe { mask(ancestor, objc::sel::get("setMasksToBounds:"), 0) };
+        assert_eq!(covers().len(), 1);
+        // A rectangular CA superlayer clips the native source more tightly
+        // than its NSView frame. Metal must not be excluded outside the very
+        // same GPU clip used by the retained native layer.
+        let middle = unsafe { make_ca(ca as *const _ as Id, maker) };
+        let own = unsafe { make_ca(ca as *const _ as Id, maker) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_ca: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_layer(native, objc::sel::get("setLayer:"), own);
+            set_frame(
+                middle,
+                objc::sel::get("setFrame:"),
+                rect(42.0, 38.0, 14.0, 11.0),
+            );
+            add_ca(ancestor, objc::sel::get("addSublayer:"), middle);
+            add_ca(middle, objc::sel::get("addSublayer:"), own);
+            mask(middle, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        let expected_coverage = || {
+            let (scene, _) = capture_metal_scene(sdl, darwin::mach::media_time()).unwrap();
+            let native = scene
+                .iter()
+                .find(|entry| entry.native_pixels.is_some())
+                .unwrap();
+            let masked = native
+                .clip
+                .expect("middle rectangular mask projects onto native");
+            crate::backing::Rect {
+                x: i64::from(masked.x),
+                y: i64::from(masked.y),
+                width: i64::from(masked.width),
+                height: i64::from(masked.height),
+            }
+        };
+        assert_eq!(covers(), vec![expected_coverage()]);
+        assert!(covers()[0].width < 30 && covers()[0].height < 25);
+        unsafe {
+            set_frame(
+                middle,
+                objc::sel::get("setFrame:"),
+                rect(42.0, 38.0, 8.0, 7.0),
+            )
+        };
+        assert_eq!(covers(), vec![expected_coverage()]);
+        assert!(covers()[0].width <= 8 && covers()[0].height <= 7);
+        unsafe { mask(middle, objc::sel::get("setMasksToBounds:"), 0) };
         assert_eq!(covers().len(), 1);
         let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
             unsafe { std::mem::transmute(objc::msg::entry()) };
@@ -4617,6 +4671,70 @@ mod tests {
         let offset = (100 * 320 + 200) * 4;
         assert_eq!(&changed.pixels[offset..offset + 4], &[0, 255, 0, 255]);
         objc::arc::release(window);
+    }
+
+    #[test]
+    fn native_pixel_cache_does_not_invalidate_from_another_window_ca_tree() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make_ca: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = Vec::new();
+        let mut views = Vec::new();
+        let mut layers = Vec::new();
+        for _ in 0..2 {
+            let window =
+                objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            if !unsafe {
+                crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 80.0, 60.0))
+            } {
+                for old in windows {
+                    objc::arc::release(old);
+                }
+                return;
+            }
+            let content = view(rect(0.0, 0.0, 80.0, 60.0));
+            unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+            let native = view(rect(0.0, 0.0, 40.0, 30.0));
+            let layer = unsafe { make_ca(ca as *const _ as Id, maker) };
+            unsafe {
+                set_layer(native, objc::sel::get("setLayer:"), layer);
+                add_subview(content, objc::sel::get("addSubview:"), native);
+            }
+            crate::backing::set_native_view_pixels_for_tests(
+                native,
+                40,
+                30,
+                [0, 0, 255, 255].repeat(40 * 30),
+            );
+            windows.push(window);
+            views.push(native);
+            layers.push(layer);
+        }
+        let first = crate::backing::native_scene_pixels(views[0], 40, 30).unwrap();
+        let scanned = crate::backing::native_render_count_for_tests();
+        for _ in 0..30 {
+            crate::coreanimation::changed(layers[1]);
+            let next = crate::backing::native_scene_pixels(views[0], 40, 30).unwrap();
+            assert!(std::sync::Arc::ptr_eq(&first.0, &next.0));
+            assert_eq!(first.1, next.1);
+        }
+        assert_eq!(crate::backing::native_render_count_for_tests(), scanned);
+        crate::coreanimation::changed(layers[0]);
+        let updated = crate::backing::native_scene_pixels(views[0], 40, 30).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&first.0, &updated.0));
+        for view in views {
+            crate::backing::forget(view);
+        }
+        for window in windows {
+            objc::arc::release(window);
+        }
     }
 
     #[test]

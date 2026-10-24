@@ -409,13 +409,10 @@ fn scene_root_key(nodes: &HashMap<usize, Node>, layer: usize) -> usize {
     at
 }
 
-/// A layer setter may execute on a guest thread other than AppKit's.
-/// Mark a transaction dirty rather than dereferencing a mutable NSView.
-static NATIVE_SCENE_CONTENT_EPOCH: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(1);
-
-pub(crate) fn native_scene_content_epoch() -> u64 {
-    NATIVE_SCENE_CONTENT_EPOCH.load(Ordering::Acquire)
+/// Source-local raster revision. A mutation in another window cannot force
+/// this view to repaint its unchanged immutable CPU capture.
+pub(crate) fn native_scene_content_revision(layer: Id) -> u64 {
+    read_node(layer, |node| node.map_or(0, |node| node.contents_revision))
 }
 
 /// Only descendants contribute their metadata to an ancestor's CPU pixels.
@@ -432,7 +429,7 @@ pub(crate) fn native_scene_descendant_revision(layer: Id) -> u64 {
             let Some(node) = nodes.get(&id) else {
                 return 0;
             };
-            node.metadata_revision.wrapping_mul(0x9e3779b97f4a7c15)
+            (node.contents_revision ^ node.metadata_revision.wrapping_mul(0x9e3779b97f4a7c15))
                 ^ node
                     .sublayers
                     .iter()
@@ -523,7 +520,9 @@ pub(crate) fn native_scene_content_animating(layer: Id, now: f64) -> bool {
 pub(crate) fn changed(layer: Id) {
     // Conservative content invalidation for CA background, contents and
     // subtree changes. Metadata-only setters call changed_metadata instead.
-    NATIVE_SCENE_CONTENT_EPOCH.fetch_add(1, Ordering::AcqRel);
+    with_node(layer, |node| {
+        node.contents_revision = node.contents_revision.wrapping_add(1);
+    });
     changed_metadata(layer);
 }
 

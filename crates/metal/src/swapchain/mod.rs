@@ -19,6 +19,94 @@ use vk::Handle;
 
 use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
 
+// Shared by the retained scene and CPU-store pools: their independent soft
+// limits cannot guarantee a hard aggregate when both own images for a window.
+// A retired image stays charged until its last GPU fence-held Arc is dropped.
+const WINDOW_GPU_PAYLOAD_BUDGET: u64 = 768 * 1024 * 1024;
+struct WindowGpuBudget {
+    held: std::sync::atomic::AtomicU64,
+}
+static WINDOW_GPU_BUDGETS: std::sync::LazyLock<
+    Mutex<HashMap<usize, std::sync::Weak<WindowGpuBudget>>>,
+> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) struct GpuCharge {
+    budget: Arc<WindowGpuBudget>,
+    bytes: u64,
+}
+
+impl GpuCharge {
+    pub(crate) fn reserve(window: usize, bytes: u64) -> Result<Self, String> {
+        if bytes == 0 || bytes > WINDOW_GPU_PAYLOAD_BUDGET {
+            return Err("invalid or over-budget GPU payload allocation".into());
+        }
+        let budget = {
+            let mut entries = WINDOW_GPU_BUDGETS
+                .lock()
+                .expect("window GPU budget registry");
+            entries.retain(|_, entry| entry.strong_count() != 0);
+            entries
+                .entry(window)
+                .or_default()
+                .upgrade()
+                .unwrap_or_else(|| {
+                    let fresh = Arc::new(WindowGpuBudget {
+                        held: std::sync::atomic::AtomicU64::new(0),
+                    });
+                    entries.insert(window, Arc::downgrade(&fresh));
+                    fresh
+                })
+        };
+        // Atomic reservation, with no GPU queue/scene/backing lock held by
+        // the ledger itself. Two independent worker pools cannot overcommit.
+        budget
+            .held
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                (used <= WINDOW_GPU_PAYLOAD_BUDGET - bytes).then_some(used + bytes)
+            })
+            .map_err(|_| "per-window compositor GPU payload budget exhausted".to_owned())?;
+        Ok(Self { budget, bytes })
+    }
+}
+
+impl Drop for GpuCharge {
+    fn drop(&mut self) {
+        self.budget.held.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn window_gpu_ledger_caps_simultaneous_sources_and_reclaims_retired_allocations() {
+    let window = 0xA7101726usize;
+    let another = window + 1;
+    let pixels = 6016u64 * 3384 * 4;
+    let owned = Arc::new(GpuCharge::reserve(window, pixels * 4).unwrap());
+    let inflight = Arc::clone(&owned);
+    let second = GpuCharge::reserve(window, pixels * 3).unwrap();
+    assert!(GpuCharge::reserve(window, pixels * 3).is_err());
+    assert!(GpuCharge::reserve(another, WINDOW_GPU_PAYLOAD_BUDGET).is_ok());
+    drop(owned);
+    assert!(GpuCharge::reserve(window, WINDOW_GPU_PAYLOAD_BUDGET).is_err());
+    drop(inflight);
+    drop(second);
+    assert!(GpuCharge::reserve(window, WINDOW_GPU_PAYLOAD_BUDGET).is_ok());
+}
+
+fn gpu_image_payload_bytes(width: u32, height: u32, format: vk::Format) -> u64 {
+    let bytes = match format {
+        vk::Format::B8G8R8A8_UNORM
+        | vk::Format::R8G8B8A8_UNORM
+        | vk::Format::B8G8R8A8_SRGB
+        | vk::Format::R8G8B8A8_SRGB => 4,
+        vk::Format::R16G16B16A16_SFLOAT => 8,
+        _ => 16, // Unsupported/unusual formats are conservatively charged.
+    };
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(bytes)
+}
+
 /// How many compositor updates can be queued before one has to finish.
 ///
 /// Independent Core Animation layers are staged before a window presentation.
@@ -28,6 +116,7 @@ const FRAMES_IN_FLIGHT: usize = 8;
 
 /// The per-window state presentation goes through.
 struct Swapchain {
+    window: usize,
     gpu: &'static Gpu,
     surface: vk::SurfaceKHR,
     handle: vk::SwapchainKHR,
@@ -67,6 +156,7 @@ struct Swapchain {
     /// Where layers accumulate when the window has more than one. `None`
     /// while a single layer covers the window, which needs no accumulator.
     composite: Option<GpuImage>,
+    composite_charge: Option<GpuCharge>,
     /// The latest full-window opaque drawable, retained until a later direct
     /// frame replaces it or a second layer needs it as a GPU snapshot.
     direct: Option<DirectLayer>,
@@ -138,11 +228,36 @@ struct Swapchain {
 pub(crate) struct BackingImageLease {
     gpu: &'static Gpu,
     pub image: GpuImage,
+    _charge: Option<GpuCharge>,
 }
 
 impl BackingImageLease {
     pub(crate) fn new(gpu: &'static Gpu, image: GpuImage) -> Arc<Self> {
-        Arc::new(Self { gpu, image })
+        Arc::new(Self {
+            gpu,
+            image,
+            _charge: None,
+        })
+    }
+}
+
+impl BackingImageLease {
+    /// Reserve the per-window aggregate before creating Vulkan memory.
+    pub(crate) fn create_for_window(
+        gpu: &'static Gpu,
+        window: usize,
+        description: &ImageDescription,
+    ) -> Result<Arc<Self>, String> {
+        let charge = GpuCharge::reserve(
+            window,
+            gpu_image_payload_bytes(description.width, description.height, description.format),
+        )?;
+        let image = gpu.create_image(description)?;
+        Ok(Arc::new(Self {
+            gpu,
+            image,
+            _charge: Some(charge),
+        }))
     }
 }
 
@@ -1785,24 +1900,55 @@ fn stage_native_scene_source(
     {
         return Err("invalid native AppKit scene pixel extent".into());
     }
+    // Native staging can simultaneously hold a transparent/CPU base, a DMA
+    // blend output, a CPU upload buffer and a newly retained scene image.
+    // Reserve all of them before creating any Vulkan allocation. The 512 MiB
+    // per-window cap is checked against existing scene images and in-flight
+    // frame leases, so resize churn cannot silently bypass the budget.
+    state.retire_copied();
+    let image_bytes = u64::from(frame.width)
+        .saturating_mul(u64::from(frame.height))
+        .saturating_mul(4);
+    let scratch_count: u64 =
+        2 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty());
+    if !scene::fits_scene_budget(
+        state.scene_gpu_bytes(),
+        image_bytes.saturating_mul(scratch_count),
+    ) {
+        state.shed_scene_spares();
+        if !scene::fits_scene_budget(
+            state.scene_gpu_bytes(),
+            image_bytes.saturating_mul(scratch_count),
+        ) {
+            if native.dmabuf.is_some() {
+                appkit::backing::refuse_dmabufs(frame.window);
+            }
+            // This is not a transient per-frame pool collision. Preserve the
+            // previously committed scene and report the bounded refusal.
+            return Err("native AppKit GPU scene budget exhausted".into());
+        }
+    }
     #[cfg(test)]
     NATIVE_IMAGE_UPLOAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let gpu = state.gpu;
-    let image = gpu.create_image(&ImageDescription {
-        image_type: vk::ImageType::TYPE_2D,
-        view_type: vk::ImageViewType::TYPE_2D,
-        format: vk::Format::B8G8R8A8_UNORM,
-        width: frame.width,
-        height: frame.height,
-        depth: 1,
-        levels: 1,
-        layers: 1,
-        samples: 1,
-        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
-        cube: false,
-        components: vk::ComponentMapping::default(),
-    })?;
-    let lease = BackingImageLease::new(gpu, image);
+    let lease = BackingImageLease::create_for_window(
+        gpu,
+        frame.window as usize,
+        &ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: frame.width,
+            height: frame.height,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        },
+    )?;
     if native.bytes.is_empty() {
         gpu.one_shot(|device, cb| unsafe {
             device.cmd_clear_color_image(
@@ -1822,6 +1968,7 @@ fn stage_native_scene_source(
             );
         })?;
     } else {
+        let _staging_charge = GpuCharge::reserve(frame.window as usize, native.bytes.len() as u64)?;
         let staging = gpu.create_buffer(native.bytes.len() as u64)?;
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -1860,7 +2007,8 @@ fn stage_native_scene_source(
     let blended = if let Some(picture) = native.dmabuf.as_ref() {
         let mut description = crate::overlay::target_description(frame.width, frame.height);
         description.usage |= gpu::USAGE_SHADER_READ;
-        let output = BackingImageLease::new(gpu, gpu.create_image(&description)?);
+        let output =
+            BackingImageLease::create_for_window(gpu, frame.window as usize, &description)?;
         let overlay = [appkit::backing::GpuOverlay {
             picture: Arc::clone(picture),
             view: layer.id & !(1usize << (usize::BITS - 1)),
@@ -2962,6 +3110,7 @@ impl Swapchain {
             false => None,
         };
         let mut swapchain = Self {
+            window: window as usize,
             gpu,
             surface: surface.take(),
             handle: vk::SwapchainKHR::null(),
@@ -2974,6 +3123,7 @@ impl Swapchain {
             blitted: Vec::new(),
             presented: Vec::new(),
             composite: None,
+            composite_charge: None,
             direct: None,
             layers: Vec::new(),
             scene_layers: Vec::new(),
@@ -3233,6 +3383,14 @@ impl Swapchain {
             {
                 None
             } else {
+                let charge = GpuCharge::reserve(
+                    self.window,
+                    gpu_image_payload_bytes(
+                        description.width,
+                        description.height,
+                        description.format,
+                    ),
+                )?;
                 let replacement = self.gpu.create_image(&description)?;
                 let copied = self.gpu.one_shot(|device, command_buffer| unsafe {
                     keep_top_left(device, command_buffer, old, &replacement);
@@ -3241,7 +3399,7 @@ impl Swapchain {
                     self.gpu.destroy_image(replacement);
                     return Err(reason);
                 }
-                Some(replacement)
+                Some((replacement, charge))
             }
         } else {
             None
@@ -3281,12 +3439,14 @@ impl Swapchain {
             if let Some(composite) = self.composite.take() {
                 self.gpu.destroy_image(composite);
             }
-        } else if let Some(replacement) = replace_composite {
+            self.composite_charge = None;
+        } else if let Some((replacement, charge)) = replace_composite {
             let old = self
                 .composite
                 .replace(replacement)
                 .expect("old window snapshot");
             self.gpu.destroy_image(old);
+            self.composite_charge = Some(charge);
         }
         // A surface that cannot show premultiplied alpha is presented
         // opaque, which the pass would only get wrong.
@@ -3441,6 +3601,10 @@ impl Swapchain {
         if self.composite.is_none() {
             let description =
                 Self::composite_description(self.format, self.extent, self.corners.is_some());
+            let charge = GpuCharge::reserve(
+                self.window,
+                gpu_image_payload_bytes(description.width, description.height, description.format),
+            )?;
             let image = self.gpu.create_image(&description)?;
             // A fresh image's contents are undefined, and the frame that
             // brings the composite into existence has only the one layer
@@ -3454,7 +3618,7 @@ impl Swapchain {
                 base_array_layer: 0,
                 layer_count: 1,
             };
-            self.gpu.one_shot(|device, command_buffer| {
+            let cleared = self.gpu.one_shot(|device, command_buffer| {
                 // SAFETY: recording into a command buffer the call owns; the
                 // image is in GENERAL from creation.
                 unsafe {
@@ -3466,8 +3630,13 @@ impl Swapchain {
                         &[range],
                     )
                 };
-            })?;
+            });
+            if let Err(reason) = cleared {
+                self.gpu.destroy_image(image);
+                return Err(reason);
+            }
             self.composite = Some(image);
+            self.composite_charge = Some(charge);
         }
         Ok(self.composite.as_ref().expect("just made").image)
     }
@@ -4027,6 +4196,7 @@ impl Drop for Swapchain {
         if let Some(composite) = self.composite.take() {
             self.gpu.destroy_image(composite);
         }
+        self.composite_charge = None;
         if let Some(instance) = crate::vulkan::instance_handle() {
             sdl3::video::vulkan::destroy_surface(instance, self.surface.as_raw());
         }
