@@ -3245,6 +3245,71 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
         state.scene_layers.iter().all(|scene| scene.id != 2),
         "removed overlay source remains in live scene"
     );
+    // Check source pixels, not just membership and WSI path selection: the
+    // old overlay's green pixels must be replaced by the blue background
+    // without requiring any new guest command buffer or drawable.
+    let retained = &direct.backing.as_ref().expect("retained background").image;
+    let source_image = retained.image;
+    let expected_blue = match retained.format {
+        vk::Format::B8G8R8A8_UNORM => [255, 0, 0, 255],
+        vk::Format::R8G8B8A8_UNORM => [0, 0, 255, 255],
+        other => panic!("unexpected retained scene source format: {other:?}"),
+    };
+    let read = gpu
+        .create_buffer(u64::from(whole.window_width) * u64::from(whole.window_height) * 4)
+        .expect("source pixel readback");
+    gpu.one_shot(|device, cb| unsafe {
+        let sync = vk::ImageMemoryBarrier::default()
+            .old_layout(vk::ImageLayout::GENERAL)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(source_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        device.cmd_pipeline_barrier(
+            cb,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::DependencyFlags::empty(),
+            &[],
+            &[],
+            &[sync],
+        );
+        device.cmd_copy_image_to_buffer(
+            cb,
+            source_image,
+            vk::ImageLayout::GENERAL,
+            read.buffer,
+            &[vk::BufferImageCopy::default()
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width: whole.window_width,
+                    height: whole.window_height,
+                    depth: 1,
+                })],
+        );
+    })
+    .expect("retained direct-image readback");
+    let at_overlay = ((35u64 * u64::from(whole.window_width) + 55) * 4) as usize;
+    let pixel = unsafe { std::slice::from_raw_parts(read.contents.add(at_overlay), 4) };
+    assert_eq!(
+        pixel, expected_blue,
+        "a removed foreground left obsolete pixels in restored WSI direct image"
+    );
+    gpu.destroy_buffer(read);
     state
         .flush_composite(window)
         .expect("direct WSI after foreground removal");
