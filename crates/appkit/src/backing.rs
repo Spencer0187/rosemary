@@ -71,7 +71,7 @@ impl Store {
 
 /// A rectangle of pixels, top-left origin; empty when either extent is not
 /// positive.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: i64,
     pub y: i64,
@@ -266,6 +266,8 @@ pub struct DmabufPlane {
 pub struct GpuOverlay {
     pub picture: std::sync::Arc<Dmabuf>,
     pub rect: Rect,
+    /// Presenting NSView identity, not the allocation shared by its content.
+    pub view: usize,
 }
 
 /// The GPU a presenter shows windows with, and what it can show from a
@@ -838,6 +840,10 @@ pub(crate) fn needs_display_in_tree(view: Id, depth: usize) {
 /// a store left behind would be handed to the next window made - at the size the
 /// old one was.
 pub fn forget_window(sdl: sdl3::Window) {
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
     if let Some(stores) = STORES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         stores.remove(&(sdl as usize));
     }
@@ -871,6 +877,12 @@ pub fn layer_drew_on_surface(sdl: sdl3::Window, layer: usize) {
 
 /// Forget a view that is being deallocated, so no pump draws freed memory.
 pub(crate) fn forget(view: Id) {
+    // A new view may reuse this address with an identical initial generation.
+    // The old underlay is never safe across that lifetime transition.
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     let key = view as usize;
     NATIVE_CAPTURES
         .lock()
@@ -1314,15 +1326,30 @@ pub(crate) fn live_metal_occlusion(sdl: sdl3::Window) -> Vec<(usize, Vec<Rect>)>
 /// source. The Metal presenter retains its own copy; no Objective-C pointer
 /// crosses onto the GPU worker. A CPU-owned view above Metal must be sampled
 /// *after* that Metal source, not flattened into the window's bottom image.
+pub fn native_scene_extent_supported(width: u32, height: u32) -> bool {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|area| area.checked_mul(4))
+        .is_some_and(|bytes| bytes > 0 && bytes <= 64 * 1024 * 1024)
+}
+
+/// DMA-BUF-only images do not allocate an RGBA copy on the AppKit thread.
+/// Bound their GPU staging footprint separately from CPU-backed captures.
+pub fn native_scene_dma_extent_supported(width: u32, height: u32) -> bool {
+    width <= 16384
+        && height <= 16384
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|area| area.checked_mul(4))
+            .is_some_and(|bytes| bytes > 0 && bytes <= 256 * 1024 * 1024)
+}
+
 pub(crate) fn native_scene_pixels(
     view: Id,
     width: u32,
     height: u32,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    let bytes = u64::from(width)
-        .checked_mul(u64::from(height))?
-        .checked_mul(4)?;
-    if bytes == 0 || bytes > 64 * 1024 * 1024 {
+    if !native_scene_extent_supported(width, height) {
         return None;
     }
     let layer = crate::view::layer_of(view);
@@ -1449,11 +1476,23 @@ pub(crate) fn native_scene_pixels(
     Some((pixels, revision))
 }
 
-/// Window backing source excluding native views painted *above* the first
-/// Metal layer. Those views are separately retained and placed above Metal.
-/// The original full CPU store remains unmodified for non-Vulkan fallbacks.
-pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
-    let _owed = crate::coreanimation::defer_releases();
+/// One immutable underlay per window, keyed only by content below the
+/// first Metal view. Changes to independently composited native foreground
+/// must not force a 4K CPU reconstruction or an unchanged GPU upload.
+static GPU_UNDERLAYS: std::sync::LazyLock<Mutex<HashMap<usize, (u64, std::sync::Arc<Store>)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static GPU_UNDERLAY_RENDERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn gpu_underlay_render_count_for_tests() -> usize {
+    GPU_UNDERLAY_RENDERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The flattened backing changes for independent foregrounds as well, but
+/// only underlying view generations, placement and CA *contents* matter here.
+pub fn gpu_under_metal_cached(sdl: sdl3::Window, source: &Store) -> Option<std::sync::Arc<Store>> {
+    use std::hash::{Hash, Hasher};
     let window = crate::window::window_for(sdl);
     if window.is_null() {
         return None;
@@ -1462,6 +1501,67 @@ pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
     let first = placed
         .iter()
         .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))?;
+    if !can_separate_native(sdl, &placed, first) {
+        GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(sdl as usize));
+        return None;
+    }
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    (source.width, source.height, first).hash(&mut key);
+    crate::window::background_pixel(window).hash(&mut key);
+    crate::window::presentation_clip(sdl)
+        .map(|rect| (rect.x, rect.y, rect.w, rect.h))
+        .hash(&mut key);
+    crate::decor::pixels(sdl)
+        .as_ref()
+        .map(|pixels| pixels.generation)
+        .hash(&mut key);
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let overlays = OVERLAY_REVISIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut animating = false;
+    for p in &placed[..first] {
+        (p.view as usize, p.rect, p.clip).hash(&mut key);
+        p.alpha.to_bits().hash(&mut key);
+        views
+            .as_ref()
+            .and_then(|all| all.get(&(p.view as usize)))
+            .map(Store::generation)
+            .hash(&mut key);
+        overlays.get(&(p.view as usize)).hash(&mut key);
+        let layer = crate::view::layer_of(p.view);
+        crate::coreanimation::native_scene_tree_revision(layer).hash(&mut key);
+        animating |=
+            crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time());
+    }
+    drop(overlays);
+    drop(views);
+    let fingerprint = key.finish();
+    if !animating {
+        if let Some(hit) = GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(sdl as usize))
+            .filter(|(key, _)| *key == fingerprint)
+        {
+            return Some(std::sync::Arc::clone(&hit.1));
+        }
+    }
+    let result = std::sync::Arc::new(gpu_under_metal(sdl, source)?);
+    if !animating {
+        GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(sdl as usize, (fingerprint, std::sync::Arc::clone(&result)));
+    }
+    Some(result)
+}
+
+/// A native source belongs outside the bottom store only once its complete
+/// independent snapshot has been accepted. If any top view lacks a source,
+/// preserve the original full window path instead of silently losing it.
+fn can_separate_native(sdl: sdl3::Window, placed: &[Placed], first: usize) -> bool {
     // Never remove native pixels from the GPU base unless the owner thread
     // has already published a corresponding independent source for *every*
     // visible native view above the first Metal drawable. Oversized or not-
@@ -1490,12 +1590,32 @@ pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
         }
         any = true;
         if !captured.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
-            return None;
+            return false;
         }
     }
-    if !any {
+    any
+}
+
+/// Window backing source excluding native views painted *above* the first
+/// Metal layer. Those views are separately retained and placed above Metal.
+/// The original full CPU store remains unmodified for non-Vulkan fallbacks.
+pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
+    let _owed = crate::coreanimation::defer_releases();
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
         return None;
     }
+    let placed = place_tree(window, sdl);
+    let first = placed
+        .iter()
+        .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))?;
+    if !can_separate_native(sdl, &placed, first) {
+        return None;
+    }
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    GPU_UNDERLAY_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut bottom = Store::new(source.width, source.height);
     let whole = Rect {
         x: 0,
@@ -1766,6 +1886,12 @@ fn copy_chrome(store: &mut Store, chrome: &crate::decor::Pixels) {
 /// Present a window's store again at the next pump, without recomposing it:
 /// for a presenter that lost what it last showed.
 pub fn present_again(sdl: sdl3::Window) {
+    // WSI recovery can request a genuinely fresh backing publication even
+    // when the underlying view pixels have not changed.
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
     let mut stores = STORES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(store) = stores
         .as_mut()
@@ -1921,6 +2047,14 @@ pub(crate) fn set_native_view_pixels_for_tests(view: Id, width: u32, height: u32
     assert_eq!(pixels.len(), width as usize * height as usize * 4);
     let mut store = Store::new(width, height);
     store.pixels = pixels;
+    // A replacement fixture is a new producer generation, not the unchanged
+    // generation 0 of a newly allocated Store.
+    store.generation = VIEW_STORES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|all| all.get(&(view as usize)))
+        .map_or(1, |old| old.generation().wrapping_add(1));
     VIEW_STORES
         .lock()
         .unwrap()
@@ -2181,7 +2315,7 @@ pub(crate) fn native_dma_overlay(view: Id) -> Option<(std::sync::Arc<Dmabuf>, u6
 
 /// Only DMA-BUF sources that have an independently retained native scene
 /// layer may be excluded from the bottom window-store overlay blending.
-pub fn native_dma_above_metal(sdl: sdl3::Window) -> Vec<std::sync::Arc<Dmabuf>> {
+pub fn native_dma_above_metal(sdl: sdl3::Window) -> Vec<usize> {
     let window = crate::window::window_for(sdl);
     if window.is_null() {
         return Vec::new();
@@ -2206,13 +2340,10 @@ pub fn native_dma_above_metal(sdl: sdl3::Window) -> Vec<std::sync::Arc<Dmabuf>> 
             if !native.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
                 return None;
             }
-            let (_, overlay) = overlays.iter().find(|(id, o)| {
-                *id == p.view as usize && matches!(o.picture, Picture::Dmabuf(_))
-            })?;
-            let Picture::Dmabuf(picture) = &overlay.picture else {
-                unreachable!()
-            };
-            Some(std::sync::Arc::clone(picture))
+            overlays
+                .iter()
+                .any(|(id, o)| *id == p.view as usize && matches!(o.picture, Picture::Dmabuf(_)))
+                .then_some(p.view as usize)
         })
         .collect()
 }
@@ -2290,6 +2421,14 @@ fn mark_window_of(view: Id) {
 /// The store with every visible pixel overlay of `window` drawn over it, or
 /// `None` when there is nothing to draw and the store can be presented as it
 /// is; and the dma-buf overlays, which only the presenter can draw.
+#[cfg(test)]
+pub(crate) fn gpu_overlay_instances_for_tests(
+    window: sdl3::Window,
+    store: &Store,
+) -> Vec<GpuOverlay> {
+    compose(window, store).1
+}
+
 fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverlay>) {
     let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     let mut composed: Option<Store> = None;
@@ -2328,6 +2467,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
         if let Picture::Dmabuf(picture) = &overlay.picture {
             gpu.push(GpuOverlay {
                 picture: picture.clone(),
+                view: view as usize,
                 // Keep original placement for texture sampling; the final
                 // Vulkan presentation masks pixels beyond the logical window.
                 rect: original,

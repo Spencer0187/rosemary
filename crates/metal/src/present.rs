@@ -1902,16 +1902,21 @@ fn unflattened_dma_overlays(
     overlays: &[appkit::backing::GpuOverlay],
 ) -> Vec<appkit::backing::GpuOverlay> {
     let separate = appkit::backing::native_dma_above_metal(window);
+    filter_native_overlay_instances(overlays, &separate)
+}
+
+/// Filter presentation instances, not the (possibly shared) DMA allocation.
+fn filter_native_overlay_instances(
+    overlays: &[appkit::backing::GpuOverlay],
+    separate_views: &[usize],
+) -> Vec<appkit::backing::GpuOverlay> {
     overlays
         .iter()
-        .filter(|overlay| {
-            !separate
-                .iter()
-                .any(|picture| std::sync::Arc::ptr_eq(picture, &overlay.picture))
-        })
+        .filter(|overlay| !separate_views.contains(&overlay.view))
         .map(|overlay| appkit::backing::GpuOverlay {
             picture: std::sync::Arc::clone(&overlay.picture),
             rect: overlay.rect,
+            view: overlay.view,
         })
         .collect()
 }
@@ -1920,7 +1925,8 @@ struct StoreUpload {
     window: usize,
     identity: u32,
     generation: u64,
-    store: appkit::backing::Store,
+    underlay: Option<std::sync::Arc<appkit::backing::Store>>,
+    store: std::sync::Arc<appkit::backing::Store>,
     holes: Vec<appkit::backing::Hole>,
     overlays: Vec<appkit::backing::GpuOverlay>,
 }
@@ -1933,19 +1939,23 @@ impl StoreUpload {
         holes: &[appkit::backing::Hole],
         overlays: &[appkit::backing::GpuOverlay],
     ) -> Self {
-        // The CPU's full flattened store is retained for its SDL fallback.
-        // The retained Metal compositor needs only what is *below* its first
-        // layer here; native views painted later are uploaded separately as
-        // ordered AppKit scene sources, not irreversibly flattened underneath.
-        let owned = appkit::backing::gpu_under_metal(window, store).unwrap_or_else(|| {
-            let mut copy = appkit::backing::Store::new(store.width, store.height);
-            copy.pixels.clone_from(&store.pixels);
-            copy
-        });
+        // A scene-only native foreground update changes the flattened store
+        // but does not change the immutable underlying source. Share its Arc
+        // without a second full-window CPU allocation or copy.
+        let underlay = appkit::backing::gpu_under_metal_cached(window, store);
+        let owned = underlay
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .unwrap_or_else(|| {
+                let mut copy = appkit::backing::Store::new(store.width, store.height);
+                copy.pixels.clone_from(&store.pixels);
+                std::sync::Arc::new(copy)
+            });
         Self {
             window: window as usize,
             identity,
             generation: store.generation(),
+            underlay,
             store: owned,
             holes: holes.to_vec(),
             overlays: unflattened_dma_overlays(window, overlays),
@@ -1959,11 +1969,17 @@ impl StoreUpload {
         holes: &[appkit::backing::Hole],
         overlays: &[appkit::backing::GpuOverlay],
     ) -> bool {
-        // Not the pixels, which would compare a whole store on the event
-        // thread for every finished upload.
+        // Not the pixels: a cached bottom source remains identical even when
+        // the flattened fallback changes for an independent native foreground.
+        let underlay = appkit::backing::gpu_under_metal_cached(self.window as sdl3::Window, store);
+        let same_underlay = match (&self.underlay, underlay) {
+            (Some(old), Some(new)) => std::sync::Arc::ptr_eq(old, &new),
+            (None, None) => self.generation == store.generation(),
+            _ => false,
+        };
         let overlays = unflattened_dma_overlays(self.window as sdl3::Window, overlays);
         self.identity == identity
-            && self.generation == store.generation()
+            && same_underlay
             && self.store.width == store.width
             && self.store.height == store.height
             && self.holes.len() == holes.len()
@@ -1973,11 +1989,11 @@ impl StoreUpload {
                 .zip(holes)
                 .all(|(a, b)| a.layer == b.layer && a.rect == b.rect)
             && self.overlays.len() == overlays.len()
-            && self
-                .overlays
-                .iter()
-                .zip(&overlays)
-                .all(|(a, b)| a.rect == b.rect && std::sync::Arc::ptr_eq(&a.picture, &b.picture))
+            && self.overlays.iter().zip(&overlays).all(|(a, b)| {
+                a.rect == b.rect
+                    && a.view == b.view
+                    && std::sync::Arc::ptr_eq(&a.picture, &b.picture)
+            })
     }
 }
 
@@ -2321,7 +2337,13 @@ pub(crate) fn present_store(
     let earlier = match state.completed.take() {
         Some((completed, outcome)) if completed.identity == identity => match outcome {
             Fallback => return Fallback,
-            Displayed if completed.matches(identity, store, holes, overlays) => return Displayed,
+            Displayed if completed.matches(identity, store, holes, overlays) => {
+                // Keep the accepted source for the next foreground-only damage
+                // event. Taking it here would upload the same underlay again
+                // on every second native scene update.
+                state.completed = Some((completed, Displayed));
+                return Displayed;
+            }
             Displayed => DisplayedEarlier,
             _ => Deferred,
         },
@@ -2564,6 +2586,191 @@ fn blend_overlays(
 #[cfg(test)]
 mod drawable_pool_tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn foreground_only_native_animation_avoids_reuploading_unchanged_gpu_underlay() {
+        let name = "present::drawable_pool_tests::foreground_only_native_animation_avoids_reuploading_unchanged_gpu_underlay";
+        if crate::swapchain::isolate_vulkan_graphical_test(name) {
+            return;
+        }
+        if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+            return;
+        }
+        let Ok(adapters) = crate::vulkan::adapters() else {
+            return;
+        };
+        if adapters
+            .first()
+            .and_then(|adapter| adapter.gpu().ok())
+            .is_none()
+        {
+            return;
+        }
+        crate::bootstrap();
+        let rect = |w: f64, h: f64| foundation::geometry::NSRect {
+            origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
+            size: foundation::geometry::NSSize {
+                width: w,
+                height: h,
+            },
+        };
+        let window = objc::object::create_instance(
+            objc::class::lookup(c"NSWindow").unwrap(),
+            appkit::window::INSTANCE_SIZE,
+        );
+        let init_window: unsafe extern "C" fn(
+            objc::object::Id,
+            objc::sel::Sel,
+            foundation::geometry::NSRect,
+            usize,
+            usize,
+            u8,
+        ) -> objc::object::Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+        assert_eq!(
+            unsafe {
+                init_window(
+                    window,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect(160.0, 120.0),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            window
+        );
+        let sdl = unsafe { appkit::window::sdl_window(window) };
+        if sdl.is_null() {
+            return;
+        }
+        let mk_view = |w, h| {
+            let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            let init: unsafe extern "C" fn(
+                objc::object::Id,
+                objc::sel::Sel,
+                foundation::geometry::NSRect,
+            ) -> objc::object::Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+            unsafe { init(object, objc::sel::get("initWithFrame:"), rect(w, h)) }
+        };
+        let content = mk_view(160.0, 120.0);
+        let metal_view = mk_view(160.0, 120.0);
+        let foreground = mk_view(20.0, 20.0);
+        let set: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel, objc::object::Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let make: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel) -> objc::object::Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let layer = unsafe {
+            make(
+                metal_cls as *const _ as objc::object::Id,
+                objc::sel::get("layer"),
+            )
+        };
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), layer);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set(content, objc::sel::get("addSubview:"), foreground);
+            set(window, objc::sel::get("orderFront:"), std::ptr::null_mut());
+        }
+        let set_overlay = |value| {
+            appkit::backing::set_overlay(
+                foreground,
+                appkit::backing::Overlay {
+                    width: 20,
+                    height: 20,
+                    picture: appkit::backing::Picture::Pixels([value, 0, 255, 255].repeat(20 * 20)),
+                },
+            )
+        };
+        set_overlay(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while backing_upload_submissions_for_test() == 0 {
+            appkit::event::pump(std::ptr::null_mut());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial Vulkan underlay never uploaded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Drain outstanding initial first-frame uploads before measuring.
+        for _ in 0..16 {
+            appkit::event::pump(std::ptr::null_mut());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let initial = backing_upload_submissions_for_test();
+        assert!(
+            appkit::view::metal_scene(sdl)
+                .unwrap_or_default()
+                .iter()
+                .any(|source| source.native_pixels.is_some()),
+            "native overlay never entered the retained scene"
+        );
+        for step in 1..20u8 {
+            set_overlay(step);
+            for _ in 0..3 {
+                appkit::event::pump(std::ptr::null_mut());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let latest = appkit::view::metal_scene(sdl).unwrap_or_default();
+        assert!(
+            latest.iter().any(|source| source
+                .native_pixels
+                .as_ref()
+                .is_some_and(|pixels| pixels.as_slice().starts_with(&[19, 0, 255, 255]))),
+            "the native foreground did not actually advance to its final pixels"
+        );
+        assert_eq!(
+            backing_upload_submissions_for_test(),
+            initial,
+            "native foreground updates caused extra Vulkan full-underlay uploads"
+        );
+        appkit::backing::remove_overlay(foreground);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn shared_dma_allocation_preserves_the_lower_view_instance() {
+        let shared = std::sync::Arc::new(appkit::backing::Dmabuf {
+            width: 2,
+            height: 2,
+            fourcc: 0,
+            modifier: 0,
+            planes: vec![],
+        });
+        let rect = appkit::backing::Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let overlays = [
+            appkit::backing::GpuOverlay {
+                view: 10,
+                picture: shared.clone(),
+                rect,
+            },
+            appkit::backing::GpuOverlay {
+                view: 20,
+                picture: shared.clone(),
+                rect,
+            },
+        ];
+        assert!(std::sync::Arc::ptr_eq(
+            &overlays[0].picture,
+            &overlays[1].picture
+        ));
+        let kept = filter_native_overlay_instances(&overlays, &[20]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].view, 10);
+        assert!(std::sync::Arc::ptr_eq(&kept[0].picture, &shared));
+        assert_eq!(
+            filter_native_overlay_instances(&overlays, &[10, 20]).len(),
+            0
+        );
+    }
 
     #[test]
     fn cpu_fallback_blacks_out_previous_frame_outside_logical_bounds() {

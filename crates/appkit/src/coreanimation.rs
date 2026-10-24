@@ -275,6 +275,68 @@ pub(crate) fn scene_properties_below(layer: Id, ancestor: Id, now: f64) -> (bool
     (hidden, opacity.clamp(0.0, 1.0) as f32)
 }
 
+/// Masks in the actual CALayer chain between a view's backing layer and
+/// its enclosing view-associated backing layer. Each rectangle is in the
+/// enclosing layer's bounds coordinates. NSView clipping alone misses these
+/// guest-inserted intermediate superlayers.
+pub(crate) fn scene_masks_below(layer: Id, ancestor: Id, now: f64) -> Vec<(NSRect, f64)> {
+    if layer.is_null() || ancestor.is_null() || layer == ancestor {
+        return Vec::new();
+    }
+    let mut ids = Vec::new();
+    read_all_nodes(|nodes| {
+        let mut at = layer as usize;
+        for _ in 0..256 {
+            if at == ancestor as usize {
+                break;
+            }
+            let Some(node) = nodes.get(&at) else {
+                return;
+            };
+            ids.push(at);
+            at = node.superlayer;
+        }
+        if at != ancestor as usize {
+            ids.clear();
+        }
+    });
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let mut parent_origin = NSPoint::default();
+    // Outermost frame coordinates are already relative to ancestor bounds.
+    // The projection into window pixels subtracts that bounds origin once.
+    let mut parent_bounds = NSPoint::default();
+    let mut result = Vec::new();
+    // Outermost to innermost: each child's frame is expressed in the bounds
+    // coordinates of its immediate CA parent, not the NSView tree.
+    for id in ids.into_iter().rev() {
+        let node = presentation(id as Id, now);
+        let origin = NSPoint {
+            x: parent_origin.x + node.frame.origin.x - parent_bounds.x,
+            y: parent_origin.y + node.frame.origin.y - parent_bounds.y,
+        };
+        if id != layer as usize && node.masks_to_bounds {
+            result.push((
+                NSRect {
+                    origin,
+                    size: node.frame.size,
+                },
+                node.corner_radius,
+            ));
+        }
+        parent_origin = origin;
+        parent_bounds = crate::layer::bounds_of(id as Id).origin;
+    }
+    result
+}
+
+pub(crate) fn scene_has_rounded_masks_below(layer: Id, ancestor: Id) -> bool {
+    scene_masks_below(layer, ancestor, darwin::mach::media_time())
+        .iter()
+        .any(|(_, radius)| *radius > 0.0)
+}
+
 /// Value-only CA presentation properties consumed by the Metal scene.
 /// A superlayer's visibility and opacity apply to its entire subtree, just as
 /// an enclosing NSView's properties do. Traverse a single immutable snapshot
@@ -393,6 +455,35 @@ pub(crate) fn native_scene_descendant_revision(layer: Id) -> u64 {
                     )
                 })
         })
+    })
+}
+
+/// Revision of a view's whole raster underlay, including root contents.
+/// Unlike the process-wide epoch, independent foreground siblings do not
+/// invalidate a different view's already accepted bottom image.
+pub(crate) fn native_scene_tree_revision(layer: Id) -> u64 {
+    if layer.is_null() {
+        return 0;
+    }
+    read_all_nodes(|nodes| {
+        fn fold(nodes: &HashMap<usize, Node>, id: usize, depth: usize) -> u64 {
+            if depth >= 64 {
+                return 0;
+            }
+            let Some(node) = nodes.get(&id) else {
+                return 0;
+            };
+            let mut value =
+                node.contents_revision ^ node.metadata_revision.wrapping_mul(0x9e3779b97f4a7c15);
+            for (index, child) in node.sublayers.iter().enumerate() {
+                value = value.wrapping_add(
+                    ((index as u64) + 1).wrapping_mul(0xbf58476d1ce4e5b9)
+                        ^ fold(nodes, *child, depth + 1),
+                );
+            }
+            value
+        }
+        fold(nodes, layer as usize, 0)
     })
 }
 

@@ -1990,6 +1990,7 @@ fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
     let mut store = appkit::backing::Store::new(160, 120);
     store.pixels.fill(42);
     let overlays = [appkit::backing::GpuOverlay {
+        view: 0,
         picture: Arc::new(appkit::backing::Dmabuf {
             width: 160,
             height: 120,
@@ -3828,6 +3829,232 @@ fn rounded_native_opaque_overlay_preserves_metal_corners() {
     drop(state);
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
+}
+
+#[test]
+fn large_native_dma_source_requires_no_event_thread_pixel_allocation() {
+    let picture = Arc::new(appkit::backing::Dmabuf {
+        width: 6016,
+        height: 3384,
+        fourcc: 0,
+        modifier: 0,
+        planes: vec![],
+    });
+    let admitted = native_scene_source(None, Some(Arc::clone(&picture)), 7, 6016, 3384)
+        .expect("6K DMA-BUF-only sources must bypass the 64 MiB CPU cap");
+    assert!(admitted.bytes.is_empty());
+    assert!(Arc::ptr_eq(admitted.dmabuf.as_ref().unwrap(), &picture));
+    assert_eq!(admitted.revision, 7);
+    assert!(native_scene_source(None, Some(picture), 7, 9000, 9000).is_none());
+}
+
+/// Exercise the complete 6K external producer -> DMA import -> retained
+/// native scene -> window composite -> GPU pixel readback. A real DMA-BUF
+/// exporter is opt-in because not every CI host has GBM or enough GPU memory.
+#[test]
+#[cfg(target_os = "linux")]
+fn oversized_external_dma_buff_composes_actual_source_pixels() {
+    if isolate_vulkan_graphical_test("oversized_external_dma_buff_composes_actual_source_pixels") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some(importer) = crate::overlay::importer() else {
+        panic!("the Vulkan adapter cannot import DMA-BUFs");
+    };
+    // Pick the exact render node used by the presenter, not a buffer owned by
+    // another physical GPU which would fail cross-device import.
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let node = ["/dev/dri/renderD128", "/dev/dri/renderD129"]
+        .into_iter()
+        .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.rdev() == importer.device))
+        .expect("no matching DRM render node for the Vulkan importer");
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        panic!("could not create real Vulkan WSI fixture for DMA-BUF pixels");
+    };
+    let (width, height) = (6016u32, 3384u32);
+    assert!(!appkit::backing::native_scene_extent_supported(
+        width, height
+    ));
+    assert!(appkit::backing::native_scene_dma_extent_supported(
+        width, height
+    ));
+    // Resolve GBM dynamically to keep portable builds independent of the
+    // distribution's libgbm development package.
+    unsafe {
+        use std::ffi::{c_int, c_void};
+        let handle = libc::dlopen(c"libgbm.so.1".as_ptr(), libc::RTLD_NOW);
+        assert!(!handle.is_null(), "libgbm runtime unavailable");
+        unsafe fn symbol<T>(handle: *mut c_void, name: &std::ffi::CStr) -> T {
+            let raw = unsafe { libc::dlsym(handle, name.as_ptr()) };
+            assert!(!raw.is_null(), "GBM missing symbol {name:?}");
+            unsafe { std::mem::transmute_copy(&raw) }
+        }
+        let create_device: unsafe extern "C" fn(c_int) -> *mut c_void =
+            symbol(handle, c"gbm_create_device");
+        let destroy_device: unsafe extern "C" fn(*mut c_void) =
+            symbol(handle, c"gbm_device_destroy");
+        let create_bo: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32) -> *mut c_void =
+            symbol(handle, c"gbm_bo_create");
+        let destroy_bo: unsafe extern "C" fn(*mut c_void) = symbol(handle, c"gbm_bo_destroy");
+        let bo_fd: unsafe extern "C" fn(*mut c_void) -> c_int = symbol(handle, c"gbm_bo_get_fd");
+        let bo_modifier: unsafe extern "C" fn(*mut c_void) -> u64 =
+            symbol(handle, c"gbm_bo_get_modifier");
+        let bo_map: unsafe extern "C" fn(
+            *mut c_void,
+            u32,
+            u32,
+            u32,
+            u32,
+            u32,
+            *mut u32,
+            *mut *mut c_void,
+        ) -> *mut u8 = symbol(handle, c"gbm_bo_map");
+        let bo_unmap: unsafe extern "C" fn(*mut c_void, *mut c_void) =
+            symbol(handle, c"gbm_bo_unmap");
+        let fd = libc::open(
+            std::ffi::CString::new(node).unwrap().as_ptr(),
+            libc::O_RDWR | libc::O_CLOEXEC,
+        );
+        assert!(fd >= 0, "could not open render node {node}");
+        let device = create_device(fd);
+        assert!(!device.is_null(), "GBM device creation failed");
+        // Linear AR24 is the portable format for this pixel oracle. No CPU
+        // zeroed 6K image is ever handed to AppKit or the Metal worker.
+        let bo = create_bo(device, width, height, u32::from_le_bytes(*b"AR24"), 16);
+        assert!(!bo.is_null(), "GBM rejected 6K linear AR24");
+        let modifier = bo_modifier(bo);
+        assert!(
+            importer
+                .formats
+                .contains(&(u32::from_le_bytes(*b"AR24"), modifier)),
+            "Vulkan importer does not support GBM modifier {modifier:#x}"
+        );
+        let mut stride = 0u32;
+        let mut cookie = std::ptr::null_mut();
+        let pixels = bo_map(bo, 0, 0, width, height, 2, &mut stride, &mut cookie);
+        assert!(
+            !pixels.is_null() && stride >= width * 4,
+            "GBM 6K buffer not CPU mappable"
+        );
+        let bytes = std::slice::from_raw_parts_mut(pixels, stride as usize * height as usize);
+        for row in bytes.chunks_exact_mut(stride as usize) {
+            for pixel in row.chunks_exact_mut(4).take(width as usize) {
+                pixel.copy_from_slice(&[0, 0, 255, 255]); // opaque red, BGRA
+            }
+        }
+        bo_unmap(bo, cookie);
+        let exported = bo_fd(bo);
+        assert!(exported >= 0, "GBM failed to export real DMA-BUF");
+        // The returned fd independently pins the image after GBM teardown.
+        destroy_bo(bo);
+        destroy_device(device);
+        libc::close(fd);
+        libc::dlclose(handle);
+        let picture = Arc::new(appkit::backing::Dmabuf {
+            width,
+            height,
+            fourcc: u32::from_le_bytes(*b"AR24"),
+            modifier,
+            planes: vec![appkit::backing::DmabufPlane {
+                fd: std::os::fd::OwnedFd::from_raw_fd(exported),
+                offset: 0,
+                stride,
+            }],
+        });
+        let native_source = native_scene_source(None, Some(picture), 1, width, height)
+            .expect("a 6K DMA-only layer must enter retained composition");
+        assert!(native_source.bytes.is_empty());
+        gpu.one_shot(|device, cb| {
+            device.cmd_clear_color_image(
+                cb,
+                metal.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [0.0, 1.0, 0.0, 1.0],
+                },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .expect("clear static Metal background");
+        let metal_id = 0x6b1usize;
+        let native_id = (1usize << (usize::BITS - 1)) | 0x6b2;
+        let bottom = ScenePlacement {
+            id: metal_id,
+            frame: DirectFrame::from_frame(&whole),
+            opacity: 1.0,
+            opaque: true,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: None,
+        };
+        let huge_frame = appkit::view::Frame {
+            x: 40,
+            y: 35,
+            width,
+            height,
+            ..whole
+        };
+        let native = ScenePlacement {
+            id: native_id,
+            frame: DirectFrame::from_frame(&huge_frame),
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: Some(native_source),
+        };
+        state.layers.push(metal_id);
+        state.synchronize_scene(window as usize, &[bottom.clone(), native.clone()]);
+        assert_eq!(
+            state.stage_composite_layer(
+                metal_id,
+                &whole,
+                &metal,
+                None,
+                &mut SourceOwner(None),
+                false
+            ),
+            Ok(Some(true))
+        );
+        state.note_scene_frame(metal_id, &whole);
+        assert_eq!(
+            stage_native_scene_source(&mut state, &native),
+            Ok(true),
+            "a genuine 6K DMA-BUF did not import as a retained native layer"
+        );
+        state.synchronize_scene(window as usize, &[bottom, native]);
+        assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+        state.idle();
+        let image = state
+            .composite
+            .as_ref()
+            .expect("completed window composite")
+            .image;
+        assert_eq!(
+            read_scene_pixel(gpu, image, whole.width, whole.height, 80, 60),
+            [255, 0, 0, 255],
+            "6K native DMA foreground disappeared or changed colour"
+        );
+        assert_eq!(
+            read_scene_pixel(gpu, image, whole.width, whole.height, 20, 20),
+            [0, 255, 0, 255],
+            "6K DMA overlay erased the static Metal background outside its view"
+        );
+        drop(state);
+        gpu.destroy_image(metal);
+        sdl3::video::destroy_window(window);
+    }
 }
 
 /// An invalid native DMA-BUF is a permanent capability failure, not an

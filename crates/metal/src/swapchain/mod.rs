@@ -1711,12 +1711,17 @@ fn native_scene_source(
     width: u32,
     height: u32,
 ) -> Option<scene::NativeCpuSceneSource> {
-    let bytes = u64::from(width)
-        .checked_mul(u64::from(height))?
-        .checked_mul(4)?;
-    if bytes == 0 || bytes > 64 * 1024 * 1024 {
+    let supported = if pixels.is_some() {
+        appkit::backing::native_scene_extent_supported(width, height)
+    } else if dmabuf.is_some() {
+        appkit::backing::native_scene_dma_extent_supported(width, height)
+    } else {
+        false
+    };
+    if !supported {
         return None;
     }
+    let bytes = u64::from(width) * u64::from(height) * 4;
     let pixels = match (pixels, dmabuf.as_ref()) {
         (Some(pixels), _) if pixels.len() as u64 == bytes => pixels,
         // An empty byte slice means an entirely transparent native CPU base.
@@ -1858,6 +1863,7 @@ fn stage_native_scene_source(
         let output = BackingImageLease::new(gpu, gpu.create_image(&description)?);
         let overlay = [appkit::backing::GpuOverlay {
             picture: Arc::clone(picture),
+            view: layer.id & !(1usize << (usize::BITS - 1)),
             rect: appkit::backing::Rect {
                 x: 0,
                 y: 0,

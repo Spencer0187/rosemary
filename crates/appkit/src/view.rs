@@ -384,6 +384,43 @@ pub(crate) fn native_scene_ca_opacity(view: Id, now: f64) -> f32 {
     opacity
 }
 
+/// Project an intermediate CA mask through its enclosing NSView's bounds
+/// into the same physical pixel coordinate system as the Metal compositor.
+fn project_ca_mask(ancestor_view: Id, rect: NSRect) -> Option<Frame> {
+    let ancestor = unsafe { presentation_frame(ancestor_view) }?;
+    let bounds = bounds_of(ancestor_view);
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        return None;
+    }
+    let sx = f64::from(ancestor.width) / bounds.size.width;
+    let sy = f64::from(ancestor.height) / bounds.size.height;
+    let left = f64::from(ancestor.x) + (rect.origin.x - bounds.origin.x) * sx;
+    let top = if is_flipped(ancestor_view) {
+        f64::from(ancestor.y) + (rect.origin.y - bounds.origin.y) * sy
+    } else {
+        f64::from(ancestor.y)
+            + (bounds.origin.y + bounds.size.height - rect.origin.y - rect.size.height) * sy
+    };
+    let right = left + rect.size.width * sx;
+    let bottom = top + rect.size.height * sy;
+    if ![left, top, right, bottom].iter().all(|f| f.is_finite()) {
+        return None;
+    }
+    let clamp = |n: f64| n.round().clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+    let (x0, y0, x1, y1) = (clamp(left), clamp(top), clamp(right), clamp(bottom));
+    Some(Frame {
+        x: x0,
+        y: y0,
+        width: i64::from(x1)
+            .saturating_sub(i64::from(x0))
+            .clamp(0, i64::from(u32::MAX)) as u32,
+        height: i64::from(y1)
+            .saturating_sub(i64::from(y0))
+            .clamp(0, i64::from(u32::MAX)) as u32,
+        ..ancestor
+    })
+}
+
 /// Opaque native coverage can only subtract a rectangle from Metal if no
 /// ancestor's rounded CA mask removes any of its pixels. Otherwise both
 /// sources must be drawn and the native source gets its rounded GPU mask.
@@ -394,13 +431,27 @@ pub(crate) fn has_rounded_mask_ancestor(view: Id) -> bool {
             break;
         }
         let layer = view_of(at).layer;
+        let parent_view = view_of(at).superview;
+        let mut parent = parent_view;
+        let mut ancestor_layer = std::ptr::null_mut();
+        for _ in 0..64 {
+            if parent.is_null() || !is_view(parent) {
+                break;
+            }
+            ancestor_layer = view_of(parent).layer;
+            if !ancestor_layer.is_null() {
+                break;
+            }
+            parent = view_of(parent).superview;
+        }
         if !layer.is_null()
-            && crate::coreanimation::scene_masks_to_bounds(layer)
-            && crate::coreanimation::scene_corner_radius(layer) > 0.0
+            && ((crate::coreanimation::scene_masks_to_bounds(layer)
+                && crate::coreanimation::scene_corner_radius(layer) > 0.0)
+                || crate::coreanimation::scene_has_rounded_masks_below(layer, ancestor_layer))
         {
             return true;
         }
-        at = view_of(at).superview;
+        at = parent_view;
     }
     false
 }
@@ -429,6 +480,7 @@ fn capture_metal_scene(
         &mut seen_metal,
         None,
         1.0,
+        std::ptr::null_mut(),
         std::ptr::null_mut(),
         &[],
         now,
@@ -465,6 +517,7 @@ fn visit_metal_scene(
     inherited_clip: Option<Frame>,
     inherited_layer_opacity: f32,
     parent_layer: Id,
+    parent_view: Id,
     inherited_rounded: &[RoundedSceneClip],
     now: f64,
     depth: usize,
@@ -491,6 +544,32 @@ fn visit_metal_scene(
         .then(|| unsafe { presentation_frame(view) })
         .flatten();
     let mut rounded = inherited_rounded.to_vec();
+    let mut ca_clip = inherited_clip;
+    if !layer.is_null() && !parent_view.is_null() {
+        for (mask, radius) in crate::coreanimation::scene_masks_below(layer, parent_layer, now) {
+            if let Some(frame) = project_ca_mask(parent_view, mask) {
+                ca_clip = Some(ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)));
+                if radius > 0.0 {
+                    let bounds = bounds_of(parent_view).size;
+                    let parent = unsafe { presentation_frame(parent_view) };
+                    if let Some(parent) = parent {
+                        let sx =
+                            f64::from(parent.width) / bounds.width.abs().max(f64::MIN_POSITIVE);
+                        let sy =
+                            f64::from(parent.height) / bounds.height.abs().max(f64::MIN_POSITIVE);
+                        let physical = radius * sx.min(sy);
+                        if physical.is_finite() && physical > 0.0 {
+                            rounded.push(RoundedSceneClip {
+                                frame,
+                                radius: physical.min(f64::from(frame.width.min(frame.height)) / 2.0)
+                                    as f32,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
     if has_ca_mask {
         let radius = crate::coreanimation::scene_corner_radius(layer);
         if radius > 0.0 {
@@ -516,7 +595,7 @@ fn visit_metal_scene(
                     frame,
                     opacity: (effective_alpha(view) as f32) * layer_opacity,
                     opaque: crate::layer::opaque_of(layer),
-                    clip: inherited_clip,
+                    clip: ca_clip,
                     rounded: rounded.clone(),
                     occluded: Vec::new(),
                     native_pixels: None,
@@ -534,7 +613,13 @@ fn visit_metal_scene(
         if let Some(frame) = unsafe { presentation_frame(view) } {
             if frame.window == window {
                 let cpu = crate::backing::native_scene_pixels(view, frame.width, frame.height);
-                let dma = crate::backing::native_dma_overlay(view);
+                // Source admission must agree with both Vulkan's native-scene
+                // converter and the backing-overlay exclusion decision. An
+                // unsupported extent stays in the original full-window path.
+                let dma =
+                    crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
+                        .then(|| crate::backing::native_dma_overlay(view))
+                        .flatten();
                 if cpu.is_some() || dma.is_some() {
                     let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
                         ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
@@ -543,7 +628,7 @@ fn visit_metal_scene(
                         frame,
                         opacity: (effective_alpha(view) as f32) * layer_opacity,
                         opaque: false,
-                        clip: inherited_clip,
+                        clip: ca_clip,
                         rounded: rounded.clone(),
                         occluded: Vec::new(),
                         native_pixels: cpu.map(|(pixels, _)| pixels),
@@ -555,10 +640,9 @@ fn visit_metal_scene(
         }
     }
     let child_clip = if current_masks {
-        own_frame
-            .map(|frame| inherited_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
+        own_frame.map(|frame| ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
     } else {
-        inherited_clip
+        ca_clip
     };
     let children = view_of(view).subviews;
     if let Some(children) = unsafe { corefoundation::collections::array(children as *const c_void) }
@@ -573,6 +657,7 @@ fn visit_metal_scene(
                 child_clip,
                 layer_opacity,
                 if layer.is_null() { parent_layer } else { layer },
+                if layer.is_null() { parent_view } else { view },
                 &rounded,
                 now,
                 depth + 1,
@@ -4312,5 +4397,316 @@ mod tests {
             assert_eq!(f(layer, get_masks), 0);
         }
         objc::arc::release(view);
+    }
+
+    #[test]
+    fn independent_dma_overlays_preserve_view_ownership_and_oversize_fallback() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let below = view(rect(0.0, 0.0, 100.0, 100.0));
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let above = view(rect(20.0, 20.0, 100.0, 100.0));
+        let huge = view(rect(0.0, 0.0, 6016.0, 3384.0));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_class
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make(metal_class as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), below);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), above);
+            add_subview(content, objc::sel::get("addSubview:"), huge);
+        }
+        // The regular presenter only collects overlays from shown windows.
+        let front: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { front(window, objc::sel::get("orderFront:"), std::ptr::null_mut()) };
+        let shared = std::sync::Arc::new(crate::backing::Dmabuf {
+            width: 100,
+            height: 100,
+            fourcc: 0,
+            modifier: 0,
+            planes: vec![],
+        });
+        for native in [below, above, huge] {
+            crate::backing::set_overlay(
+                native,
+                crate::backing::Overlay {
+                    width: 100,
+                    height: 100,
+                    picture: crate::backing::Picture::Dmabuf(std::sync::Arc::clone(&shared)),
+                },
+            );
+        }
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(
+            scene
+                .iter()
+                .filter(|layer| layer.native_dmabuf.is_some())
+                .count(),
+            2
+        );
+        assert!(
+            scene
+                .iter()
+                .any(|layer| layer.layer == ((above as usize) | (1usize << (usize::BITS - 1))))
+        );
+        let admitted = crate::backing::native_dma_above_metal(sdl);
+        assert_eq!(
+            admitted,
+            [above as usize, huge as usize],
+            "both the small upper overlay and 6K DMA-only view are independent"
+        );
+        assert!(!crate::backing::native_scene_extent_supported(6016, 3384));
+        assert!(crate::backing::native_scene_dma_extent_supported(
+            6016, 3384
+        ));
+        assert!(!crate::backing::native_scene_dma_extent_supported(
+            9000, 9000
+        ));
+        let overlays = crate::backing::gpu_overlay_instances_for_tests(
+            sdl,
+            &crate::backing::Store::new(320, 240),
+        );
+        assert_eq!(overlays.len(), 3);
+        assert_eq!(
+            overlays
+                .iter()
+                .map(|overlay| overlay.view)
+                .collect::<Vec<_>>(),
+            [below as usize, above as usize, huge as usize]
+        );
+        assert!(
+            overlays
+                .iter()
+                .all(|overlay| std::sync::Arc::ptr_eq(&overlay.picture, &shared))
+        );
+        // A 6K DMA source is accepted without a full CPU allocation and
+        // must remain an independent top layer rather than being flattened.
+        assert!(
+            crate::backing::gpu_under_metal(sdl, &crate::backing::Store::new(320, 240)).is_some()
+        );
+        // An extreme geometry unsupported by the bounded GPU importer must
+        // remain in the original backing overlay path, never be excluded.
+        let set_size: unsafe extern "C" fn(Id, objc::sel::Sel, NSSize) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_size(
+                huge,
+                objc::sel::get("setFrameSize:"),
+                NSSize {
+                    width: 9000.0,
+                    height: 9000.0,
+                },
+            )
+        };
+        flush_metal_scenes();
+        assert_eq!(
+            crate::backing::native_dma_above_metal(sdl),
+            [above as usize]
+        );
+        assert!(
+            crate::backing::gpu_under_metal(sdl, &crate::backing::Store::new(320, 240)).is_none()
+        );
+        for native in [below, above, huge] {
+            crate::backing::remove_overlay(native);
+        }
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn native_foreground_updates_reuse_cpu_underlay_until_lower_content_changes() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let foreground = view(rect(40.0, 35.0, 30.0, 25.0));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_class
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        unsafe {
+            set_layer(
+                metal_view,
+                objc::sel::get("setLayer:"),
+                make(metal_class as *const _ as Id, maker),
+            );
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), foreground);
+        }
+        let mut flat = crate::backing::Store::new(320, 240);
+        crate::backing::set_native_view_pixels_for_tests(
+            foreground,
+            30,
+            25,
+            [0, 0, 255, 255].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        let initial =
+            crate::backing::gpu_under_metal_cached(sdl, &flat).expect("independent foreground");
+        let count = crate::backing::gpu_underlay_render_count_for_tests();
+        for index in 0..48u8 {
+            crate::backing::set_native_view_pixels_for_tests(
+                foreground,
+                30,
+                25,
+                [index, 0, 255, 255].repeat(30 * 25),
+            );
+            flush_metal_scenes();
+            // Every draw dirties the *flattened* fallback store.
+            flat.pixels[0] = index;
+            let after = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+            assert!(
+                std::sync::Arc::ptr_eq(&initial, &after),
+                "foreground-only redraw recomputed the underlay"
+            );
+        }
+        assert_eq!(crate::backing::gpu_underlay_render_count_for_tests(), count);
+        assert_eq!(&initial.pixels[0..4], &[237, 237, 237, 255]);
+        crate::backing::set_native_view_pixels_for_tests(
+            content,
+            320,
+            240,
+            [0, 255, 0, 255].repeat(320 * 240),
+        );
+        flush_metal_scenes();
+        let changed = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&initial, &changed));
+        let offset = (100 * 320 + 200) * 4;
+        assert_eq!(&changed.pixels[offset..offset + 4], &[0, 255, 0, 255]);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn intermediate_ca_superlayer_mask_updates_static_metal_scene() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let root = unsafe { make(ca as *const _ as Id, maker) };
+        let middle = unsafe { make(ca as *const _ as Id, maker) };
+        let metal = unsafe { make(metal_class as *const _ as Id, maker) };
+        unsafe {
+            set_layer(content, objc::sel::get("setLayer:"), root);
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+        }
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_ca: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let radius: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_frame(
+                middle,
+                objc::sel::get("setFrame:"),
+                rect(30.0, 20.0, 100.0, 90.0),
+            );
+            add_ca(root, objc::sel::get("addSublayer:"), middle);
+            add_ca(middle, objc::sel::get("addSublayer:"), metal);
+            radius(middle, objc::sel::get("setCornerRadius:"), 17.0);
+        }
+        crate::coreanimation::set_masks(middle, true);
+        flush_metal_scenes();
+        let first = metal_scene(sdl).unwrap();
+        let entry = first
+            .iter()
+            .find(|layer| layer.layer == metal as usize)
+            .unwrap();
+        assert_eq!(
+            entry.rounded.len(),
+            1,
+            "intermediate CA radius was not inherited"
+        );
+        let mask = entry.rounded[0];
+        assert_eq!(
+            (mask.frame.x, mask.frame.width, mask.frame.height),
+            (30, 100, 90)
+        );
+        assert_eq!(mask.radius, 17.0);
+        assert!(entry.clip.is_some());
+        crate::coreanimation::set_masks(middle, false);
+        flush_metal_scenes();
+        let unmasked = metal_scene(sdl).unwrap();
+        let entry = unmasked
+            .iter()
+            .find(|layer| layer.layer == metal as usize)
+            .unwrap();
+        assert!(entry.rounded.is_empty());
+        assert!(entry.clip.is_none());
+        // Re-masking only changes CA metadata. No guest Metal submission.
+        crate::coreanimation::set_masks(middle, true);
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .find(|layer| layer.layer == metal as usize)
+                .unwrap()
+                .rounded
+                .len(),
+            1
+        );
+        objc::arc::release(window);
     }
 }
