@@ -2140,6 +2140,21 @@ fn linear_dmabuf_cpu_fallback(_layer: &ScenePlacement) -> Option<ScenePlacement>
     None
 }
 
+/// A native snapshot is reusable only if it contains the exact GPU texel
+/// generation described by the proposed native publication. Frame movement
+/// alone is composited from the existing image and does not retire its lease.
+fn native_image_matches_placement(image: &scene::SceneLayer, proposed: &ScenePlacement) -> bool {
+    let Some(native) = proposed.native.as_ref() else {
+        return false;
+    };
+    image.id == proposed.id
+        && image.ready
+        && image.native_revision == Some(native.revision)
+        && image.native_dma_sample == native.dma_sample
+        && image.snapshot.image.width == proposed.frame.width
+        && image.snapshot.image.height == proposed.frame.height
+}
+
 fn stage_native_scene_source(
     state: &mut Swapchain,
     layer: &ScenePlacement,
@@ -2165,14 +2180,11 @@ fn stage_native_scene_source(
     if state.direct.is_some() && state.stage_direct_snapshot(true)? != Some(true) {
         return Ok(false);
     }
-    if state.scene_layers.iter().any(|s| {
-        s.id == layer.id
-            && s.ready
-            && s.native_revision == Some(native.revision)
-            && s.native_dma_sample == native.dma_sample
-            && s.snapshot.image.width == layer.frame.width
-            && s.snapshot.image.height == layer.frame.height
-    }) {
+    if state
+        .scene_layers
+        .iter()
+        .any(|image| native_image_matches_placement(image, layer))
+    {
         return Ok(true);
     }
     let frame = layer.frame.frame();
@@ -2230,6 +2242,14 @@ fn stage_native_scene_source(
         frame.window as usize,
         image_bytes.saturating_mul(scratch_count),
     ) {
+        // Fence-held allocations may disappear on retry. Rollback-pinned
+        // *committed* images cannot: they need a different atomic transition
+        // strategy, not a perpetual 10-ms poll. Do not disable DMA importing.
+        if state.atomic_transition_gpu_floor()
+            > WINDOW_GPU_PAYLOAD_BUDGET.saturating_sub(image_bytes.saturating_mul(scratch_count))
+        {
+            return Err("native AppKit atomic GPU transition peak exhausted".into());
+        }
         return Ok(false);
     }
     #[cfg(test)]
@@ -2759,6 +2779,10 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 // snapshot and the actual GPU window accumulator. Keep the
                 // previously committed image leases alive through the whole
                 // batch; metadata-only rollback is not sufficient.
+                // Spare cached native images are not part of the last
+                // committed pixels needed for rollback. Never pin them into
+                // an otherwise impossible atomic replacement.
+                state.shed_scene_spares();
                 let previous_layers = state.scene_layers.clone();
                 state.transaction_pinned = previous_layers
                     .iter()
@@ -2767,15 +2791,17 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             .chain(layer.spare.iter().map(Arc::clone))
                     })
                     .collect();
-                // Count only pre-transaction native images whose view is
-                // removed by the complete proposal. These leases stay alive
-                // in previous_layers/transaction_pinned for rollback; the
-                // window-wide allocator still charges their physical bytes.
+                // The projected scene does not retain old native GPU texels
+                // when a layer is removed *or* the same layer ID publishes a
+                // different image generation. Keep their old leases pinned
+                // for rollback and charged to the 768MiB physical ledger.
                 state.transaction_retiring_bytes = previous_layers
                     .iter()
                     .filter(|old| {
                         old.native_revision.is_some()
-                            && !live.iter().any(|proposed| proposed.id == old.id)
+                            && !live
+                                .iter()
+                                .any(|proposed| native_image_matches_placement(old, proposed))
                     })
                     .map(|old| scene::scene_image_bytes(PresentSource::from(&old.snapshot.image)))
                     .sum();
@@ -2834,7 +2860,9 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         }
                         Err(reason)
                             if reason == "native-dmabuf-import-refused"
-                                || reason == "native AppKit GPU scene budget exhausted" =>
+                                || reason == "native AppKit GPU scene budget exhausted"
+                                || reason
+                                    == "native AppKit atomic GPU transition peak exhausted" =>
                         {
                             // Keep the last successfully published window
                             // image. Its producer will receive the changed
@@ -2844,7 +2872,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 != Some((revision, committed))
                             {
                                 #[cfg(test)]
-                                if reason.contains("budget") {
+                                if reason.contains("budget") || reason.contains("peak") {
                                     NATIVE_HARD_BUDGET_REFUSALS.fetch_add(1, Ordering::Relaxed);
                                 }
                                 gpu::trace(format!(

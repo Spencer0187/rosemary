@@ -7006,6 +7006,282 @@ fn replacing_obsolete_native_gpu_generations_makes_forward_progress() {
     sdl3::video::destroy_window(window);
 }
 
+/// A high-occupancy native scene can replace an accepted GPU generation
+/// *without changing its layer ID*. The 512MiB projected scene budget must
+/// credit the old pixels it supersedes, not just views removed by membership.
+#[test]
+#[cfg(target_os = "linux")]
+fn same_native_id_near_scene_budget_replaces_real_dma_pixels() {
+    if isolate_vulkan_graphical_test("same_native_id_near_scene_budget_replaces_real_dma_pixels") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let picture = real_gbm_picture_with_pixels(2048, 2048, |_, _| [0, 0, 255, 255]);
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"same id native 512MiB", 2048, 2048, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: 2048,
+            height: 2048,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 2048,
+        height: 2048,
+        window_width: 2048,
+        window_height: 2048,
+    };
+    let frame = DirectFrame::from_frame(&whole);
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let ids: Vec<_> = (0..28usize)
+        .map(|n| (1usize << (usize::BITS - 1)) | 0xca00 | n)
+        .collect();
+    for id in &ids {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &desc)
+            .expect("accepted native 16MiB image under physical window ledger");
+        state.seed_accepted_native_for_budget_test(*id, frame, lease);
+    }
+    // Initial accepted image generation is blue, later DMA revision red.
+    let id = *ids.last().unwrap();
+    let base = state
+        .scene_layers
+        .iter()
+        .find(|s| s.id == id)
+        .unwrap()
+        .snapshot
+        .image
+        .image;
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            base,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [1.0, 0.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let old_scene = state.scene_placements.clone();
+    state.synchronize_scene(window as usize, &old_scene);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(state.scene_gpu_bytes() >= 464 * 1024 * 1024);
+    let output = state.composite.as_ref().unwrap().image;
+    // Synthetic preaccepted snapshots validate the GPU lease and budget
+    // transition; their pixels are not an AppKit producer publication.
+    assert_eq!(state.scene_layers.iter().filter(|s| s.ready).count(), 28);
+    let changed = ScenePlacement {
+        id,
+        frame,
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([255, 0, 0, 255].repeat(2048 * 2048)),
+            revision: 2,
+            dmabuf: Some(picture),
+            dma_sample: None,
+        }),
+    };
+    let mut proposal = old_scene;
+    *proposal.last_mut().unwrap() = changed.clone();
+    let previous = state.scene_layers.clone();
+    state.transaction_pinned = previous
+        .iter()
+        .map(|image| Arc::clone(&image.snapshot))
+        .collect();
+    state.transaction_retiring_bytes = previous
+        .iter()
+        .filter(|image| {
+            image.native_revision.is_some()
+                && !proposal
+                    .iter()
+                    .any(|p| native_image_matches_placement(image, p))
+        })
+        .map(|image| scene::scene_image_bytes(PresentSource::from(&image.snapshot.image)))
+        .sum();
+    assert_eq!(state.transaction_retiring_bytes, 16 * 1024 * 1024);
+    let staged_scratch = 4 * 2048 * 2048 * 4;
+    assert!(!scene::fits_scene_budget(
+        state.scene_gpu_bytes(),
+        staged_scratch
+    ));
+    assert!(scene::fits_scene_budget(
+        state.budgeted_scene_bytes(),
+        staged_scratch
+    ));
+    assert!(scene::fits_scene_budget(
+        state.projected_committed_scene_bytes(),
+        staged_scratch
+    ));
+    assert_eq!(
+        stage_native_scene_source(&mut state, &changed),
+        Ok(true),
+        "same-ID native replacement was permanently refused at 512MiB"
+    );
+    state.synchronize_scene(window as usize, &proposal);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, output, 2048, 2048, 60, 40),
+        [255, 0, 0, 255],
+        "accepted image content stayed stale even after same-ID admission"
+    );
+    assert!(!appkit::backing::dmabuf_import_refused(window));
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(previous);
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+    drop(state);
+    sdl3::video::destroy_window(window);
+}
+
+/// Staging a second large mixed native tile while preserving old and first-
+/// replacement generations for rollback can exceed the 768MiB physical cap,
+/// even though the final projected retained scene fits under 512MiB. Classify
+/// this as a nonprogressing atomic peak, not a fence-held temporary retry or
+/// an importer failure. No GPU submission or rejected CPU pixel fallback.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn atomic_scene_replacement_peak_reports_nonprogressing_physical_pressure() {
+    if isolate_vulkan_graphical_test(
+        "atomic_scene_replacement_peak_reports_nonprogressing_physical_pressure",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let mut old = Vec::new();
+    for n in 0..28usize {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        old.push(Arc::clone(&lease));
+        state.seed_accepted_native_for_budget_test(
+            (1usize << (usize::BITS - 1)) | 0xdd00 | n,
+            DirectFrame::from_frame(&whole),
+            lease,
+        );
+    }
+    // Nineteen tiles were successfully staged in this atomic replacement,
+    // but the previous 28 old generations must remain pinned for rollback.
+    // The 47 actual 16MiB leases occupy 752MiB before one more tile begins.
+    state.transaction_pinned = old.clone();
+    for i in 0..19 {
+        let fresh = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.scene_layers[i].snapshot = fresh;
+        state.scene_layers[i].native_revision = Some(2);
+    }
+    state.transaction_retiring_bytes = 19 * 16 * 1024 * 1024;
+    let incoming = 4 * 16 * 1024 * 1024u64;
+    assert_eq!(state.atomic_transition_gpu_floor(), 47 * 16 * 1024 * 1024);
+    assert_eq!(state.budgeted_scene_bytes(), 28 * 16 * 1024 * 1024);
+    assert!(scene::fits_scene_budget(
+        state.budgeted_scene_bytes(),
+        incoming
+    ));
+    assert!(state.atomic_transition_gpu_floor() + incoming > WINDOW_GPU_PAYLOAD_BUDGET);
+    assert!(!window_gpu_capacity_available(window as usize, incoming));
+    let pending = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xee00,
+        frame: DirectFrame {
+            window: window as usize,
+            x: 0,
+            y: 0,
+            width: 2048,
+            height: 2048,
+            window_width: whole.width,
+            window_height: whole.height,
+        },
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(vec![0u8; 16 * 1024 * 1024]),
+            revision: 2,
+            dmabuf: Some(Arc::new(appkit::backing::Dmabuf {
+                width: 2048,
+                height: 2048,
+                fourcc: 0,
+                modifier: 0,
+                planes: vec![],
+            })),
+            dma_sample: None,
+        }),
+    };
+    let before = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        stage_native_scene_source(&mut state, &pending),
+        Err("native AppKit atomic GPU transition peak exhausted".to_owned())
+    );
+    assert_eq!(NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed), before);
+    assert!(!appkit::backing::dmabuf_import_refused(window));
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(old);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 /// External backing pool reservations or fence-held leases are not a hard
 /// scene-size impossibility. Deferred native staging must avoid a wasted
 /// Vulkan upload and resume when unrelated GPU image ownership retires.

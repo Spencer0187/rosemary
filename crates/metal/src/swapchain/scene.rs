@@ -832,6 +832,37 @@ impl Swapchain {
             .saturating_sub(self.transaction_retiring_bytes)
     }
 
+    /// Physical allocations that must coexist to preserve rollback at this
+    /// point in the transaction. Count identical Arc leases once, but include
+    /// previous generations pinned solely by the transaction. Unlike the
+    /// projected 512MiB scene check, none of these bytes can be retired by
+    /// waiting for an unrelated frame fence.
+    pub(super) fn atomic_transition_gpu_floor(&self) -> u64 {
+        let mut seen = std::collections::HashSet::new();
+        let mut total = 0u64;
+        let mut count = |lease: &Arc<BackingImageLease>| {
+            if seen.insert(Arc::as_ptr(lease) as usize) {
+                total = total.saturating_add(scene_image_bytes(PresentSource::from(&lease.image)));
+            }
+        };
+        for current in &self.scene_layers {
+            count(&current.snapshot);
+        }
+        for prior in &self.transaction_pinned {
+            count(prior);
+        }
+        if let Some(direct) = &self.direct {
+            if let Some(backing) = &direct.backing {
+                count(backing);
+            }
+        }
+        total.saturating_add(
+            self.composite
+                .as_ref()
+                .map_or(0, |image| scene_image_bytes(PresentSource::from(image))),
+        )
+    }
+
     /// Lower bound on scene capacity with *all* previous submissions retired.
     /// This is the non-evictable set; a new native source which cannot fit
     /// alongside it will not become stageable by polling fences or sleeping.
