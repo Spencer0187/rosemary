@@ -6288,6 +6288,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
         if pending
             && !state.scene_restore_pending
             && !state.scene_repaint_needed
+            && state.direct.is_none()
             && state
                 .scene_layers
                 .iter()
