@@ -2188,12 +2188,37 @@ fn cached_native_cpu_base<'a>(
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagedNativeIdentity {
+    revision: u64,
+    dma_sample: Option<scene::DmaSample>,
+}
+
+impl StagedNativeIdentity {
+    fn from_placement(layer: &ScenePlacement) -> Option<Self> {
+        layer.native.as_ref().map(|native| Self {
+            revision: native.revision,
+            dma_sample: native.dma_sample,
+        })
+    }
+}
+
+// Existing direct staging users need only completion. The compositor worker
+// additionally needs the identity of the *effective* bytes after CPU fallback.
+#[cfg(test)]
 fn stage_native_scene_source(
     state: &mut Swapchain,
     layer: &ScenePlacement,
 ) -> Result<bool, String> {
+    stage_native_scene_source_effective(state, layer).map(|identity| identity.is_some())
+}
+
+fn stage_native_scene_source_effective(
+    state: &mut Swapchain,
+    layer: &ScenePlacement,
+) -> Result<Option<StagedNativeIdentity>, String> {
     let Some(native) = layer.native.as_ref() else {
-        return Ok(true);
+        return Ok(None);
     };
     if native.dmabuf.is_some()
         && appkit::backing::dmabuf_import_refused(layer.frame.window as sdl3::Window)
@@ -2202,7 +2227,7 @@ fn stage_native_scene_source(
         // producer allocation may still be CPU-mappable. Use its *real* texels
         // as an ordered source rather than dropping the foreground entirely.
         if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
-            return stage_native_scene_source(state, &cpu);
+            return stage_native_scene_source_effective(state, &cpu);
         }
         return Err("native-dmabuf-import-refused".into());
     }
@@ -2211,14 +2236,14 @@ fn stage_native_scene_source(
     // transparent regions will permanently erase the still-static Metal
     // drawable. A busy frame must defer the entire scene transaction.
     if state.direct.is_some() && state.stage_direct_snapshot(true)? != Some(true) {
-        return Ok(false);
+        return Ok(None);
     }
     if state
         .scene_layers
         .iter()
         .any(|image| native_image_matches_placement(image, layer))
     {
-        return Ok(true);
+        return Ok(StagedNativeIdentity::from_placement(layer));
     }
     let frame = layer.frame.frame();
     if frame.width == 0
@@ -2275,7 +2300,7 @@ fn stage_native_scene_source(
                 state.projected_committed_scene_bytes(),
                 image_bytes.saturating_mul(scratch_count),
             ) {
-                return Ok(false);
+                return Ok(None);
             }
             // Only a committed, non-evictable footprint is a hard failure.
             // A temporarily pinned generation must never poison importer
@@ -2308,7 +2333,7 @@ fn stage_native_scene_source(
         {
             return Err("native AppKit atomic GPU transition peak exhausted".into());
         }
-        return Ok(false);
+        return Ok(None);
     }
     #[cfg(test)]
     NATIVE_IMAGE_UPLOAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
@@ -2470,7 +2495,7 @@ fn stage_native_scene_source(
             // If it cannot, request a CPU representation; a transparent
             // replacement is not an acceptable fallback for unknown pixels.
             if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
-                return stage_native_scene_source(state, &cpu);
+                return stage_native_scene_source_effective(state, &cpu);
             }
             return Err("native-dmabuf-import-refused".into());
         }
@@ -2520,7 +2545,7 @@ fn stage_native_scene_source(
         state.capture_single_scene_from_composite()?;
     }
     state.accept_native_gpu_snapshot(layer, source);
-    Ok(true)
+    Ok(StagedNativeIdentity::from_placement(layer))
 }
 
 enum NativeEscrowProgress {
@@ -2599,10 +2624,10 @@ fn stage_native_transaction_source(
     layer: &ScenePlacement,
     previous: &mut [SceneRollbackLayer],
     proposal: &[ScenePlacement],
-) -> Result<bool, String> {
+) -> Result<Option<StagedNativeIdentity>, String> {
     loop {
-        let result = stage_native_scene_source(state, layer);
-        let physical_pressure = matches!(result, Ok(false))
+        let result = stage_native_scene_source_effective(state, layer);
+        let physical_pressure = matches!(result, Ok(None))
             && layer.native.as_ref().is_some_and(|native| {
                 let pixels = u64::from(layer.frame.width)
                     .saturating_mul(u64::from(layer.frame.height))
@@ -2620,7 +2645,7 @@ fn stage_native_transaction_source(
         {
             match escrow_one_retired_native(state, previous, proposal) {
                 Ok(NativeEscrowProgress::Released) => continue,
-                Ok(NativeEscrowProgress::WaitingForReaders) => return Ok(false),
+                Ok(NativeEscrowProgress::WaitingForReaders) => return Ok(None),
                 Ok(NativeEscrowProgress::NoCandidate) => {}
                 Err(error) => return Err(error),
             }
@@ -2778,16 +2803,17 @@ fn committed_native_gpu_revisions(
     state: &Swapchain,
     effective: &[ScenePlacement],
     published: &HashMap<usize, u64>,
-    staged: &std::collections::HashSet<usize>,
+    staged: &HashMap<usize, StagedNativeIdentity>,
     refused: &[usize],
 ) -> Vec<(usize, u64)> {
     effective
         .iter()
         .filter_map(|placement| {
-            let native = placement.native.as_ref()?;
-            if refused.contains(&placement.id) || !staged.contains(&placement.id) {
+            placement.native.as_ref()?;
+            if refused.contains(&placement.id) {
                 return None;
             }
+            let staged_identity = staged.get(&placement.id)?;
             let original = *published.get(&placement.id)?;
             state
                 .scene_layers
@@ -2795,7 +2821,8 @@ fn committed_native_gpu_revisions(
                 .any(|source| {
                     source.id == placement.id
                         && source.ready
-                        && source.native_revision == Some(native.revision)
+                        && source.native_revision == Some(staged_identity.revision)
+                        && source.native_dma_sample == staged_identity.dma_sample
                         && source.native_published_revision == Some(original)
                 })
                 .then_some((placement.id, original))
@@ -3039,7 +3066,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 let previous_frames = state.scene_frames.clone();
                 let mut native_ready = true;
                 let mut refused = Vec::new();
-                let mut staged_ids = std::collections::HashSet::new();
+                let mut staged_ids = HashMap::<usize, StagedNativeIdentity>::new();
                 let mut unrepresented = false;
                 for layer in live.iter().filter(|p| p.native.is_some()) {
                     let revision = layer.native.as_ref().expect("filtered").revision;
@@ -3071,26 +3098,24 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         &live,
                     );
                     match staged {
-                        Ok(true) => {
+                        Ok(Some(effective)) => {
                             let original = published.get(&layer.id).copied();
-                            let revision = layer.native.as_ref().map(|n| n.revision);
                             if let Some(image) = state.scene_layers.iter_mut().find(|image| {
                                 image.id == layer.id
                                     && image.ready
-                                    && image.native_revision == revision
-                                    && image.native_dma_sample
-                                        == layer.native.as_ref().and_then(|n| n.dma_sample)
+                                    && image.native_revision == Some(effective.revision)
+                                    && image.native_dma_sample == effective.dma_sample
                             }) {
                                 // Bind the exact original publication to the
                                 // retained image, not simply to the layer ID.
                                 image.native_published_revision = original;
-                                staged_ids.insert(layer.id);
+                                staged_ids.insert(layer.id, effective);
                             } else {
                                 native_ready = false;
                                 break;
                             }
                         }
-                        Ok(false) => {
+                        Ok(None) => {
                             native_ready = false;
                             break;
                         }

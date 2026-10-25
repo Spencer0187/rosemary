@@ -6434,7 +6434,13 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     {
         let state = entry.state.lock().unwrap();
         let publication = HashMap::from([(earlier_id, 10u64)]);
-        let staged = std::collections::HashSet::from([earlier_id]);
+        let staged = HashMap::from([(
+            earlier_id,
+            StagedNativeIdentity {
+                revision: 9,
+                dma_sample: None,
+            },
+        )]);
         let previous = vec![previously_accepted_a.clone()];
         assert!(
             committed_native_gpu_revisions(&state, &previous, &publication, &staged, &[earlier_id])
@@ -12619,7 +12625,7 @@ fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
         let result = stage_native_transaction_source(&mut state, layer, &mut rollback, &proposed);
         assert_eq!(
             result,
-            Ok(true),
+            Ok(StagedNativeIdentity::from_placement(layer)),
             "native image id={} scene={} floor={} retiring={} physical_free={} gpu_held={}",
             layer.id,
             state.scene_gpu_bytes(),
@@ -12660,5 +12666,205 @@ fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
     drop(rollback);
     assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
     drop(state);
+    sdl3::video::destroy_window(window);
+}
+
+/// CPU-readable linear DMA fallback must complete the *worker* transaction,
+/// not just the direct uploader: its GPU revision is not the producer's
+/// publication revision, but only the latter may be acknowledged to AppKit.
+#[test]
+#[cfg(target_os = "linux")]
+fn rejected_linear_dma_worker_commits_original_publication() {
+    if isolate_vulkan_graphical_test("rejected_linear_dma_worker_commits_original_publication") {
+        return;
+    }
+    use std::os::fd::FromRawFd;
+    let retirement = AwaitTestWindowRetirements;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"linear DMA worker admission", 160, 120, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 160,
+        height: 120,
+        window_width: 160,
+        window_height: 120,
+    };
+    let metal = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 160,
+            height: 120,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0., 1., 0., 1.],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let window_id = window as usize;
+    assert_eq!(present(gpu, window_id, &whole, &metal, &[]), Ok(true));
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&window_id)
+        .unwrap()
+        .clone();
+    let fd = unsafe {
+        libc::memfd_create(
+            c"worker-linear-fallback".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(fd >= 0);
+    let (width, height, stride) = (30u32, 25u32, 30u32 * 4 + 16);
+    let mut image = vec![0u8; (stride * height) as usize];
+    for row in image.chunks_exact_mut(stride as usize) {
+        for pixel in row.chunks_exact_mut(4).take(width as usize) {
+            pixel.copy_from_slice(&[0, 0, 255, 255]);
+        }
+    }
+    assert_eq!(
+        unsafe { libc::ftruncate(fd, image.len() as libc::off_t) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pwrite(fd, image.as_ptr().cast(), image.len(), 0) },
+        image.len() as isize
+    );
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                fd,
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+            )
+        },
+        0
+    );
+    let picture = Arc::new(appkit::backing::Dmabuf {
+        width,
+        height,
+        fourcc: u32::from_le_bytes(*b"AR24"),
+        modifier: 0,
+        planes: vec![appkit::backing::DmabufPlane {
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            offset: 0,
+            stride,
+        }],
+    });
+    let id = (1usize << (usize::BITS - 1)) | 0xa021usize;
+    let native = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 40,
+            y: 35,
+            width,
+            height,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 17,
+            dmabuf: Some(picture),
+            dma_sample: None,
+        }),
+    };
+    let base = ScenePlacement {
+        id: window_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    appkit::backing::refuse_dmabufs(window);
+    *entry.pending_scene.lock().unwrap() = Some(vec![base, native]);
+    ensure_layer_compositor_worker(window_id, &entry);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = entry.state.lock().unwrap();
+        let accepted = state.scene_layers.iter().any(|layer| {
+            layer.id == id
+                && layer.ready
+                && layer.native_published_revision == Some(17)
+                && layer.native_revision != Some(17)
+        });
+        if accepted
+            && !state.composite_dirty
+            && !state.scene_restore_pending
+            && entry.pending_scene.lock().unwrap().is_none()
+        {
+            assert_eq!(
+                read_scene_pixel(
+                    gpu,
+                    state.composite.as_ref().unwrap().image,
+                    160,
+                    120,
+                    48,
+                    42
+                ),
+                [255, 0, 0, 255]
+            );
+            assert!(
+                state.wsi_publishes > 0,
+                "worker did not publish fallback WSI image"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "linear fallback worker never acknowledged publication: layers={} restore={} pending={}",
+            state.scene_layers.len(),
+            state.scene_restore_pending,
+            entry.pending_scene.lock().unwrap().is_some()
+        );
+        drop(state);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    forget_window(window);
+    drop(entry);
+    drop(retirement);
+    gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
