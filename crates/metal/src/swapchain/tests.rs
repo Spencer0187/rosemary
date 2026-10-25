@@ -13833,3 +13833,298 @@ fn immediate_resize_copy_retains_old_and_new_accumulators_after_failed_wait() {
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
+
+/// Retryable GPU-only import failures may not enter refused_revisions: the
+/// *same* immutable producer must be accepted after the temporary error ends.
+#[test]
+#[cfg(target_os = "linux")]
+fn compositor_worker_retries_same_dma_revision_after_temporary_import_failure() {
+    if isolate_vulkan_graphical_test(
+        "compositor_worker_retries_same_dma_revision_after_temporary_import_failure",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let retirement = AwaitTestWindowRetirements;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"DMA transient worker", 160, 120, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 160,
+        height: 120,
+        window_width: 160,
+        window_height: 120,
+    };
+    let metal = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 160,
+            height: 120,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    assert_eq!(present(gpu, window as usize, &whole, &metal, &[]), Ok(true));
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&(window as usize))
+        .unwrap()
+        .clone();
+    let picture = real_gbm_picture_with_pixels(32, 32, |_, _| [15, 45, 175, 255]);
+    let native_id = (1usize << (usize::BITS - 1)) | 0xda44;
+    let native = ScenePlacement {
+        id: native_id,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 26,
+            y: 19,
+            width: 32,
+            height: 32,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 63,
+            cpu_capture: None,
+            dmabuf: Some(Arc::clone(&picture)),
+            dma_sample: None,
+        }),
+    };
+    let base = ScenePlacement {
+        id: window as usize,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let failures = TEST_NATIVE_RETRYABLE_FAILURES.load(Ordering::Acquire);
+    TEST_BLOCK_LINEAR_DMA_FALLBACK.store(true, Ordering::Release);
+    crate::overlay::fail_next_dma_import_for_test();
+    *entry.pending_scene.lock().unwrap() = Some(vec![base, native]);
+    ensure_layer_compositor_worker(window as usize, &entry);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = entry.state.lock().unwrap();
+        let accepted = state.scene_layers.iter().any(|layer| {
+            layer.id == native_id
+                && layer.ready
+                && layer.native_revision == Some(63)
+                && layer.native_published_revision == Some(63)
+        });
+        if accepted
+            && !state.composite_dirty
+            && !state.scene_restore_pending
+            && entry.pending_scene.lock().unwrap().is_none()
+        {
+            assert!(
+                TEST_NATIVE_RETRYABLE_FAILURES.load(Ordering::Acquire) > failures,
+                "worker did not observe retryable DMA rejection"
+            );
+            assert_eq!(
+                read_scene_pixel(
+                    gpu,
+                    state.composite.as_ref().unwrap().image,
+                    160,
+                    120,
+                    29,
+                    23
+                ),
+                [175, 45, 15, 255]
+            );
+            assert!(state.wsi_publishes > 0);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker never retried unchanged rejected DMA source: pending={} restore={} accepted={}",
+            entry.pending_scene.lock().unwrap().is_some(),
+            state.scene_restore_pending,
+            accepted
+        );
+        drop(state);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    TEST_BLOCK_LINEAR_DMA_FALLBACK.store(false, Ordering::Release);
+    forget_window(window);
+    drop(entry);
+    drop(retirement);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// A cached unsupported GPU import must still recompute the exact linear
+/// fallback on subsequent moves/opacity updates of the same DMA revision.
+#[test]
+#[cfg(target_os = "linux")]
+fn cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change() {
+    if isolate_vulkan_graphical_test(
+        "cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let picture = real_gbm_picture_with_pixels(22, 18, |_, _| [9, 81, 202, 255]);
+    assert_eq!(picture.modifier, 0, "CPU fallback fixture must be linear");
+    let id = (1usize << (usize::BITS - 1)) | 0xda45;
+    let mut placement = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 12,
+            y: 11,
+            width: 22,
+            height: 18,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 89,
+            cpu_capture: None,
+            dmabuf: Some(Arc::clone(&picture)),
+            dma_sample: None,
+        }),
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0., 1., 0., 1.],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let base = ScenePlacement {
+        id: 0xda46,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.push(base.id);
+    state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
+    assert_eq!(
+        state.stage_composite_layer(base.id, &whole, &metal, None, &mut SourceOwner(None), false),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(base.id, &whole);
+    crate::overlay::fail_next_unsupported_dma_import_for_test();
+    assert_eq!(stage_native_scene_source(&mut state, &placement), Ok(true));
+    assert_eq!(state.unsupported_native_dma.len(), 1);
+    let original = state.scene_layers.iter().find(|l| l.id == id).unwrap();
+    assert_eq!(
+        read_scene_pixel(gpu, original.snapshot.image.image, 22, 18, 3, 4),
+        [9, 81, 202, 255]
+    );
+    state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            160,
+            120,
+            15,
+            15
+        ),
+        [202, 81, 9, 255]
+    );
+    // Exact same producer and revision, only compositor geometry and opacity.
+    placement.frame.x = 57;
+    placement.frame.y = 33;
+    placement.opacity = 0.5;
+    assert_eq!(stage_native_scene_source(&mut state, &placement), Ok(true));
+    let updated = state.scene_layers.iter().find(|l| l.id == id).unwrap();
+    assert_eq!(updated.native_published_revision, None);
+    assert_eq!(
+        read_scene_pixel(gpu, updated.snapshot.image.image, 22, 18, 3, 4),
+        [9, 81, 202, 255]
+    );
+    assert_eq!(
+        state.unsupported_native_dma.len(),
+        1,
+        "same producer should not retry unsupported GPU import"
+    );
+    state.synchronize_scene(window as usize, &[base, placement]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            160,
+            120,
+            15,
+            15
+        ),
+        [0, 255, 0, 255],
+        "moved native view remained visible at the previous location"
+    );
+    let moved = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        160,
+        120,
+        60,
+        38,
+    );
+    assert_ne!(
+        moved,
+        [0, 255, 0, 255],
+        "CPU fallback was skipped when only native geometry and opacity changed"
+    );
+    assert_eq!(moved[3], 255);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}

@@ -156,16 +156,36 @@ static IMPORTED: Mutex<Vec<Imported>> = Mutex::new(Vec::new());
 #[cfg(test)]
 static INJECT_IMPORT_FAILURE_ONCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static INJECT_UNSUPPORTED_IMPORT_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 pub(crate) fn fail_next_dma_import_for_test() {
     INJECT_IMPORT_FAILURE_ONCE.store(true, std::sync::atomic::Ordering::Release);
 }
+#[cfg(test)]
+pub(crate) fn fail_next_unsupported_dma_import_for_test() {
+    INJECT_UNSUPPORTED_IMPORT_ONCE.store(true, std::sync::atomic::Ordering::Release);
+}
 
-fn import(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<(vk::Image, vk::ImageView), String> {
+fn import(
+    gpu: &'static Gpu,
+    picture: &Arc<Dmabuf>,
+) -> Result<(vk::Image, vk::ImageView), (ImportFailureKind, String)> {
     #[cfg(test)]
     if INJECT_IMPORT_FAILURE_ONCE.swap(false, std::sync::atomic::Ordering::AcqRel) {
-        return Err("injected temporary DMA allocation failure".into());
+        return Err((
+            ImportFailureKind::Retryable,
+            "injected temporary DMA allocation failure".into(),
+        ));
+    }
+    #[cfg(test)]
+    if INJECT_UNSUPPORTED_IMPORT_ONCE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return Err((
+            ImportFailureKind::UnsupportedProducer,
+            "injected unsupported DMA producer".into(),
+        ));
     }
     let mut imported = IMPORTED.lock().expect("imported dma-bufs");
     if let Some(found) = imported
@@ -174,7 +194,7 @@ fn import(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<(vk::Image, vk::Im
     {
         return Ok((found.image, found.view));
     }
-    let made = make(gpu, picture)?;
+    let made = make(gpu, picture).map_err(|reason| (import_failure_kind(gpu, picture), reason))?;
     let handles = (made.image, made.view);
     imported.push(made);
     Ok(handles)
@@ -631,8 +651,7 @@ pub(crate) fn blend_with_store_init_owned<R: Send + 'static>(
     for overlay in overlays.iter().take(MOST) {
         match import(gpu, &overlay.picture) {
             Ok((image, view)) => placed.push((overlay, image, view)),
-            Err(reason) => {
-                let kind = import_failure_kind(gpu, &overlay.picture);
+            Err((kind, reason)) => {
                 gpu::trace_once(format!(
                     "a dma-buf overlay was not imported ({kind:?}): {reason}"
                 ));

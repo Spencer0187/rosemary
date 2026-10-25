@@ -1991,6 +1991,12 @@ fn native_scene_source(
 /// to the same fence-retained scene snapshot used for Metal drawables. AppKit
 /// publishes immutable bytes but never blocks on a Vulkan queue.
 #[cfg(test)]
+static TEST_BLOCK_LINEAR_DMA_FALLBACK: AtomicBool = AtomicBool::new(false);
+#[cfg(test)]
+static TEST_NATIVE_RETRYABLE_FAILURES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
 static NATIVE_IMAGE_UPLOAD_ATTEMPTS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
@@ -2004,6 +2010,10 @@ static NATIVE_HARD_BUDGET_REFUSALS: std::sync::atomic::AtomicUsize =
 #[cfg(target_os = "linux")]
 fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> {
     use std::os::fd::AsRawFd;
+    #[cfg(test)]
+    if TEST_BLOCK_LINEAR_DMA_FALLBACK.load(Ordering::Acquire) {
+        return None;
+    }
     let native = layer.native.as_ref()?;
     let picture = native.dmabuf.as_ref()?;
     let frame = layer.frame;
@@ -2318,6 +2328,11 @@ fn stage_native_scene_source_effective(
                 && item.revision == native.revision
                 && item.producer.ptr_eq(&Arc::downgrade(picture))
         }) {
+            // Cache only the unsupported GPU representation. Placement and
+            // opacity changes still require recompositing exact CPU pixels.
+            if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
+                return stage_native_scene_source_effective(state, &cpu);
+            }
             return Err("native-dmabuf-import-refused".into());
         }
     }
@@ -2670,7 +2685,13 @@ fn stage_native_scene_source_effective(
             if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
                 return stage_native_scene_source_effective(state, &cpu);
             }
-            return Err("native-dmabuf-import-refused".into());
+            return Err(match failure.kind {
+                crate::overlay::ImportFailureKind::UnsupportedProducer => {
+                    "native-dmabuf-import-refused"
+                }
+                crate::overlay::ImportFailureKind::Retryable => "native-dmabuf-import-retryable",
+            }
+            .into());
         }
         Some(output)
     } else {
@@ -3354,6 +3375,10 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             continue;
                         }
                         Err(reason) => {
+                            #[cfg(test)]
+                            if reason == "native-dmabuf-import-retryable" {
+                                TEST_NATIVE_RETRYABLE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                            }
                             gpu::trace(format!("native AppKit scene staging failed: {reason}"));
                             device_lost = reason.contains("ERROR_DEVICE_LOST")
                                 || entry.gpu.lost.load(Ordering::Acquire);
