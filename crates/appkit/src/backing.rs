@@ -326,6 +326,10 @@ static WINDOWS: Mutex<Option<HashMap<usize, WindowState>>> = Mutex::new(None);
 
 /// Views sent `-setNeedsDisplay:`, by address, drawn at the next pump.
 static NEEDS_DISPLAY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+// A partial request is authoritative only while no full-display request is
+// pending. All explicit geometry is in guest NSView point coordinates.
+static NEEDS_DISPLAY_RECTS: std::sync::LazyLock<Mutex<HashMap<usize, NSRect>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The batches [`pump`] is drawing, innermost last, so a view freed by another
 /// view's `-drawRect:` is taken out of them too. A stack because a `-drawRect:`
@@ -475,6 +479,9 @@ struct Focus {
     /// Drawing into [`OFFSCREEN`]'s store keyed by `view`, an image being
     /// rendered, rather than into a view in a window.
     offscreen: bool,
+    // `drawRect:`'s requested local top-left pixel region, if old pixels
+    // outside it remain valid and the producer has supplied exact damage.
+    clip: Option<Rect>,
 }
 
 thread_local! {
@@ -503,6 +510,7 @@ pub(crate) fn begin_offscreen(key: usize, width: u32, height: u32, density: f64,
             density: if density > 0.0 { density } else { 1.0 },
             flipped,
             offscreen: true,
+            clip: None,
         })
     });
 }
@@ -545,6 +553,7 @@ fn focus_on(view: Id) -> Option<Focus> {
         density: if density > 0.0 { density } else { 1.0 },
         flipped: crate::view::is_flipped(view),
         offscreen: false,
+        clip: None,
     })
 }
 
@@ -632,10 +641,20 @@ pub(crate) fn paint_coverage(left: i64, top: i64, width: usize, coverage: &[f32]
             .or_insert_with(|| Store::new(store_width, store_height));
         store.resize(store_width, store_height);
         let rows = coverage.len() / width;
-        let x0 = left.max(0);
-        let y0 = top.max(0);
-        let x1 = (left + width as i64).min(i64::from(store.width));
-        let y1 = (top + rows as i64).min(i64::from(store.height));
+        let clip = focus.clip.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(store.width),
+            height: i64::from(store.height),
+        });
+        let x0 = left.max(0).max(clip.x);
+        let y0 = top.max(0).max(clip.y);
+        let x1 = (left + width as i64)
+            .min(i64::from(store.width))
+            .min(clip.x + clip.width);
+        let y1 = (top + rows as i64)
+            .min(i64::from(store.height))
+            .min(clip.y + clip.height);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -780,19 +799,35 @@ pub(crate) fn draw_focused(draw: impl FnOnce(&mut [u8], u32, u32) -> Option<Rect
         store.resize(width, height);
         let drawn = draw(&mut store.pixels, store.width, store.height);
         if let Some(area) = drawn.filter(|r| !r.is_empty()) {
-            store.touch_region(area);
+            if focus.clip.is_some() {
+                // Arbitrary canvas callbacks can alter pixels outside the
+                // advertised dirty bounds; never certify narrow damage.
+                store.touch();
+            } else {
+                store.touch_region(area);
+            }
         }
         drawn
     };
     if let Some(drawn) = drawn
         && !focus.offscreen
     {
+        let actual = if focus.clip.is_some() {
+            Rect {
+                x: 0,
+                y: 0,
+                width: width as i64,
+                height: height as i64,
+            }
+        } else {
+            drawn
+        };
         damage(
             focus.window,
             Rect {
-                x: drawn.x + focus.x as i64,
-                y: drawn.y + focus.y as i64,
-                ..drawn
+                x: actual.x + focus.x as i64,
+                y: actual.y + focus.y as i64,
+                ..actual
             },
         );
     }
@@ -854,10 +889,16 @@ fn draw_into(
     let mirrored = focus.flipped && !respect_flipped;
     let opacity = (fraction.min(1.0) * 256.0) as u32;
 
-    let x0 = left.max(0.0).round() as i64;
-    let x1 = (left + width).min(f64::from(store.width)).round() as i64;
-    let y0 = top.max(0.0).round() as i64;
-    let y1 = (top + height).min(f64::from(store.height)).round() as i64;
+    let clip = focus.clip.unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    });
+    let x0 = (left.max(0.0).round() as i64).max(clip.x);
+    let x1 = ((left + width).min(f64::from(store.width)).round() as i64).min(clip.x + clip.width);
+    let y0 = (top.max(0.0).round() as i64).max(clip.y);
+    let y1 = ((top + height).min(f64::from(store.height)).round() as i64).min(clip.y + clip.height);
     if x0 >= x1 || y0 >= y1 {
         return Rect::default();
     }
@@ -912,9 +953,89 @@ fn draw_into(
 /// Mark a view for `-drawRect:` at the next pump.
 pub(crate) fn needs_display(view: Id) {
     let mut pending = NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(view as usize));
     if !pending.contains(&(view as usize)) {
         pending.push(view as usize);
     }
+}
+
+pub(crate) fn needs_display_in_rect(view: Id, rect: NSRect) {
+    let values = [
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    ];
+    if !values.iter().all(|v| v.is_finite()) || rect.size.width < 0.0 || rect.size.height < 0.0 {
+        needs_display(view);
+        return;
+    }
+    if rect.size.width == 0.0 || rect.size.height == 0.0 {
+        return;
+    }
+    let mut pending = NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut areas = NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !pending.contains(&(view as usize)) {
+        pending.push(view as usize);
+        areas.insert(view as usize, rect);
+    } else if let Some(previous) = areas.get_mut(&(view as usize)) {
+        let x0 = previous.origin.x.min(rect.origin.x);
+        let y0 = previous.origin.y.min(rect.origin.y);
+        let x1 = (previous.origin.x + previous.size.width).max(rect.origin.x + rect.size.width);
+        let y1 = (previous.origin.y + previous.size.height).max(rect.origin.y + rect.size.height);
+        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+            areas.remove(&(view as usize));
+        } else {
+            *previous = NSRect {
+                origin: NSPoint { x: x0, y: y0 },
+                size: NSSize {
+                    width: x1 - x0,
+                    height: y1 - y0,
+                },
+            };
+        }
+    }
+}
+
+fn focus_dirty_pixels(focus: Focus, requested: NSRect) -> Option<Rect> {
+    let [x, y, w, h] = [
+        requested.origin.x,
+        requested.origin.y,
+        requested.size.width,
+        requested.size.height,
+    ];
+    let left = (x * focus.density).floor();
+    let right = ((x + w) * focus.density).ceil();
+    let top = if focus.flipped {
+        (y * focus.density).floor()
+    } else {
+        (focus.height - (y + h) * focus.density).floor()
+    };
+    let bottom = if focus.flipped {
+        ((y + h) * focus.density).ceil()
+    } else {
+        (focus.height - y * focus.density).ceil()
+    };
+    if ![left, right, top, bottom].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let width = focus.width.max(1.0) as i64;
+    let height = focus.height.max(1.0) as i64;
+    let x0 = (left as i64).clamp(0, width);
+    let x1 = (right as i64).clamp(0, width);
+    let y0 = (top as i64).clamp(0, height);
+    let y1 = (bottom as i64).clamp(0, height);
+    (x0 < x1 && y0 < y1).then_some(Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 /// Whether a view of `window` is waiting to be displayed.
@@ -1015,6 +1136,10 @@ pub(crate) fn forget(view: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|v| *v != key);
+    NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     ANIMATING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1042,6 +1167,17 @@ pub(crate) fn forget(view: Id) {
 /// with YES is sent `-updateLayer`. Every other view has `-drawRect:` sent with
 /// its focus locked, and what it draws is its layer's content.
 pub(crate) fn display_view(view: Id) {
+    // Explicit `-display` can run before a queued pump. The pixels it draws
+    // satisfy that prior invalidation; a later region-only request must not
+    // inherit an obsolete full-view pending entry.
+    NEEDS_DISPLAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|pending| *pending != view as usize);
+    let dirty = NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(view as usize));
     if crate::view::is_layer_backed(view) && focus_on(view).is_some() {
         let layer = crate::view::layer_of(view);
         let delegate = crate::layer::delegate_of(layer);
@@ -1070,13 +1206,46 @@ pub(crate) fn display_view(view: Id) {
     if !responds || !push_focus(view) {
         return;
     }
+    FOCUS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let focus = stack.last_mut().unwrap();
+        if let Some(requested) = dirty {
+            let has_base = VIEW_STORES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|stores| stores.get(&(view as usize)))
+                .is_some_and(|store| {
+                    store.width == focus.width as u32 && store.height == focus.height as u32
+                });
+            if has_base {
+                focus.clip = focus_dirty_pixels(*focus, requested);
+            }
+        }
+    });
     clear_focused_store();
-    let bounds = current_focus().map_or(NSRect::default(), |focus| NSRect {
-        origin: NSPoint { x: 0.0, y: 0.0 },
-        size: NSSize {
-            width: focus.width / focus.density,
-            height: focus.height / focus.density,
-        },
+    let bounds = current_focus().map_or(NSRect::default(), |focus| {
+        let area = focus.clip.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: focus.width as i64,
+            height: focus.height as i64,
+        });
+        let origin_y = if focus.flipped {
+            area.y as f64 / focus.density
+        } else {
+            (focus.height - (area.y + area.height) as f64) / focus.density
+        };
+        NSRect {
+            size: NSSize {
+                width: area.width as f64 / focus.density,
+                height: area.height as f64 / focus.density,
+            },
+            origin: NSPoint {
+                x: area.x as f64 / focus.density,
+                y: origin_y,
+            },
+        }
     });
     // SAFETY: `-drawRect:` is `void (id, SEL, NSRect)`.
     unsafe {
@@ -1099,13 +1268,27 @@ fn clear_focused_store() {
         .as_mut()
         .and_then(|stores| stores.get_mut(&(focus.view as usize)))
         .map(|store| {
-            store.pixels.fill(0);
-            store.touch();
-            Rect {
-                x: focus.x as i64,
-                y: focus.y as i64,
+            let area = focus.clip.unwrap_or(Rect {
+                x: 0,
+                y: 0,
                 width: i64::from(store.width),
                 height: i64::from(store.height),
+            });
+            if focus.clip.is_none() {
+                store.pixels.fill(0);
+                store.touch();
+            } else {
+                let row_bytes = area.width as usize * 4;
+                for y in area.y..area.y + area.height {
+                    let start = (y as usize * store.width as usize + area.x as usize) * 4;
+                    store.pixels[start..start + row_bytes].fill(0);
+                }
+                store.touch_region(area);
+            }
+            Rect {
+                x: area.x + focus.x as i64,
+                y: area.y + focus.y as i64,
+                ..area
             }
         });
     if let Some(area) = cleared {
@@ -3165,17 +3348,33 @@ unsafe extern "C" fn get_rects_being_drawn(
             size: NSSize { width: 0.0, height: 0.0 },
         }) };
     }
-    let size = current_focus()
+    let rect = current_focus()
         .filter(|focus| focus.view == receiver)
-        .map_or(NSSize::default(), |focus| NSSize {
-            width: focus.width / focus.density,
-            height: focus.height / focus.density,
-        });
+        .map(|focus| {
+            let area = focus.clip.unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                width: focus.width as i64,
+                height: focus.height as i64,
+            });
+            NSRect {
+                origin: NSPoint {
+                    x: area.x as f64 / focus.density,
+                    y: if focus.flipped {
+                        area.y as f64 / focus.density
+                    } else {
+                        (focus.height - (area.y + area.height) as f64) / focus.density
+                    },
+                },
+                size: NSSize {
+                    width: area.width as f64 / focus.density,
+                    height: area.height as f64 / focus.density,
+                },
+            }
+        })
+        .unwrap_or_default();
     DRAWN.with(|drawn| {
-        *drawn.borrow_mut() = NSRect {
-            origin: NSPoint { x: 0.0, y: 0.0 },
-            size,
-        };
+        *drawn.borrow_mut() = rect;
         if !rects.is_null() {
             // SAFETY: the caller's out-pointer; the rect lives as long as the
             // thread, past the `-drawRect:` it is read in.
@@ -3940,6 +4139,7 @@ mod tests {
             density: 1.0,
             flipped: true,
             offscreen: false,
+            clip: None,
         };
         let size = NSSize {
             width: 1.0,
@@ -4169,6 +4369,7 @@ mod tests {
             density: 1.0,
             flipped: true,
             offscreen: false,
+            clip: None,
         };
         FOCUS.with(|stack| stack.borrow_mut().push(focus));
         let size = NSSize {

@@ -2901,8 +2901,8 @@ unsafe extern "C" fn mark_needs_display(receiver: Id, _sel: Sel) {
     crate::backing::needs_display(receiver);
 }
 
-unsafe extern "C" fn set_needs_display_in_rect(receiver: Id, _sel: Sel, _rect: NSRect) {
-    crate::backing::needs_display(receiver);
+unsafe extern "C" fn set_needs_display_in_rect(receiver: Id, _sel: Sel, rect: NSRect) {
+    crate::backing::needs_display_in_rect(receiver, rect);
 }
 
 unsafe extern "C" fn set_hidden(receiver: Id, _sel: Sel, hidden: u8) {
@@ -5855,6 +5855,213 @@ mod tests {
                 .len(),
             1
         );
+        objc::arc::release(window);
+    }
+}
+
+#[cfg(test)]
+mod native_partial_draw_regression {
+    use super::*;
+    use std::sync::atomic::{AtomicU8, Ordering};
+
+    fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+        NSRect {
+            origin: NSPoint { x, y },
+            size: NSSize { width, height },
+        }
+    }
+
+    fn view(frame: NSRect) -> Id {
+        unsafe {
+            init_with_frame(
+                objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0),
+                objc::sel::get("initWithFrame:"),
+                frame,
+            )
+        }
+    }
+
+    static DRAW_PHASE: AtomicU8 = AtomicU8::new(0);
+    static PARTIAL_RECT_OBSERVED: AtomicU8 = AtomicU8::new(0);
+
+    unsafe extern "C" fn paint_native_partial_rect(receiver: Id, _selector: Sel, dirty: NSRect) {
+        match DRAW_PHASE.load(Ordering::Relaxed) {
+            0 => {
+                assert!(crate::backing::draw_focused(|pixels, width, height| {
+                    for pixel in pixels.chunks_exact_mut(4) {
+                        pixel.copy_from_slice(&[255, 0, 0, 255]);
+                    }
+                    Some(crate::backing::Rect {
+                        x: 0,
+                        y: 0,
+                        width: width as i64,
+                        height: height as i64,
+                    })
+                }));
+            }
+            1 => {
+                let expected = NSRect {
+                    origin: NSPoint { x: 6., y: 19. },
+                    size: NSSize {
+                        width: 1.,
+                        height: 1.,
+                    },
+                };
+                let passed_dirty = dirty == expected;
+                let mut rects = std::ptr::null();
+                let mut count = 0isize;
+                let send: unsafe extern "C" fn(Id, Sel, *mut *const NSRect, *mut isize) =
+                    unsafe { std::mem::transmute(objc::msg::entry()) };
+                unsafe {
+                    send(
+                        receiver,
+                        objc::sel::get("getRectsBeingDrawn:count:"),
+                        &mut rects,
+                        &mut count,
+                    )
+                };
+                PARTIAL_RECT_OBSERVED.store(
+                    u8::from(
+                        passed_dirty
+                            && count == 1
+                            && !rects.is_null()
+                            && unsafe { *rects } == expected,
+                    ),
+                    Ordering::Relaxed,
+                );
+                // Draw a full view on purpose: AppKit clips it to the
+                // partial invalidation and keeps every outside blue texel.
+                crate::backing::paint_coverage(0, 0, 32, &vec![1.0; 32 * 24], [0., 1., 0., 1.]);
+            }
+            _ => {
+                assert!(crate::backing::draw_focused(|pixels, _, _| {
+                    pixels[..4].copy_from_slice(&[0, 0, 255, 255]);
+                    Some(crate::backing::Rect {
+                        x: 0,
+                        y: 0,
+                        width: 1,
+                        height: 1,
+                    })
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn live_draw_rect_partial_invalidation_preserves_old_pixels_and_capture_damage() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 160., 120.))
+        } {
+            return;
+        }
+        let content = view(rect(0., 0., 160., 120.));
+        let set_content: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let cls = objc::class::lookup(c"RosemaryPartialDrawRectTestView").unwrap_or_else(|| {
+            let class = objc::class::allocate_pair(
+                objc::class::lookup(c"NSView"),
+                c"RosemaryPartialDrawRectTestView",
+                0,
+            )
+            .unwrap();
+            assert!(class.add_method(
+                objc::sel::get("drawRect:"),
+                paint_native_partial_rect as objc::class::Imp,
+                c"v48@0:8{CGRect={CGPoint=dd}{CGSize=dd}}16"
+            ));
+            objc::class::register_pair(class);
+            class
+        });
+        let child = unsafe {
+            init_with_frame(
+                objc::object::create_instance(cls, 0),
+                objc::sel::get("initWithFrame:"),
+                rect(12., 12., 32., 24.),
+            )
+        };
+        let add_subview: unsafe extern "C" fn(Id, Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { add_subview(content, objc::sel::get("addSubview:"), child) };
+        DRAW_PHASE.store(0, Ordering::Relaxed);
+        PARTIAL_RECT_OBSERVED.store(0, Ordering::Relaxed);
+        crate::backing::display_view(child);
+        let crop = crate::backing::Rect {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 24,
+        };
+        let first =
+            crate::backing::native_scene_pixels_cropped_with_damage(child, 32, 24, crop).unwrap();
+        assert_eq!(first.2, None);
+        DRAW_PHASE.store(1, Ordering::Relaxed);
+        let invalidate: unsafe extern "C" fn(Id, Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            invalidate(
+                child,
+                objc::sel::get("setNeedsDisplayInRect:"),
+                NSRect {
+                    origin: NSPoint { x: 6., y: 19. },
+                    size: NSSize {
+                        width: 1.,
+                        height: 1.,
+                    },
+                },
+            )
+        };
+        crate::backing::display_view(child);
+        assert_eq!(PARTIAL_RECT_OBSERVED.load(Ordering::Relaxed), 1);
+        let next =
+            crate::backing::native_scene_pixels_cropped_with_damage(child, 32, 24, crop).unwrap();
+        assert_eq!(
+            next.2,
+            Some(crate::backing::NativeCpuDamage {
+                from_revision: first.1,
+                rect: crate::backing::Rect {
+                    x: 6,
+                    y: 4,
+                    width: 1,
+                    height: 1
+                },
+            })
+        );
+        assert_eq!(
+            &next.0[(4 * 32 + 6) * 4..(4 * 32 + 7) * 4],
+            &[0, 255, 0, 255]
+        );
+        assert_eq!(&next.0[..4], &[255, 0, 0, 255]);
+        assert_eq!(
+            &next.0[(4 * 32 + 7) * 4..(4 * 32 + 8) * 4],
+            &[255, 0, 0, 255]
+        );
+        // A raw canvas callback bypasses clipped drawing primitives. Such a
+        // callback cannot make an authoritative small-region damage claim.
+        DRAW_PHASE.store(2, Ordering::Relaxed);
+        unsafe {
+            invalidate(
+                child,
+                objc::sel::get("setNeedsDisplayInRect:"),
+                NSRect {
+                    origin: NSPoint { x: 6., y: 19. },
+                    size: NSSize {
+                        width: 1.,
+                        height: 1.,
+                    },
+                },
+            )
+        };
+        crate::backing::display_view(child);
+        let opaque =
+            crate::backing::native_scene_pixels_cropped_with_damage(child, 32, 24, crop).unwrap();
+        assert_eq!(opaque.2.unwrap().rect, crop);
+        crate::backing::forget(child);
         objc::arc::release(window);
     }
 }
