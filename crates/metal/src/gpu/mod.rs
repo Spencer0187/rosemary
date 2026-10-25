@@ -8,7 +8,7 @@ mod submit;
 mod trace;
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, atomic::AtomicBool};
+use std::sync::{Condvar, Mutex, OnceLock, atomic::AtomicBool};
 
 use ash::{Device, Instance, vk};
 use static_init::dynamic;
@@ -103,9 +103,10 @@ pub struct Gpu {
     /// sharing a resource shape share a layout.
     layouts: Mutex<DescriptorLayouts>,
     render_passes: Mutex<HashMap<RenderPassKey, vk::RenderPass>>,
-    /// The pool and fence behind `one_shot`, which runs the small transfers
-    /// and layout transitions Metal performs outside a command buffer.
-    immediate: Mutex<Option<Immediate>>,
+    /// Fence-owned immediate command contexts. Recording or waiting on an
+    /// unrelated window must not hold a global command-pool mutex.
+    immediate: Mutex<ImmediatePool>,
+    immediate_ready: Condvar,
     /// The blocks Metal buffers are cut out of, made on first use because the
     /// memory type depends on what a buffer's requirements admit.
     buffers: OnceLock<Heap>,
@@ -193,6 +194,16 @@ struct Immediate {
     pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     fence: vk::Fence,
+}
+
+/// Bounded recycler: command pools are never reused until their GPU fence
+/// completes. A failed wait quarantines the context instead of resetting a
+/// command buffer which the Vulkan queue may still be reading.
+#[derive(Default)]
+struct ImmediatePool {
+    available: Vec<Immediate>,
+    quarantined: Vec<Immediate>,
+    in_use: usize,
 }
 
 /// One command buffer with the pool it was allocated from and the fence its
@@ -738,7 +749,8 @@ impl Gpu {
             limits: properties.limits,
             layouts: Mutex::new(HashMap::new()),
             render_passes: Mutex::new(HashMap::new()),
-            immediate: Mutex::new(None),
+            immediate: Mutex::new(ImmediatePool::default()),
+            immediate_ready: Condvar::new(),
             buffers: OnceLock::new(),
             private_buffers: OnceLock::new(),
             timestamp_pools: Mutex::new(Vec::new()),

@@ -180,6 +180,61 @@ fn fifo_limits_wsi_images_without_changing_mailbox_capacity() {
     );
 }
 
+/// Two independent windows may perform immediate Vulkan recording without
+/// holding up one another's command pool for the duration of a GPU wait.
+/// Both command lists own different handles and retire independently.
+#[test]
+fn overlapping_immediate_gpu_recorders_have_independent_fence_owners() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Ok(adapters) = crate::vulkan::adapters() else {
+        return;
+    };
+    let Some(adapter) = adapters.first() else {
+        return;
+    };
+    let Ok(gpu) = adapter.gpu() else {
+        return;
+    };
+    let (first_started, started) = std::sync::mpsc::sync_channel(1);
+    let (release_first, release) = std::sync::mpsc::sync_channel::<()>(1);
+    let first = std::thread::spawn(move || {
+        gpu.one_shot(|_, cb| {
+            first_started
+                .send(cb)
+                .expect("notify competing immediate recorder");
+            release.recv().expect("first command recorder released");
+        })
+    });
+    let first_cb = started
+        .recv_timeout(std::time::Duration::from_secs(4))
+        .expect("first Vulkan command recorder never began");
+    let (second_done, second_result) = std::sync::mpsc::sync_channel(1);
+    let second = std::thread::spawn(move || {
+        let mut handle = None;
+        let result = gpu.one_shot(|_, cb| {
+            handle = Some(cb);
+        });
+        second_done
+            .send(result.map(|()| handle.expect("recorded Vulkan command buffer")))
+            .expect("second recorder completed");
+    });
+    // A single global immediate pool lock would block here until the first
+    // recorder is released. Do not leave a hung thread behind on failure.
+    let concurrent = second_result.recv_timeout(std::time::Duration::from_secs(4));
+    release_first.send(()).expect("release first recorder");
+    assert!(first.join().unwrap().is_ok());
+    second.join().unwrap();
+    let second_cb = concurrent
+        .expect("unrelated Vulkan recorder blocked by first recorder")
+        .expect("second Vulkan submission failed");
+    assert_ne!(
+        first_cb, second_cb,
+        "two simultaneous GPU immediate recordings aliased a live VkCommandBuffer"
+    );
+}
+
 #[test]
 fn all_present_modes_compose_layers_before_wsi() {
     for mode in [

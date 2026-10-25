@@ -265,16 +265,6 @@ impl Gpu {
         })
     }
 
-    /// Submit one recorded command buffer and wait for it.
-    fn submit_and_wait(
-        &self,
-        command_buffer: vk::CommandBuffer,
-        fence: vk::Fence,
-    ) -> Result<(), String> {
-        self.submit(command_buffer, fence)?;
-        self.wait(fence)
-    }
-
     /// Record and run one command list synchronously.
     ///
     /// Metal performs some work outside any command buffer the guest holds:
@@ -291,41 +281,75 @@ impl Gpu {
     }
 
     fn one_shot_inner(&self, body: impl FnOnce(&Device, vk::CommandBuffer)) -> Result<(), String> {
-        let mut slot = self.immediate.lock().expect("immediate command state");
-        if slot.is_none() {
-            let pool_info = vk::CommandPoolCreateInfo::default()
-                .queue_family_index(self.queue_family)
-                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-            // SAFETY: a well-formed create info on this live device.
-            let pool = unsafe { self.device.create_command_pool(&pool_info, None) }
-                .map_err(|error| format!("vkCreateCommandPool failed with {error:?}"))?;
-            // The pool owns the command buffer allocated from it, so one guard
-            // covers both: a fence which fails to be created leaves neither.
-            let pool = crate::gpu::Guard::new(pool, |pool| {
-                // SAFETY: a pool of this device's whose command buffer was
-                // never submitted.
-                unsafe { self.device.destroy_command_pool(pool, None) };
-            });
-            let allocate = vk::CommandBufferAllocateInfo::default()
-                .command_pool(*pool)
-                .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
-            // SAFETY: the pool was just created by this device.
-            let command_buffer = unsafe { self.device.allocate_command_buffers(&allocate) }
-                .map_err(|error| format!("vkAllocateCommandBuffers failed with {error:?}"))?[0];
-            // SAFETY: a well-formed create info on this live device.
-            let fence = unsafe {
-                self.device
-                    .create_fence(&vk::FenceCreateInfo::default(), None)
+        const MAX_IMMEDIATE_CONTEXTS: usize = 8;
+        // DXVK-style command-list checkout: distinct windows record on
+        // independent pools and wait on their own fences. Only vkQueueSubmit
+        // retains Vulkan's mandatory per-queue external synchronization.
+        let immediate = {
+            let mut registry = self.immediate.lock().expect("immediate command recycler");
+            loop {
+                if let Some(available) = registry.available.pop() {
+                    registry.in_use += 1;
+                    break available;
+                }
+                if registry.in_use + registry.quarantined.len() < MAX_IMMEDIATE_CONTEXTS {
+                    registry.in_use += 1;
+                    drop(registry);
+                    let created = (|| -> Result<Immediate, String> {
+                        let pool_info = vk::CommandPoolCreateInfo::default()
+                            .queue_family_index(self.queue_family)
+                            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+                        let pool = unsafe { self.device.create_command_pool(&pool_info, None) }
+                            .map_err(|error| {
+                                format!("vkCreateCommandPool failed with {error:?}")
+                            })?;
+                        let pool = crate::gpu::Guard::new(pool, |pool| {
+                            unsafe { self.device.destroy_command_pool(pool, None) };
+                        });
+                        let allocate = vk::CommandBufferAllocateInfo::default()
+                            .command_pool(*pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(1);
+                        let command_buffer =
+                            unsafe { self.device.allocate_command_buffers(&allocate) }.map_err(
+                                |error| format!("vkAllocateCommandBuffers failed with {error:?}"),
+                            )?[0];
+                        let fence = unsafe {
+                            self.device
+                                .create_fence(&vk::FenceCreateInfo::default(), None)
+                        }
+                        .map_err(|error| format!("vkCreateFence failed with {error:?}"))?;
+                        Ok(Immediate {
+                            pool: pool.take(),
+                            command_buffer,
+                            fence,
+                        })
+                    })();
+                    if created.is_err() {
+                        let mut registry =
+                            self.immediate.lock().expect("immediate command recycler");
+                        registry.in_use -= 1;
+                        self.immediate_ready.notify_one();
+                    }
+                    break created?;
+                }
+                if registry.in_use == 0 {
+                    return Err(
+                        "immediate command pool exhausted by incomplete GPU submissions".into(),
+                    );
+                }
+                registry = self
+                    .immediate_ready
+                    .wait(registry)
+                    .expect("immediate command recycler");
             }
-            .map_err(|error| format!("vkCreateFence failed with {error:?}"))?;
-            *slot = Some(Immediate {
-                pool: pool.take(),
-                command_buffer,
-                fence,
-            });
-        }
-        let immediate = slot.as_ref().expect("just created");
+        };
+        let mut slot = ImmediateLease {
+            gpu: self,
+            context: Some(immediate),
+            completed: false,
+        };
+        let immediate = slot.context.as_ref().expect("checked out GPU command list");
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: the mutex makes this the only user of the pool.
@@ -341,6 +365,44 @@ impl Gpu {
         // SAFETY: recording began above and has not ended.
         unsafe { self.device.end_command_buffer(immediate.command_buffer) }
             .map_err(|error| format!("vkEndCommandBuffer failed with {error:?}"))?;
-        self.submit_and_wait(immediate.command_buffer, immediate.fence)
+        if let Err(error) = self.submit(immediate.command_buffer, immediate.fence) {
+            // vkQueueSubmit did not queue this command buffer. It is safe to
+            // reset its pool even though the submission fence was reset.
+            slot.completed = true;
+            return Err(error);
+        }
+        // Once submitted, a failed wait may mean the GPU is still reading the
+        // command buffer. Only a confirmed fence completion recycles its pool.
+        self.wait(immediate.fence)?;
+        slot.completed = true;
+        Ok(())
+    }
+}
+
+/// Keeps one command pool and its fence exclusively owned until the GPU
+/// finishes its submission. Even a recording panic or failed fence wait may
+/// not return a possibly active command buffer to the free recycler.
+struct ImmediateLease<'a> {
+    gpu: &'a Gpu,
+    context: Option<Immediate>,
+    completed: bool,
+}
+
+impl Drop for ImmediateLease<'_> {
+    fn drop(&mut self) {
+        let mut registry = self
+            .gpu
+            .immediate
+            .lock()
+            .expect("immediate command recycler");
+        registry.in_use -= 1;
+        if let Some(context) = self.context.take() {
+            if self.completed {
+                registry.available.push(context);
+            } else {
+                registry.quarantined.push(context);
+            }
+        }
+        self.gpu.immediate_ready.notify_one();
     }
 }
