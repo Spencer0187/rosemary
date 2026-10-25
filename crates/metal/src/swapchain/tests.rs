@@ -5035,14 +5035,44 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(3)
             .clamp(3, 64);
+        let pace = std::env::var("ROSEMARY_BENCH_NATIVE_MIXED_6K_PACE_HZ")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|hz| (1..=1000).contains(hz))
+            .map(|hz| std::time::Duration::from_secs_f64(1. / f64::from(hz)));
+        let change_cpu = std::env::var("ROSEMARY_BENCH_NATIVE_MIXED_6K_CHANGE_CPU")
+            .is_ok_and(|value| value == "1");
+        let cadence_start = std::time::Instant::now();
+        let mut missed_deadlines = 0usize;
         let mut stage_times = Vec::with_capacity(repetitions);
+        let mut complete_times = Vec::with_capacity(repetitions);
         for n in 0..repetitions {
+            if let Some(interval) = pace {
+                let due = cadence_start + interval.mul_f64(n as f64);
+                let now = std::time::Instant::now();
+                if now < due {
+                    std::thread::sleep(due - now);
+                } else if n != 0 {
+                    missed_deadlines += 1;
+                }
+            }
             let animation_start = std::time::Instant::now();
             // Worker discards expendable scene snapshot spares before every
             // transaction; immutable CPU backing caches must survive.
             state.shed_scene_snapshot_spares();
             for tile in &mut scene[1..] {
-                tile.native.as_mut().unwrap().revision += 1;
+                let native = tile.native.as_mut().unwrap();
+                native.revision += 1;
+                if change_cpu {
+                    let mut pixels = (*native.bytes).clone();
+                    // Source backing truly changes on each update. Alter a
+                    // center texel, not a tile boundary sampled by the test.
+                    let w = tile.frame.width as usize;
+                    let h = tile.frame.height as usize;
+                    let at = ((h / 2) * w + (w / 2)) * 4;
+                    pixels[at] = (n as u8) ^ 1;
+                    native.bytes = Arc::new(pixels);
+                }
                 assert_eq!(stage_native_scene_source(&mut state, tile), Ok(true));
             }
             let six_tiles_ms = animation_start.elapsed().as_secs_f64() * 1000.0;
@@ -5060,6 +5090,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
                     .expect("animated mixed 6K WSI publication");
             }
             let wsi_ms = wsi_start.elapsed().as_secs_f64() * 1000.0;
+            complete_times.push(animation_start.elapsed().as_secs_f64() * 1000.0);
             eprintln!(
                 "6K mixed real GPU mode={:?} revision={} six_tiles_ms={six_tiles_ms:.3} first_wsi_ms={wsi_ms:.3} total_ms={:.3}",
                 state.present_mode,
@@ -5070,10 +5101,16 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         stage_times.sort_by(f64::total_cmp);
         let p95 = stage_times[(stage_times.len() * 95 / 100).min(stage_times.len() - 1)];
         let avg = stage_times.iter().sum::<f64>() / stage_times.len() as f64;
+        complete_times.sort_by(f64::total_cmp);
+        let end_to_end_p95 =
+            complete_times[(complete_times.len() * 95 / 100).min(complete_times.len() - 1)];
         eprintln!(
-            "6K mixed real GPU mode={:?} revisions={} staging_mean_ms={avg:.3} staging_p95_ms={p95:.3} staging_max_ms={:.3}",
+            "6K mixed real GPU mode={:?} revisions={} paced={} cpu_changed={} missed_deadlines={} staging_mean_ms={avg:.3} staging_p95_ms={p95:.3} staging_max_ms={:.3} stage_compose_wsi_p95_ms={end_to_end_p95:.3}",
             state.present_mode,
             repetitions,
+            pace.is_some(),
+            change_cpu,
+            missed_deadlines,
             stage_times.last().unwrap()
         );
     }
