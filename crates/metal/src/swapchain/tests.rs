@@ -4506,13 +4506,76 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         }),
         ..cpu.clone()
     };
+    let mut second_invalid = second_invalid;
+    second_invalid.frame.x += 17;
+    second_invalid.frame.y += 9;
+    second_invalid.frame.width = 44;
+    second_invalid.frame.height = 33;
+    second_invalid.opacity = 0.25;
+    second_invalid.opaque = true;
+    second_invalid.clip = Some(DirectFrame::from_frame(&appkit::view::Frame {
+        x: 10,
+        y: 10,
+        width: 12,
+        height: 12,
+        ..whole
+    }));
+    second_invalid.rounded.push(scene::RoundedClip {
+        frame: second_invalid.frame,
+        radius: 8.0,
+    });
+    second_invalid.occluded = Some(vec![Region {
+        x: 40,
+        y: 35,
+        width: 2,
+        height: 2,
+    }]);
     let accepted =
         preserve_refused_native_sources(&state, vec![bottom.clone(), second_invalid], &[native_id]);
+    assert!(
+        accepted[1].frame == DirectFrame::from_frame(&cpu.frame.frame()),
+        "unimported revision moved/resized old GPU image"
+    );
+    assert_eq!(accepted[1].opacity, cpu.opacity);
+    assert_eq!(accepted[1].opaque, cpu.opaque);
+    assert!(accepted[1].clip == cpu.clip);
+    assert!(accepted[1].rounded == cpu.rounded);
+    assert_eq!(accepted[1].occluded, cpu.occluded);
     assert_eq!(accepted.len(), 2);
     assert_eq!(
         accepted[1].native.as_ref().unwrap().revision,
         12,
         "previously accepted native pixels were dropped on reimport failure"
+    );
+    // Composing the rejected resize/move/opacity/mask proposal must not
+    // relocate or distort the previously admitted native GPU texture.
+    state.synchronize_scene(window as usize, &accepted);
+    state.scene_repaint_needed = true;
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let kept = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        whole.width,
+        whole.height,
+        45,
+        40,
+    );
+    assert!(
+        (i32::from(kept[0]) - 128).abs() <= 2 && (i32::from(kept[1]) - 127).abs() <= 2,
+        "rejected new masks/position hid accepted native pixels: {kept:?}"
+    );
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            85,
+            70
+        ),
+        [0, 255, 0, 255],
+        "unadmitted larger proposed bounds made old GPU texture appear elsewhere"
     );
     state.synchronize_scene(
         window as usize,
@@ -4547,6 +4610,279 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     drop(state);
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
+}
+
+/// The last guest Metal image initially has only a direct WSI owner: no
+/// retained scene image exists. Rejected first native admission must not
+/// consume that owner and replace the visible window with transparent pixels.
+fn exercise_direct_first_native_rejection(busy_restore: bool) {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let _retire = AwaitTestWindowRetirements;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"direct rejected native scene", 160, 120, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let green = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 160,
+            height: 120,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            green.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 160,
+        height: 120,
+        window_width: 160,
+        window_height: 120,
+    };
+    let metal_id = window as usize;
+    assert_eq!(present(gpu, metal_id, &whole, &green, &[]), Ok(true));
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&metal_id)
+        .unwrap()
+        .clone();
+    let bottom = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    // Seed the exact direct presentation state with its GPU source still
+    // alive. The preceding public present() creates a genuine WSI window;
+    // queue_direct models the last completed full-window guest drawable.
+    {
+        let _presenting = entry.presenting.lock().unwrap();
+        let mut state = entry.state.lock().unwrap();
+        state.scene_layers.clear();
+        state.scene_placements = vec![bottom.clone()];
+        state.layers = vec![metal_id];
+        state.scene_frames.clear();
+        state.note_scene_frame(metal_id, &whole);
+        state.queue_direct(
+            metal_id,
+            &whole,
+            PresentSource::from(&green),
+            &mut SourceOwner(None),
+            None,
+        );
+        assert!(state.direct.is_some());
+        assert!(state.scene_layers.is_empty());
+    }
+    let bframe = appkit::view::Frame {
+        x: 24,
+        y: 20,
+        width: 32,
+        height: 24,
+        ..whole
+    };
+    let missing_id = (1usize << (usize::BITS - 1)) | 0x55bbu64 as usize;
+    let missing = ScenePlacement {
+        id: missing_id,
+        frame: DirectFrame::from_frame(&bframe),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 71,
+            dmabuf: Some(Arc::new(appkit::backing::Dmabuf {
+                width: 32,
+                height: 24,
+                fourcc: 0,
+                modifier: u64::MAX,
+                planes: vec![],
+            })),
+        }),
+    };
+    let mut proposal = vec![bottom.clone()];
+    if busy_restore {
+        // A previously absent stage writes the accumulator before rejecting B.
+        proposal.push(ScenePlacement {
+            id: (1usize << (usize::BITS - 1)) | 0x55aa,
+            frame: DirectFrame::from_frame(&appkit::view::Frame {
+                x: 70,
+                y: 45,
+                ..bframe
+            }),
+            native: Some(scene::NativeCpuSceneSource {
+                bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
+                revision: 72,
+                dmabuf: None,
+            }),
+            ..missing.clone()
+        });
+    }
+    proposal.push(missing);
+    // First direct WSI presentation may finish before worker admission;
+    // subsequent publication while restore_pending is never permitted.
+    {
+        let mut state = entry.state.lock().unwrap();
+        if busy_restore {
+            state.injected_restore_busy_cycles = 120;
+        }
+    }
+    *entry.pending_scene.lock().unwrap() = Some(proposal);
+    ensure_layer_compositor_worker(window as usize, &entry);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    if busy_restore {
+        loop {
+            let state = entry.state.lock().unwrap();
+            if state.restore_busy_cycles_seen >= 3 {
+                assert!(
+                    state.scene_restore_pending,
+                    "partial GPU stage was incorrectly marked committed"
+                );
+                let baseline = state.wsi_publishes;
+                drop(state);
+                std::thread::sleep(Duration::from_millis(20));
+                let state = entry.state.lock().unwrap();
+                assert!(
+                    state.scene_restore_pending,
+                    "worker published a partial scene while restoration busy"
+                );
+                assert_eq!(
+                    state.wsi_publishes, baseline,
+                    "WSI advanced while partial accumulator awaited rollback"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "worker never encountered the injected busy restoration slot"
+            );
+            drop(state);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        entry.state.lock().unwrap().injected_restore_busy_cycles = 0;
+        wake_compositor_worker(&entry);
+    }
+    loop {
+        let state = entry.state.lock().unwrap();
+        let pending = entry.pending_scene.lock().unwrap().is_none();
+        if pending
+            && !state.scene_restore_pending
+            && !state.scene_repaint_needed
+            && state
+                .scene_layers
+                .iter()
+                .any(|source| source.id == metal_id && source.ready)
+        {
+            let color = read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                whole.width,
+                whole.height,
+                80,
+                50,
+            );
+            assert_eq!(
+                color,
+                [0, 255, 0, 255],
+                "failed native first admission erased last direct Metal source"
+            );
+            let other = read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                whole.width,
+                whole.height,
+                28,
+                25,
+            );
+            assert_eq!(
+                other,
+                [0, 255, 0, 255],
+                "failed DMA scene left partial foreground over direct source"
+            );
+            assert!(
+                state.direct.is_none(),
+                "direct source not materialized before batch"
+            );
+            assert!(
+                state
+                    .scene_placements
+                    .iter()
+                    .all(|layer| layer.id != missing_id)
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "GPU restoration remained incomplete without guest drawables"
+        );
+        drop(state);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    forget_window(window);
+    drop(entry);
+    gpu.destroy_image(green);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn rejected_first_native_dma_preserves_last_direct_metal_pixels() {
+    if isolate_vulkan_graphical_test("rejected_first_native_dma_preserves_last_direct_metal_pixels")
+    {
+        return;
+    }
+    exercise_direct_first_native_rejection(false);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn busy_rollback_never_presents_partial_native_scene() {
+    if isolate_vulkan_graphical_test("busy_rollback_never_presents_partial_native_scene") {
+        return;
+    }
+    exercise_direct_first_native_rejection(true);
 }
 
 /// A newly published DMA foreground has neither a retained GPU layer nor

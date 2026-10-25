@@ -1652,18 +1652,16 @@ pub fn set_native_gpu_admission(window: sdl3::Window, admitted: &[(usize, u64)])
     let mut registry = GPU_ADMITTED_NATIVE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    // Missing entry, revised content or changed membership all require a
-    // new underlay: AppKit may only subtract pixels confirmed on the GPU.
+    // Exact GPU admission changes require an owner-thread repaint, but the
+    // lower-content underlay has no dependency on upper source revisions.
     let unchanged = registry.get(&(window as usize)) == Some(&current);
     registry.insert(window as usize, current);
     drop(registry);
     if unchanged {
         return;
     }
-    GPU_UNDERLAYS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&(window as usize));
+    // Do not evict GPU_UNDERLAYS here. Its independent lower-content
+    // fingerprint is checked only when native separation is actually allowed.
     // The owner thread will re-snapshot the now-admitted independent scene
     // and recompute the backing source without changing the guest's store.
     GPU_ADMISSION_DAMAGE
@@ -1733,10 +1731,8 @@ pub fn gpu_under_metal_cached(sdl: sdl3::Window, source: &Store) -> Option<std::
         .iter()
         .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))?;
     if !can_separate_native(sdl, &placed, first) {
-        GPU_UNDERLAYS
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&(sdl as usize));
+        // A temporarily unadmitted foreground must use flattened pixels,
+        // but it does not invalidate the independently cached lower content.
         return None;
     }
     let mut key = std::collections::hash_map::DefaultHasher::new();

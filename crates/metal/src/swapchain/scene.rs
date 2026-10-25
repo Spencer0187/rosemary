@@ -758,13 +758,15 @@ impl Swapchain {
         frame: &appkit::view::Frame,
         source: PresentSource,
         regions: Option<&[Region]>,
+        force_retained: bool,
     ) -> Result<ScenePrepared, String> {
         // A clipped single layer cannot take the historical full-frame blit
         // path: the accumulator must remain transparent outside its ancestor.
         let source_is_clipped = self
             .scene_clip(id)
             .is_some_and(|clip| !scene_clip_contains(&clip.frame(), frame));
-        if self.layers.len() <= 1
+        if !force_retained
+            && self.layers.len() <= 1
             && self.scene_layers.is_empty()
             // A partial drawable is not interchangeable with the flattened
             // full-window accumulator. Its original layer-space pixels must

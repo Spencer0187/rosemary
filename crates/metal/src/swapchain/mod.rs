@@ -188,6 +188,15 @@ struct Swapchain {
     /// Scene damage survives an early membership sync or a busy staging slot.
     /// It is cleared only once a GPU update contains the new visible scene.
     scene_repaint_needed: bool,
+    /// An incomplete source batch has altered GPU pixels. Never publish its
+    /// accumulator until the previously committed scene is recomposed.
+    scene_restore_pending: bool,
+    #[cfg(test)]
+    injected_restore_busy_cycles: u32,
+    #[cfg(test)]
+    restore_busy_cycles_seen: u32,
+    #[cfg(test)]
+    wsi_publishes: u64,
     /// For a window whose surface shows its alpha, the pass that makes its
     /// content opaque and rounds its corners. `None` presents opaque.
     corners: Option<corners::Corners>,
@@ -2333,7 +2342,10 @@ fn preserve_refused_native_sources(
             .iter()
             .find(|previous| previous.id == placement.id && previous.native.is_some());
         if retained && let Some(old) = old {
-            placement.native.clone_from(&old.native);
+            // An old GPU allocation has the old source extent and sampling
+            // coordinates. Moving, resizing or remasking it with an unimported
+            // payload does not describe any valid Core Animation frame.
+            *placement = old.clone();
             true
         } else {
             false
@@ -2458,6 +2470,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         // the same mutex before signaling us, so notifications are not lost.
         let mut state = entry.state.lock().expect("window swapchain");
         while !state.composite_dirty
+            && !state.scene_restore_pending
             && entry
                 .pending_scene
                 .lock()
@@ -2499,6 +2512,57 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         {
             return;
         }
+        if state.scene_restore_pending {
+            drop(state);
+            let _presenting = PresentingGuard {
+                held: Some(entry.presenting.lock().expect("window presentation")),
+                gpu: entry.gpu,
+            };
+            let mut state = entry.state.lock().expect("window swapchain");
+            if state.scene_restore_pending {
+                // Deterministically exercise the same nonblocking deferral
+                // as an unsignaled Vulkan frame slot without sleeping on GPU.
+                #[cfg(test)]
+                if state.injected_restore_busy_cycles > 0 {
+                    state.injected_restore_busy_cycles -= 1;
+                    state.restore_busy_cycles_seen += 1;
+                    drop(state);
+                    drop(_presenting);
+                    std::thread::park_timeout(Duration::from_millis(1));
+                    continue;
+                }
+                match state.redisplay_scene(window) {
+                    Ok(true) => {
+                        state.scene_restore_pending = false;
+                        state.scene_repaint_needed = false;
+                    }
+                    Ok(false) => {
+                        // The restoration slot is busy. The last incomplete
+                        // accumulator must not reach prepare_composite().
+                        drop(state);
+                        drop(_presenting);
+                        std::thread::park_timeout(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => {
+                        let lost = error.contains("ERROR_DEVICE_LOST")
+                            || entry.gpu.lost.load(Ordering::Acquire);
+                        gpu::trace(format!("native scene restoration deferred: {error}"));
+                        drop(state);
+                        drop(_presenting);
+                        if lost {
+                            record_device_loss(entry.gpu);
+                            return;
+                        }
+                        std::thread::park_timeout(Duration::from_millis(10));
+                        continue;
+                    }
+                }
+            }
+            // WSI may now publish the restored window, or process a later
+            // complete proposal. No partially staged scene was ever exposed.
+            continue;
+        }
         if entry
             .pending_scene
             .lock()
@@ -2538,6 +2602,39 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     .collect();
                 refused_revisions.retain(|id, _| live.iter().any(|p| p.id == *id));
                 let mut state = entry.state.lock().expect("window swapchain");
+                if state.direct.is_some() {
+                    // A direct Metal source is not in scene_layers. Materialize
+                    // it *before* capturing pre-batch ownership, or rollback
+                    // would discard the only visible source. The transition is
+                    // a real retained GPU generation, not an owned drawable
+                    // that may be restored by copying a pointer.
+                    match state.stage_direct_snapshot(true) {
+                        Ok(Some(true)) => {}
+                        Ok(_) => {
+                            requeue_scene(&entry.pending_scene, live);
+                            drop(state);
+                            drop(_presenting);
+                            std::thread::park_timeout(Duration::from_millis(1));
+                            continue;
+                        }
+                        Err(error) => {
+                            let lost = error.contains("ERROR_DEVICE_LOST")
+                                || entry.gpu.lost.load(Ordering::Acquire);
+                            gpu::trace(format!("direct scene transition deferred: {error}"));
+                            if !lost {
+                                requeue_scene(&entry.pending_scene, live);
+                            }
+                            drop(state);
+                            drop(_presenting);
+                            if lost {
+                                record_device_loss(entry.gpu);
+                                return;
+                            }
+                            std::thread::park_timeout(Duration::from_millis(10));
+                            continue;
+                        }
+                    }
+                }
                 // Stage native sources before committing the proposed view
                 // hierarchy. A permanently refused DMA-BUF must not prune
                 // previously retained Metal images, direct sources or scene
@@ -2569,6 +2666,10 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             .scene_layers
                             .iter()
                             .any(|old| old.id == layer.id && old.ready)
+                            || !state
+                                .scene_placements
+                                .iter()
+                                .any(|old| old.id == layer.id && old.native.is_some())
                         {
                             unrepresented = true;
                         }
@@ -2627,6 +2728,10 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 .scene_layers
                                 .iter()
                                 .any(|old| old.id == layer.id && old.ready)
+                                || !state
+                                    .scene_placements
+                                    .iter()
+                                    .any(|old| old.id == layer.id && old.native.is_some())
                             {
                                 // Without an old GPU snapshot, omitting this
                                 // foreground would publish the wrong pixels.
@@ -2656,30 +2761,17 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     state.layers = previous_order;
                     state.scene_frames = previous_frames;
                     state.scene_placements = previous_scene;
-                    // Stage submissions have already changed composite GPU
-                    // pixels. Force a full render of the pinned old sources.
+                    // The accumulator contains submitted partial stages.
+                    // Retry reconstruction before WSI or another proposal.
                     state.scene_repaint_needed = true;
-                    if state.scene_repaint_needed {
-                        match state.redisplay_scene(window) {
-                            Ok(true) => state.scene_repaint_needed = false,
-                            Ok(false) => {
-                                retry_delay = Some(Duration::from_millis(1));
-                            }
-                            Err(error) => {
-                                gpu::trace(format!(
-                                    "restoring last complete native scene: {error}"
-                                ));
-                                device_lost = error.contains("ERROR_DEVICE_LOST")
-                                    || entry.gpu.lost.load(Ordering::Acquire);
-                            }
-                        }
-                    }
+                    state.scene_restore_pending = true;
                 } else if !native_ready {
                     state.scene_layers = previous_layers;
                     state.layers = previous_order;
                     state.scene_frames = previous_frames;
                     state.scene_placements = previous_scene;
                     state.scene_repaint_needed = true;
+                    state.scene_restore_pending = true;
                     if !device_lost {
                         requeue_scene(&entry.pending_scene, effective);
                         retry_delay = Some(Duration::from_millis(10));
@@ -2704,6 +2796,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 state.scene_frames = previous_frames.clone();
                                 state.scene_placements = previous_scene.clone();
                                 state.scene_repaint_needed = true;
+                                state.scene_restore_pending = true;
                                 requeue_scene(&entry.pending_scene, effective.clone());
                                 retry_delay = Some(Duration::from_millis(1));
                             }
@@ -2716,6 +2809,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 state.scene_frames = previous_frames.clone();
                                 state.scene_placements = previous_scene.clone();
                                 state.scene_repaint_needed = true;
+                                state.scene_restore_pending = true;
                                 device_lost = error.contains("ERROR_DEVICE_LOST")
                                     || entry.gpu.lost.load(Ordering::Acquire);
                                 if !device_lost {
@@ -2807,6 +2901,11 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         if !uses_layer_compositor(state.present_mode) || !state.composite_dirty {
             continue;
         }
+        // A source batch may have submitted GPU copies before it failed.
+        // Never submit those accumulator pixels to WSI until restoration.
+        if state.scene_restore_pending {
+            continue;
+        }
         let prepared = state.prepare_composite(window as sdl3::Window);
         let typed_device_loss = state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
         let gpu = state.gpu;
@@ -2880,6 +2979,10 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         match state.complete_composite(prepared, Ok(ready)) {
             Ok(None) => {
                 prepare_failures = 0;
+                #[cfg(test)]
+                {
+                    state.wsi_publishes += 1;
+                }
                 if state.handle != old_swapchain {
                     // Recovery lost the accumulator. Request a new store
                     // upload outside the WSI and AppKit store mutexes.
@@ -2987,6 +3090,7 @@ impl Swapchain {
             regions.as_deref(),
             &mut owner,
             nonblocking,
+            true,
         );
         if matches!(result, Ok(Some(true))) {
             let slot = self.frame.wrapping_sub(1) % self.frames.len();
@@ -3051,6 +3155,7 @@ impl Swapchain {
             regions,
             owner,
             nonblocking,
+            false,
         )
     }
 
@@ -3075,6 +3180,7 @@ impl Swapchain {
             regions,
             owner,
             nonblocking,
+            false,
         )
     }
 
@@ -3086,6 +3192,7 @@ impl Swapchain {
         regions: Option<&[Region]>,
         owner: &mut SourceOwner,
         nonblocking: bool,
+        force_retained: bool,
     ) -> Result<Option<bool>, String> {
         let slot = self.frame % self.frames.len().max(1);
         let this = &self.frames[slot];
@@ -3108,7 +3215,7 @@ impl Swapchain {
         self.frames[slot].backing.take();
         self.frames[slot].scene_reads.clear();
         let composite = self.composite()?;
-        let scene_work = match self.prepare_scene(layer, frame, source, regions)? {
+        let scene_work = match self.prepare_scene(layer, frame, source, regions, force_retained)? {
             ScenePrepared::SingleLayer => None,
             ScenePrepared::Deferred => return Ok(None),
             ScenePrepared::Ready(work) => Some(work),
@@ -3635,6 +3742,13 @@ impl Swapchain {
             scene_blender: None,
             scene_frames: Vec::new(),
             scene_repaint_needed: false,
+            scene_restore_pending: false,
+            #[cfg(test)]
+            injected_restore_busy_cycles: 0,
+            #[cfg(test)]
+            restore_busy_cycles_seen: 0,
+            #[cfg(test)]
+            wsi_publishes: 0,
             corners,
             pool: pool.take(),
             frames: frames.take(),

@@ -3868,8 +3868,8 @@ mod tests {
             crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240))
                 .expect("newly committed revision reenabled separation");
         assert!(
-            !std::sync::Arc::ptr_eq(&previous_underlay, &accepted_underlay),
-            "revision-only acknowledgment failed to invalidate cached underlay"
+            std::sync::Arc::ptr_eq(&previous_underlay, &accepted_underlay),
+            "unchanged lower-content underlay was rebuilt for a foreground admission revision"
         );
         // Restore the original test pixels after checking the transition.
         crate::backing::set_native_view_pixels_for_tests(
@@ -5126,16 +5126,16 @@ mod tests {
         }
         let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
         if !unsafe {
-            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 320.0, 240.0))
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 3840.0, 2160.0))
         } {
             return;
         }
         let sdl = unsafe { crate::window::sdl_window(window) };
-        let content = view(rect(0.0, 0.0, 320.0, 240.0));
+        let content = view(rect(0.0, 0.0, 3840.0, 2160.0));
         let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
             unsafe { std::mem::transmute(objc::msg::entry()) };
         unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
-        let metal_view = view(rect(0.0, 0.0, 320.0, 240.0));
+        let metal_view = view(rect(0.0, 0.0, 3840.0, 2160.0));
         let foreground = view(rect(40.0, 35.0, 30.0, 25.0));
         let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
         let maker = objc::sel::get("layer");
@@ -5157,7 +5157,7 @@ mod tests {
             add_subview(content, objc::sel::get("addSubview:"), metal_view);
             add_subview(content, objc::sel::get("addSubview:"), foreground);
         }
-        let mut flat = crate::backing::Store::new(320, 240);
+        let mut flat = crate::backing::Store::new(3840, 2160);
         crate::backing::set_native_view_pixels_for_tests(
             foreground,
             30,
@@ -5169,6 +5169,8 @@ mod tests {
         let initial =
             crate::backing::gpu_under_metal_cached(sdl, &flat).expect("independent foreground");
         let count = crate::backing::gpu_underlay_render_count_for_tests();
+        assert_eq!(initial.pixels.len(), 3840 * 2160 * 4);
+        let start = std::time::Instant::now();
         for index in 1..49u8 {
             crate::backing::set_native_view_pixels_for_tests(
                 foreground,
@@ -5186,22 +5188,31 @@ mod tests {
             accept_published_native_for_tests(sdl);
             let after = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
             assert!(
-                !std::sync::Arc::ptr_eq(&initial, &after),
-                "revised acceptance did not invalidate an obsolete underlay"
+                std::sync::Arc::ptr_eq(&initial, &after),
+                "revised foreground acknowledgment rebuilt the unchanged lower underlay"
             );
         }
-        assert!(crate::backing::gpu_underlay_render_count_for_tests() >= count + 48);
+        assert_eq!(
+            crate::backing::gpu_underlay_render_count_for_tests(),
+            count,
+            "48 foreground-only updates allocated new full-window underlays"
+        );
+        eprintln!(
+            "4K underlay: 48 native revisions in {:?}; unchanged lower pixels = {} bytes retained, 0 reconstructed",
+            start.elapsed(),
+            initial.pixels.len()
+        );
         assert_eq!(&initial.pixels[0..4], &[237, 237, 237, 255]);
         crate::backing::set_native_view_pixels_for_tests(
             content,
-            320,
-            240,
-            [0, 255, 0, 255].repeat(320 * 240),
+            3840,
+            2160,
+            [0, 255, 0, 255].repeat(3840 * 2160),
         );
         flush_metal_scenes();
         let changed = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
         assert!(!std::sync::Arc::ptr_eq(&initial, &changed));
-        let offset = (100 * 320 + 200) * 4;
+        let offset = (100 * 3840 + 200) * 4;
         assert_eq!(&changed.pixels[offset..offset + 4], &[0, 255, 0, 255]);
         objc::arc::release(window);
     }
