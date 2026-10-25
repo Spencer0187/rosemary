@@ -221,9 +221,16 @@ impl Gpu {
     /// they are free. Presentation calls this when it rebuilds or gives up a
     /// swapchain, which is a resize or a teardown and never a frame.
     pub fn wait_queue_idle(&self) {
-        let queue = self.queue.lock().expect("Vulkan queue");
-        // SAFETY: the queue is held exclusively for the wait.
-        let _ = unsafe { self.device.queue_wait_idle(*queue) };
+        let idle = {
+            let queue = self.queue.lock().expect("Vulkan queue");
+            // SAFETY: the queue is held exclusively for the wait.
+            unsafe { self.device.queue_wait_idle(*queue) }.is_ok()
+        };
+        if idle {
+            // Submitted immediate commands are also complete now; release
+            // their owned resources without making another window submit.
+            self.retire_immediate_quarantine();
+        }
     }
 
     /// Every fence query and wait must publish device loss just like queue
@@ -261,8 +268,72 @@ impl Gpu {
     /// Wait for a submitted command buffer's fence.
     pub fn wait(&self, fence: vk::Fence) -> Result<(), String> {
         crate::stats::timed(crate::stats::Counter::FenceWaitMicros, || {
-            self.wait_fence_timeout(fence, u64::MAX).map(|_| ())
+            self.wait_fence_timeout(fence, u64::MAX)
+                .and_then(|complete| {
+                    complete
+                        .then_some(())
+                        .ok_or_else(|| "Vulkan fence did not signal before wait timeout".into())
+                })
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_immediate_wait_failure_for_test(&self) {
+        self.fail_immediate_wait_after_submit
+            .store(true, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn immediate_quarantine_count_for_test(&self) -> usize {
+        self.immediate.lock().unwrap().quarantined.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_first_quarantined_for_test(&self) -> Result<(), String> {
+        let fence = self
+            .immediate
+            .lock()
+            .unwrap()
+            .quarantined
+            .first()
+            .map(|context| context.fence)
+            .ok_or("no quarantined immediate submission")?;
+        self.wait(fence)
+    }
+
+    // Move signaled quarantines back into circulation without reclaiming
+    // their descriptors or upload buffers while a GPU read is outstanding.
+    // Hold the count against the bound while cleanup runs outside the lock.
+    fn retire_immediate_quarantine(&self) {
+        let mut ready = Vec::new();
+        {
+            let mut registry = self.immediate.lock().expect("immediate command recycler");
+            let mut i = 0;
+            while i < registry.quarantined.len() {
+                let fence = registry.quarantined[i].fence;
+                // SAFETY: fence belongs to this live device and has never
+                // been destroyed or reset while quarantined.
+                match unsafe { self.device.get_fence_status(fence) } {
+                    Ok(true) => {
+                        ready.push(registry.quarantined.swap_remove(i));
+                    }
+                    Ok(false) | Err(_) => i += 1,
+                }
+            }
+            registry.retiring += ready.len();
+        }
+        let count = ready.len();
+        for context in &mut ready {
+            // Dropping an owned submission may free Vulkan buffers, charges
+            // or return overlay passes. Never do that under the pool lock.
+            drop(context.retained.take());
+        }
+        if count != 0 {
+            let mut registry = self.immediate.lock().expect("immediate command recycler");
+            registry.retiring -= count;
+            registry.available.extend(ready);
+            self.immediate_ready.notify_all();
+        }
     }
 
     /// Record and run one command list synchronously.
@@ -271,17 +342,30 @@ impl Gpu {
     /// putting a fresh texture into a usable layout, and copying bytes a guest
     /// handed to `-replaceRegion:`. Those go through here.
     pub fn one_shot(&self, body: impl FnOnce(&Device, vk::CommandBuffer)) -> Result<(), String> {
+        self.one_shot_owned((), |device, cb, _| body(device, cb))
+    }
+
+    pub(crate) fn one_shot_owned<R: Send + 'static>(
+        &self,
+        resources: R,
+        body: impl FnOnce(&Device, vk::CommandBuffer, &R),
+    ) -> Result<(), String> {
         if self.lost.load(Ordering::Acquire) {
             return Err("Vulkan logical device is lost".into());
         }
         crate::stats::count(crate::stats::Counter::ImmediateCalls);
         crate::stats::timed(crate::stats::Counter::ImmediateMicros, || {
-            self.one_shot_inner(body)
+            self.one_shot_inner(resources, body)
         })
     }
 
-    fn one_shot_inner(&self, body: impl FnOnce(&Device, vk::CommandBuffer)) -> Result<(), String> {
+    fn one_shot_inner<R: Send + 'static>(
+        &self,
+        resources: R,
+        body: impl FnOnce(&Device, vk::CommandBuffer, &R),
+    ) -> Result<(), String> {
         const MAX_IMMEDIATE_CONTEXTS: usize = 8;
+        self.retire_immediate_quarantine();
         // DXVK-style command-list checkout: distinct windows record on
         // independent pools and wait on their own fences. Only vkQueueSubmit
         // retains Vulkan's mandatory per-queue external synchronization.
@@ -292,7 +376,9 @@ impl Gpu {
                     registry.in_use += 1;
                     break available;
                 }
-                if registry.in_use + registry.quarantined.len() < MAX_IMMEDIATE_CONTEXTS {
+                if registry.in_use + registry.retiring + registry.quarantined.len()
+                    < MAX_IMMEDIATE_CONTEXTS
+                {
                     registry.in_use += 1;
                     drop(registry);
                     let created = (|| -> Result<Immediate, String> {
@@ -323,6 +409,7 @@ impl Gpu {
                             pool: pool.take(),
                             command_buffer,
                             fence,
+                            retained: None,
                         })
                     })();
                     if created.is_err() {
@@ -347,7 +434,8 @@ impl Gpu {
         let mut slot = ImmediateLease {
             gpu: self,
             context: Some(immediate),
-            completed: false,
+            completed: true, // No GPU submission exists until submit succeeds.
+            resources: Some(resources),
         };
         let immediate = slot.context.as_ref().expect("checked out GPU command list");
         let begin = vk::CommandBufferBeginInfo::default()
@@ -361,18 +449,32 @@ impl Gpu {
                 .begin_command_buffer(immediate.command_buffer, &begin)
                 .map_err(|error| format!("vkBeginCommandBuffer failed with {error:?}"))?;
         }
-        body(&self.device, immediate.command_buffer);
+        body(
+            &self.device,
+            immediate.command_buffer,
+            slot.resources.as_ref().unwrap(),
+        );
         // SAFETY: recording began above and has not ended.
         unsafe { self.device.end_command_buffer(immediate.command_buffer) }
             .map_err(|error| format!("vkEndCommandBuffer failed with {error:?}"))?;
+        // A queue submission is the first point at which resource retirement
+        // becomes uncertain. Recording/reset failures leave the owner safe to
+        // recycle; a panic during the submit call must conservatively retain it.
+        slot.completed = false;
         if let Err(error) = self.submit(immediate.command_buffer, immediate.fence) {
-            // vkQueueSubmit did not queue this command buffer. It is safe to
-            // reset its pool even though the submission fence was reset.
+            // vkQueueSubmit did not queue the command buffer.
             slot.completed = true;
             return Err(error);
         }
         // Once submitted, a failed wait may mean the GPU is still reading the
         // command buffer. Only a confirmed fence completion recycles its pool.
+        #[cfg(test)]
+        if self
+            .fail_immediate_wait_after_submit
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err("injected immediate fence wait error after queue submission".into());
+        }
         self.wait(immediate.fence)?;
         slot.completed = true;
         Ok(())
@@ -382,13 +484,14 @@ impl Gpu {
 /// Keeps one command pool and its fence exclusively owned until the GPU
 /// finishes its submission. Even a recording panic or failed fence wait may
 /// not return a possibly active command buffer to the free recycler.
-struct ImmediateLease<'a> {
+struct ImmediateLease<'a, R: Send + 'static> {
     gpu: &'a Gpu,
     context: Option<Immediate>,
     completed: bool,
+    resources: Option<R>,
 }
 
-impl Drop for ImmediateLease<'_> {
+impl<R: Send + 'static> Drop for ImmediateLease<'_, R> {
     fn drop(&mut self) {
         let mut registry = self
             .gpu
@@ -396,10 +499,14 @@ impl Drop for ImmediateLease<'_> {
             .lock()
             .expect("immediate command recycler");
         registry.in_use -= 1;
-        if let Some(context) = self.context.take() {
+        if let Some(mut context) = self.context.take() {
             if self.completed {
                 registry.available.push(context);
             } else {
+                context.retained = self
+                    .resources
+                    .take()
+                    .map(|resource| Box::new(resource) as Box<dyn Send>);
                 registry.quarantined.push(context);
             }
         }

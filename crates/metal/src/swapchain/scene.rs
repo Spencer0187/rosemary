@@ -5,6 +5,20 @@
 use super::*;
 use crate::gpu::GpuBuffer;
 
+// Native CPU rollback readback and upload buffers remain owned through the
+// corresponding Vulkan completion fence, including on an unsuccessful wait.
+struct EscrowBuffer {
+    gpu: &'static Gpu,
+    buffer: GpuBuffer,
+}
+
+impl Drop for EscrowBuffer {
+    fn drop(&mut self) {
+        self.gpu
+            .destroy_buffer(std::mem::replace(&mut self.buffer, GpuBuffer::none()));
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct SceneLayer {
     pub(super) id: usize,
@@ -222,83 +236,80 @@ impl NativeGpuEscrow {
                 return Ok(None);
             }
         }
-        let _charge = GpuCharge::reserve(state.window, bytes)?;
-        let buffer = gpu.create_staging_buffer(bytes)?;
+        let charge = GpuCharge::reserve(state.window, bytes)?;
+        let buffer = Arc::new(Mutex::new(EscrowBuffer {
+            gpu,
+            buffer: gpu.create_staging_buffer(bytes)?,
+        }));
         let source = snapshot.image.image;
         let (width, height, format) = (
             snapshot.image.width,
             snapshot.image.height,
             snapshot.image.format,
         );
-        let read = gpu.one_shot(|device, command_buffer| unsafe {
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(source)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-            device.cmd_copy_image_to_buffer(
-                command_buffer,
-                source,
-                vk::ImageLayout::GENERAL,
-                buffer.buffer,
-                &[vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
+        let read = gpu.one_shot_owned(
+            (Arc::clone(&buffer), charge, Arc::clone(snapshot)),
+            |device, command_buffer, resources| unsafe {
+                let barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(source)
+                    .subresource_range(vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
+                        base_mip_level: 0,
+                        level_count: 1,
                         base_array_layer: 0,
                         layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width,
-                        height,
-                        depth: 1,
-                    })],
-            );
-        });
-        if let Err(error) = read {
-            // A failed wait may leave a transfer reading this buffer. A
-            // confirmed device idle is the only safe immediate cleanup;
-            // otherwise keep its allocation charged on the failed device.
-            if unsafe { gpu.device.device_wait_idle() }.is_ok() {
-                gpu.destroy_buffer(buffer);
-            } else {
-                std::mem::forget(buffer);
-                std::mem::forget(_charge);
-            }
-            return Err(error);
-        }
+                    });
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    source,
+                    vk::ImageLayout::GENERAL,
+                    resources.0.lock().unwrap().buffer.buffer,
+                    &[vk::BufferImageCopy::default()
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width,
+                            height,
+                            depth: 1,
+                        })],
+                );
+            },
+        );
+        read?;
         let mut pixels = Vec::new();
-        if let Err(error) = pixels.try_reserve_exact(bytes as usize) {
-            gpu.destroy_buffer(buffer);
-            return Err(format!("native CPU rollback reservation failed: {error}"));
-        }
+        pixels
+            .try_reserve_exact(bytes as usize)
+            .map_err(|error| format!("native CPU rollback reservation failed: {error}"))?;
         // SAFETY: one_shot finished its fence, the buffer is mapped and the
         // entire tightly packed image was transferred, including transparent
         // texels. No reinterpretation, color conversion or alpha changes.
         unsafe {
             pixels.set_len(bytes as usize);
-            std::ptr::copy_nonoverlapping(buffer.contents, pixels.as_mut_ptr(), bytes as usize);
+            std::ptr::copy_nonoverlapping(
+                buffer.lock().unwrap().buffer.contents,
+                pixels.as_mut_ptr(),
+                bytes as usize,
+            );
         }
-        gpu.destroy_buffer(buffer);
         Ok(Some(Self {
             width,
             height,
@@ -342,48 +353,43 @@ impl NativeGpuEscrow {
                 components: vk::ComponentMapping::default(),
             },
         )?;
-        let _charge = GpuCharge::reserve(window, size)?;
-        let staging = gpu.create_staging_buffer(size)?;
+        let charge = GpuCharge::reserve(window, size)?;
+        let staging = Arc::new(Mutex::new(EscrowBuffer {
+            gpu,
+            buffer: gpu.create_staging_buffer(size)?,
+        }));
         // SAFETY: the entire buffer is overwritten before its transfer.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.pixels.as_ptr(),
-                staging.contents,
+                staging.lock().unwrap().buffer.contents,
                 self.pixels.len(),
             );
         }
-        let copied = gpu.one_shot(|device, cb| unsafe {
-            device.cmd_copy_buffer_to_image(
-                cb,
-                staging.buffer,
-                image.image.image,
-                vk::ImageLayout::GENERAL,
-                &[vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width: self.width,
-                        height: self.height,
-                        depth: 1,
-                    })],
-            );
-        });
-        if let Err(error) = copied {
-            if unsafe { gpu.device.device_wait_idle() }.is_ok() {
-                gpu.destroy_buffer(staging);
-            } else {
-                std::mem::forget(staging);
-                std::mem::forget(_charge);
-                std::mem::forget(image);
-                return Err(error);
-            }
-            return Err(error);
-        }
-        gpu.destroy_buffer(staging);
+        let copied = gpu.one_shot_owned(
+            (Arc::clone(&staging), charge, Arc::clone(&image)),
+            |device, cb, resources| unsafe {
+                device.cmd_copy_buffer_to_image(
+                    cb,
+                    resources.0.lock().unwrap().buffer.buffer,
+                    image.image.image,
+                    vk::ImageLayout::GENERAL,
+                    &[vk::BufferImageCopy::default()
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: self.width,
+                            height: self.height,
+                            depth: 1,
+                        })],
+                );
+            },
+        );
+        copied?;
         Ok(image)
     }
 }

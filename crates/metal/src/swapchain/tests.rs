@@ -12868,3 +12868,288 @@ fn rejected_linear_dma_worker_commits_original_publication() {
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
+
+/// A successful submit followed by a synthetic wait error does not establish
+/// completion. The staging heap and image leases remain physically charged
+/// until a later query proves the fence complete.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_upload_failed_fence_wait_retains_gpu_resources_until_completion() {
+    if isolate_vulkan_graphical_test(
+        "native_upload_failed_fence_wait_retains_gpu_resources_until_completion",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let before = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let baseline = before.held.load(Ordering::Acquire);
+    let native = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xd21,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 5,
+            y: 6,
+            width: 32,
+            height: 32,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 32)),
+            revision: 1,
+            dmabuf: None,
+            dma_sample: None,
+        }),
+    };
+    gpu.inject_immediate_wait_failure_for_test();
+    let error = stage_native_scene_source(&mut state, &native).unwrap_err();
+    assert!(error.contains("injected immediate fence wait error"));
+    assert!(gpu.immediate_quarantine_count_for_test() > 0);
+    assert!(
+        before.held.load(Ordering::Acquire) > baseline,
+        "failed wait prematurely freed charged native input and output"
+    );
+    assert!(state.scene_layers.is_empty(), "failed upload was admitted");
+    gpu.wait_first_quarantined_for_test()
+        .expect("actual completion fence");
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
+    assert_eq!(
+        before.held.load(Ordering::Acquire),
+        baseline,
+        "completed native upload leaked its charged staging resources"
+    );
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Native CPU/DMA blending must quarantine the descriptor pass and imported
+/// picture along with the staging buffer, source image and destination image.
+#[test]
+#[cfg(target_os = "linux")]
+fn native_dma_failed_fence_wait_keeps_descriptor_and_import_alive() {
+    if isolate_vulkan_graphical_test(
+        "native_dma_failed_fence_wait_keeps_descriptor_and_import_alive",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let picture = real_gbm_picture_with_pixels(32, 32, |_, _| [128, 0, 127, 255]);
+    let before_pictures = Arc::strong_count(&picture);
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let budget = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let baseline = budget.held.load(Ordering::Acquire);
+    let available_passes = crate::overlay::available_passes_for_test(gpu);
+    let native = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xd22,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 5,
+            y: 6,
+            width: 32,
+            height: 32,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 32)),
+            revision: 1,
+            dmabuf: Some(Arc::clone(&picture)),
+            dma_sample: None,
+        }),
+    };
+    gpu.inject_immediate_wait_failure_for_test();
+    let error = stage_native_scene_source(&mut state, &native).unwrap_err();
+    assert!(error.contains("injected immediate fence wait error"));
+    assert!(gpu.immediate_quarantine_count_for_test() > 0);
+    assert!(budget.held.load(Ordering::Acquire) > baseline);
+    assert!(
+        Arc::strong_count(&picture) > before_pictures + 1,
+        "submitted DMA importer lost strong producer ownership"
+    );
+    assert_eq!(
+        crate::overlay::available_passes_for_test(gpu),
+        available_passes.saturating_sub(1),
+        "descriptor pass was recycled before completion"
+    );
+    gpu.wait_first_quarantined_for_test()
+        .expect("actual overlay completion fence");
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
+    assert_eq!(budget.held.load(Ordering::Acquire), baseline);
+    assert_eq!(
+        Arc::strong_count(&picture),
+        before_pictures + 1,
+        "completed blend still retains DMA picture"
+    );
+    assert_eq!(
+        crate::overlay::available_passes_for_test(gpu),
+        available_passes.max(1),
+        "descriptor pass never returned after completion"
+    );
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn immediate_quarantine_recycles_completed_contexts_across_repeated_faults() {
+    if isolate_vulkan_graphical_test(
+        "immediate_quarantine_recycles_completed_contexts_across_repeated_faults",
+    ) {
+        return;
+    }
+    let Some((window, gpu, state, metal, _)) = v10_fifo_fixture() else {
+        return;
+    };
+    struct CompletionWitness(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for CompletionWitness {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+    let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // More failures than the pool's eight contexts. Each fence eventually
+    // completes, so the recycler must regain contexts instead of exhausting.
+    for index in 0..12 {
+        gpu.inject_immediate_wait_failure_for_test();
+        assert!(
+            gpu.one_shot_owned(CompletionWitness(Arc::clone(&completed)), |_, _, _| {})
+                .unwrap_err()
+                .contains("injected immediate fence wait error")
+        );
+        assert_eq!(completed.load(Ordering::Acquire), index);
+        assert!(gpu.immediate_quarantine_count_for_test() > 0);
+        gpu.wait_first_quarantined_for_test().unwrap();
+        gpu.one_shot(|_, _| {}).unwrap();
+        assert_eq!(completed.load(Ordering::Acquire), index + 1);
+        assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
+    }
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_escrow_failed_wait_retains_exact_gpu_readback_and_restore_resources() {
+    if isolate_vulkan_graphical_test(
+        "native_escrow_failed_wait_retains_exact_gpu_readback_and_restore_resources",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, _)) = v10_fifo_fixture() else {
+        return;
+    };
+    let source = BackingImageLease::create_for_window(
+        gpu,
+        window as usize,
+        &ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 8,
+            height: 8,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        },
+    )
+    .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            source.image.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0., 1., 0., 1.],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let budget = Arc::clone(&source._charge.as_ref().unwrap().budget);
+    let baseline = budget.held.load(Ordering::Acquire);
+    gpu.inject_immediate_wait_failure_for_test();
+    assert!(
+        scene::NativeGpuEscrow::capture(&mut state, &source)
+            .err()
+            .expect("injected wait failure")
+            .contains("injected immediate fence wait error")
+    );
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 1);
+    assert!(
+        budget.held.load(Ordering::Acquire) > baseline,
+        "uncertain escrow GPU readback released its allocation"
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(budget.held.load(Ordering::Acquire), baseline);
+    let saved = scene::NativeGpuEscrow::capture(&mut state, &source)
+        .unwrap()
+        .unwrap();
+    gpu.inject_immediate_wait_failure_for_test();
+    assert!(
+        saved
+            .restore(gpu, window as usize)
+            .err()
+            .expect("injected wait failure")
+            .contains("injected immediate fence wait error")
+    );
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 1);
+    assert!(
+        budget.held.load(Ordering::Acquire) > baseline,
+        "uncertain escrow GPU restore released its allocation"
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(budget.held.load(Ordering::Acquire), baseline);
+    let recovered = saved.restore(gpu, window as usize).unwrap();
+    assert_eq!(
+        read_scene_pixel(gpu, recovered.image.image, 8, 8, 4, 4),
+        [0, 255, 0, 255]
+    );
+    drop(recovered);
+    drop(source);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}

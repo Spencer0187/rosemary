@@ -138,6 +138,24 @@ struct NativeCpuBaseCache {
 }
 
 /// The per-window state presentation goes through.
+// A queued native upload owns its charge, buffer and every GPU image the
+// command references until the submitted fence is confirmed complete.
+struct NativeStageGpuResources {
+    gpu: &'static Gpu,
+    buffer: Option<gpu::GpuBuffer>,
+    _charge: Option<GpuCharge>,
+    _source: Arc<BackingImageLease>,
+    _target: Option<Arc<BackingImageLease>>,
+}
+
+impl Drop for NativeStageGpuResources {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.gpu.destroy_buffer(buffer);
+        }
+    }
+}
+
 struct Swapchain {
     window: usize,
     gpu: &'static Gpu,
@@ -2372,7 +2390,7 @@ fn stage_native_scene_source_effective(
     // upload path; no buffer may be released before its submit fence signals.
     if native.dmabuf.is_none() {
         if native.bytes.is_empty() {
-            gpu.one_shot(|device, cb| unsafe {
+            gpu.one_shot_owned(Arc::clone(&lease), |device, cb, _source| unsafe {
                 device.cmd_clear_color_image(
                     cb,
                     lease.image.image,
@@ -2390,7 +2408,7 @@ fn stage_native_scene_source_effective(
                 );
             })?;
         } else {
-            let _staging_charge =
+            let staging_charge =
                 GpuCharge::reserve(frame.window as usize, native.bytes.len() as u64)?;
             let staging = gpu.create_staging_buffer(native.bytes.len() as u64)?;
             unsafe {
@@ -2400,10 +2418,17 @@ fn stage_native_scene_source_effective(
                     native.bytes.len(),
                 )
             };
-            let upload = gpu.one_shot(|device, cb| unsafe {
+            let owned = NativeStageGpuResources {
+                gpu,
+                buffer: Some(staging),
+                _charge: Some(staging_charge),
+                _source: Arc::clone(&lease),
+                _target: None,
+            };
+            gpu.one_shot_owned(owned, |device, cb, owned| unsafe {
                 device.cmd_copy_buffer_to_image(
                     cb,
-                    staging.buffer,
+                    owned.buffer.as_ref().unwrap().buffer,
                     lease.image.image,
                     vk::ImageLayout::GENERAL,
                     &[vk::BufferImageCopy::default()
@@ -2419,9 +2444,7 @@ fn stage_native_scene_source_effective(
                             depth: 1,
                         })],
                 );
-            });
-            gpu.destroy_buffer(staging);
-            upload?;
+            })?;
         }
     }
     // The existing DMA-BUF importer already validates external memory and
@@ -2483,12 +2506,21 @@ fn stage_native_scene_source_effective(
         // blend_with_store_init waits for this submission fence. The staging
         // allocation and its window-wide budget reservation stay live until
         // the GPU is done copying the CPU base and sampling imported DMA.
-        let blended_result =
-            crate::overlay::blend_with_store_init(gpu, &lease.image, &output.image, &overlay, init);
-        if let Some(staging) = staging {
-            gpu.destroy_buffer(staging);
-        }
-        drop(staging_charge);
+        let owned = NativeStageGpuResources {
+            gpu,
+            buffer: staging,
+            _charge: staging_charge,
+            _source: Arc::clone(&lease),
+            _target: Some(Arc::clone(&output)),
+        };
+        let blended_result = crate::overlay::blend_with_store_init_owned(
+            gpu,
+            &lease.image,
+            &output.image,
+            &overlay,
+            init,
+            owned,
+        );
         if !blended_result?.is_empty() {
             appkit::backing::refuse_dmabufs(frame.window);
             // A producer-backed linear buffer can be mapped with DMA_BUF_SYNC.

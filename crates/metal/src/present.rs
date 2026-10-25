@@ -2620,7 +2620,17 @@ fn blend_overlays(
     overlays: &[appkit::backing::GpuOverlay],
 ) -> std::sync::Arc<crate::swapchain::BackingImageLease> {
     let blended = entry.blended.as_ref().expect("reserved before upload");
-    match crate::overlay::blend(entry.gpu, &entry.image, &blended.image, overlays) {
+    match crate::overlay::blend_with_store_init_owned(
+        entry.gpu,
+        &entry.image,
+        &blended.image,
+        overlays,
+        None,
+        (
+            std::sync::Arc::clone(&entry.image),
+            std::sync::Arc::clone(blended),
+        ),
+    ) {
         Ok(refused) => {
             if !refused.is_empty() {
                 appkit::backing::refuse_dmabufs(window);
