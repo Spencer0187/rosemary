@@ -1845,55 +1845,85 @@ pub fn native_scene_pixels_cropped(
     };
     #[cfg(test)]
     NATIVE_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut output = Store::new(crop.width as u32, crop.height as u32);
-    let whole = Rect {
-        x: 0,
-        y: 0,
-        width: crop.width,
-        height: crop.height,
+    // A plain fully opaque backing store has exactly the same BGRA texels
+    // after blending over a transparent native background. Allocate/copy its
+    // crop directly; the existing compositor path handles alpha and CA.
+    #[cfg(test)]
+    let compare_slow = std::env::var_os("ROSEMARY_BENCH_NATIVE_CAPTURE_FORCE_SLOW").is_some();
+    #[cfg(not(test))]
+    let compare_slow = false;
+    let exact_opaque = if plain_store && !compare_slow {
+        source.filter(|src| src.width == width && src.height == height && src.fully_opaque())
+    } else {
+        None
     };
-    let logical = Rect {
-        x: -crop.x,
-        y: -crop.y,
-        width: i64::from(width),
-        height: i64::from(height),
-    };
-    use crate::coreanimation::{Pass, render_with_root_opacity};
-    render_with_root_opacity(
-        view,
-        &mut output,
-        logical,
-        whole,
-        Pass::Background,
-        Some(1.0),
-    );
-    if let Some(source) = source {
-        // CA/view opacity is applied by the retained scene, not a second time
-        // during this isolated pixel capture.
-        blend_at(&mut output, source, -crop.x, -crop.y, whole, 1.0);
-    }
-    if let Some(overlay) = overlay {
-        // Software overlays (including CPU-backed web content) are also
-        // separate native layers; previously they were irreversibly composed
-        // under the later Metal drawable in the full window store.
-        blend_overlay_clipped(
+    let output = if let Some(src) = exact_opaque {
+        let mut pixels = Vec::with_capacity(crop.width as usize * crop.height as usize * 4);
+        for row in crop.y as usize..(crop.y + crop.height) as usize {
+            let offset = (row * src.width as usize + crop.x as usize) * 4;
+            pixels.extend_from_slice(&src.pixels[offset..offset + crop.width as usize * 4]);
+        }
+        Store {
+            width: crop.width as u32,
+            height: crop.height as u32,
+            pixels,
+            dirty: false,
+            generation: 0,
+            changes: VecDeque::new(),
+            alpha_class: AtomicU8::new(2),
+        }
+    } else {
+        let mut output = Store::new(crop.width as u32, crop.height as u32);
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: crop.width,
+            height: crop.height,
+        };
+        let logical = Rect {
+            x: -crop.x,
+            y: -crop.y,
+            width: i64::from(width),
+            height: i64::from(height),
+        };
+        use crate::coreanimation::{Pass, render_with_root_opacity};
+        render_with_root_opacity(
+            view,
             &mut output,
-            overlay,
-            (-crop.x).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            (-crop.y).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            width,
-            height,
+            logical,
             whole,
+            Pass::Background,
+            Some(1.0),
         );
-    }
-    render_with_root_opacity(
-        view,
-        &mut output,
-        logical,
-        whole,
-        Pass::Sublayers,
-        Some(1.0),
-    );
+        if let Some(source) = source {
+            // CA/view opacity is applied by the retained scene, not a second time
+            // during this isolated pixel capture.
+            blend_at(&mut output, source, -crop.x, -crop.y, whole, 1.0);
+        }
+        if let Some(overlay) = overlay {
+            // Software overlays (including CPU-backed web content) are also
+            // separate native layers; previously they were irreversibly composed
+            // under the later Metal drawable in the full window store.
+            blend_overlay_clipped(
+                &mut output,
+                overlay,
+                (-crop.x).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                (-crop.y).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                width,
+                height,
+                whole,
+            );
+        }
+        render_with_root_opacity(
+            view,
+            &mut output,
+            logical,
+            whole,
+            Pass::Sublayers,
+            Some(1.0),
+        );
+        output
+    };
     if output
         .pixels
         .as_chunks::<4>()
@@ -3618,6 +3648,46 @@ mod tests {
     use super::*;
 
     #[test]
+    fn opaque_native_direct_capture_matches_translucent_fallback_and_crops() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        const WIDTH: u32 = 6;
+        const HEIGHT: u32 = 4;
+        let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
+        pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+            .copy_from_slice(&[90, 80, 70, 255]);
+        set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, pixels);
+        let crop = Rect {
+            x: 3,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        let opaque = native_scene_pixels_cropped(view, WIDTH, HEIGHT, crop)
+            .unwrap()
+            .0;
+        assert_eq!(&opaque[..4], &[12, 34, 56, 255]);
+        assert_eq!(&opaque[4..8], &[90, 80, 70, 255]);
+        set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, {
+            let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
+            pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+                .copy_from_slice(&[90, 80, 70, 0]);
+            pixels
+        });
+        let mixed = native_scene_pixels_cropped(view, WIDTH, HEIGHT, crop)
+            .unwrap()
+            .0;
+        assert_eq!(&mixed[..4], &[12, 34, 56, 255]);
+        assert_eq!(
+            &mixed[4..8],
+            &[0, 0, 0, 0],
+            "alpha-zero premultiplied source may never preserve nonzero RGB"
+        );
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
     fn store_producer_damage_requires_contiguous_versions_and_full_unknown_fallback() {
         let mut store = Store::new(32, 16);
         assert_eq!(store.damage_since(0), None);
@@ -4397,4 +4467,77 @@ mod tests {
         assert_eq!(store.pixels, [99, 99, 227, 255]);
         FOCUS.with(|stack| stack.borrow_mut().clear());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn changing_six_k_native_store_capture_costs() {
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_CHANGED_6K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    const W: u32 = 6016;
+    const H: u32 = 3384;
+    let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+    set_native_view_pixels_for_tests(
+        view,
+        W,
+        H,
+        [48u8, 128, 196, 255].repeat(W as usize * H as usize),
+    );
+    let mut tiles = Vec::new();
+    for y in (0..H).step_by(2048) {
+        for x in (0..W).step_by(2048) {
+            tiles.push(Rect {
+                x: x as i64,
+                y: y as i64,
+                width: (W - x).min(2048) as i64,
+                height: (H - y).min(2048) as i64,
+            });
+        }
+    }
+    assert_eq!(tiles.len(), 6);
+    let mut prior = tiles
+        .iter()
+        .map(|rect| {
+            native_scene_pixels_cropped_with_damage(view, W, H, *rect)
+                .unwrap()
+                .1
+        })
+        .collect::<Vec<_>>();
+    let mut measured = Vec::new();
+    for revision in 1..=24 {
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            for rect in &tiles {
+                let x = (rect.x + rect.width / 2) as usize;
+                let y = (rect.y + rect.height / 2) as usize;
+                let at = (y * W as usize + x) * 4;
+                store.pixels[at] = revision as u8;
+                store.touch_region(Rect {
+                    x: x as i64,
+                    y: y as i64,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+        let started = std::time::Instant::now();
+        for (i, rect) in tiles.iter().enumerate() {
+            let (pixels, version, damage) =
+                native_scene_pixels_cropped_with_damage(view, W, H, *rect).unwrap();
+            assert_eq!(damage.unwrap().from_revision, prior[i]);
+            let at = ((rect.height / 2 * rect.width + rect.width / 2) * 4) as usize;
+            assert_eq!(pixels[at], revision as u8);
+            prior[i] = version;
+        }
+        measured.push(started.elapsed().as_secs_f64() * 1000.);
+    }
+    measured.sort_by(f64::total_cmp);
+    let mean = measured.iter().sum::<f64>() / measured.len() as f64;
+    let p95 = measured[measured.len() * 95 / 100];
+    eprintln!("6K changed plain native captures six tiles mean_ms={mean:.3} p95_ms={p95:.3}");
+    forget(view);
+    objc::arc::release(view);
 }
