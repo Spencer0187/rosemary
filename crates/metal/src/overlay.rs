@@ -504,6 +504,15 @@ pub(crate) fn target_description(width: u32, height: u32) -> ImageDescription {
     }
 }
 
+/// An AppKit native base can be initialized inside the *same* synchronous
+/// GPU submission as its DMA overlay blend. Staging buffers remain owned by
+/// the caller until this operation has completed its GPU fence.
+#[derive(Clone, Copy)]
+pub(crate) enum StoreInit {
+    Transparent,
+    Upload(vk::Buffer),
+}
+
 /// Copy `store` into `target`, of the same size, and blend `overlays` over
 /// it, waiting until that is done. Overlays that could not be imported are
 /// left out and returned.
@@ -512,6 +521,16 @@ pub(crate) fn blend<'a>(
     store: &GpuImage,
     target: &GpuImage,
     overlays: &'a [GpuOverlay],
+) -> Result<Vec<&'a GpuOverlay>, String> {
+    blend_with_store_init(gpu, store, target, overlays, None)
+}
+
+pub(crate) fn blend_with_store_init<'a>(
+    gpu: &'static Gpu,
+    store: &GpuImage,
+    target: &GpuImage,
+    overlays: &'a [GpuOverlay],
+    base: Option<StoreInit>,
 ) -> Result<Vec<&'a GpuOverlay>, String> {
     let mut passes = PASSES.lock().expect("overlay passes");
     if !passes.iter().any(|pass| std::ptr::eq(pass.gpu, gpu)) {
@@ -569,6 +588,47 @@ pub(crate) fn blend<'a>(
         // target are in GENERAL from creation, and each imported image is
         // taken from its producer and handed back around its read.
         unsafe {
+            // A native scene's CPU base initialization and imported DMA
+            // blend share one command buffer and one completed GPU fence.
+            // A transfer-write -> transfer-read barrier below orders this
+            // upload before the store-to-target blit.
+            if let Some(init) = base {
+                match init {
+                    StoreInit::Transparent => device.cmd_clear_color_image(
+                        command_buffer,
+                        store.image,
+                        vk::ImageLayout::GENERAL,
+                        &vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 0.0],
+                        },
+                        &[vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }],
+                    ),
+                    StoreInit::Upload(buffer) => device.cmd_copy_buffer_to_image(
+                        command_buffer,
+                        buffer,
+                        store.image,
+                        vk::ImageLayout::GENERAL,
+                        &[vk::BufferImageCopy::default()
+                            .image_subresource(vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            })
+                            .image_extent(vk::Extent3D {
+                                width: store.width,
+                                height: store.height,
+                                depth: 1,
+                            })],
+                    ),
+                }
+            }
             // The store's upload lands, and the last present's read of the
             // target is done, before the copy.
             general_barrier(

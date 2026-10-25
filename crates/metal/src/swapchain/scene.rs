@@ -497,6 +497,43 @@ impl Swapchain {
         }
     }
 
+    /// A guest Metal present cannot commit an AppKit native source which has
+    /// not yet passed the compositor worker's atomic staging transaction.
+    /// Preserve committed native metadata (including still-pending removals)
+    /// while allowing unrelated Metal drawable placements to update. Only
+    /// the scene worker may call synchronize_scene with proposed native state.
+    pub(super) fn guest_present_scene(&self, proposed: &[ScenePlacement]) -> Vec<ScenePlacement> {
+        // Keep every committed native source at its committed paint-order
+        // position, even when a new proposal moves or removes that NSView.
+        // The guest drawable may refresh ordinary Metal placement metadata,
+        // but only a successful compositor transaction may reorder natives.
+        let mut safe = Vec::with_capacity(proposed.len().max(self.scene_placements.len()));
+        for previous in &self.scene_placements {
+            if previous.native.is_some() {
+                safe.push(previous.clone());
+            } else if let Some(current) = proposed
+                .iter()
+                .find(|current| current.id == previous.id && current.native.is_none())
+            {
+                safe.push(current.clone());
+            }
+        }
+        // Metal sources first appearing in this guest submission need live
+        // membership without advancing any unpublished native proposal. The
+        // next already committed source anchors their relative paint order.
+        for (at, current) in proposed.iter().enumerate() {
+            if current.native.is_some() || safe.iter().any(|old| old.id == current.id) {
+                continue;
+            }
+            let insert = proposed[at + 1..]
+                .iter()
+                .find_map(|later| safe.iter().position(|old| old.id == later.id))
+                .unwrap_or(safe.len());
+            safe.insert(insert, current.clone());
+        }
+        safe
+    }
+
     /// AppKit's live view hierarchy, not historical present order, decides
     /// which cached layers are still visible and how they must be composed.
     /// The window's CPU backing-store pseudo-layer remains below Metal views.

@@ -4803,6 +4803,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         Ok(Some(true))
     );
     let mut scene = vec![bottom.clone()];
+    let admission_start = std::time::Instant::now();
     let mut count = 0usize;
     for y in (0..HEIGHT).step_by(2048) {
         for x in (0..WIDTH).step_by(2048) {
@@ -4845,9 +4846,43 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         }
     }
     assert_eq!(count, 6);
+    let first_six_tiles_ms = admission_start.elapsed().as_secs_f64() * 1000.0;
     state.synchronize_scene(window as usize, &scene);
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
     state.idle();
+    let initial_wsi_start = std::time::Instant::now();
+    state
+        .flush_composite(window)
+        .expect("real initial mixed 6K WSI presentation");
+    let initial_wsi_ms = initial_wsi_start.elapsed().as_secs_f64() * 1000.0;
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_MIXED_6K").is_some() {
+        eprintln!(
+            "6K mixed real GPU mode={:?} initial_six_tiles_ms={first_six_tiles_ms:.3} first_wsi_ms={initial_wsi_ms:.3}",
+            state.present_mode
+        );
+        for n in 0..3 {
+            let animation_start = std::time::Instant::now();
+            for tile in &mut scene[1..] {
+                tile.native.as_mut().unwrap().revision += 1;
+                assert_eq!(stage_native_scene_source(&mut state, tile), Ok(true));
+            }
+            let six_tiles_ms = animation_start.elapsed().as_secs_f64() * 1000.0;
+            state.synchronize_scene(window as usize, &scene);
+            assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+            state.idle();
+            let wsi_start = std::time::Instant::now();
+            state
+                .flush_composite(window)
+                .expect("animated mixed 6K WSI publication");
+            let wsi_ms = wsi_start.elapsed().as_secs_f64() * 1000.0;
+            eprintln!(
+                "6K mixed real GPU mode={:?} revision={} six_tiles_ms={six_tiles_ms:.3} first_wsi_ms={wsi_ms:.3} total_ms={:.3}",
+                state.present_mode,
+                n + 1,
+                animation_start.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
     let image = state.composite.as_ref().unwrap().image;
     // DMA: premultiplied half-red over opaque CPU blue => purple. Fully
     // transparent texels preserve CPU blue rather than exposing Metal green.
@@ -6274,6 +6309,308 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     drop(entry);
     sdl3::video::destroy_window(window);
     gpu.destroy_image(metal);
+}
+
+/// A newly proposed native DMA geometry revision must never overwrite the
+/// last GPU-admitted source simply because another Metal drawable arrived
+/// first. Also preserve still-pending native removals until the worker commits.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refusal() {
+    if isolate_vulkan_graphical_test(
+        "guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refusal",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+    })
+    .unwrap();
+    let background = ScenePlacement {
+        id: 0xb010,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let old_frame = appkit::view::Frame {
+        x: 20,
+        y: 16,
+        width: 32,
+        height: 24,
+        ..whole
+    };
+    let old = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xb011,
+        frame: DirectFrame::from_frame(&old_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
+            revision: 7,
+            dmabuf: None,
+            dma_sample: None,
+        }),
+    };
+    state.layers.push(background.id);
+    state.synchronize_scene(window as usize, &[background.clone(), old.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            background.id,
+            &whole,
+            PresentSource::from(&metal),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(stage_native_scene_source(&mut state, &old), Ok(true));
+    state.synchronize_scene(window as usize, &[background.clone(), old.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 24, 20),
+        [255, 0, 0, 255]
+    );
+    let proposed = ScenePlacement {
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 75,
+            y: 55,
+            width: 48,
+            height: 30,
+            ..whole
+        }),
+        opacity: 0.4,
+        opaque: false,
+        clip: Some(DirectFrame::from_frame(&appkit::view::Frame {
+            x: 82,
+            y: 60,
+            width: 24,
+            height: 16,
+            ..whole
+        })),
+        rounded: vec![scene::RoundedClip {
+            frame: DirectFrame::from_frame(&old_frame),
+            radius: 9.0,
+        }],
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 8,
+            dmabuf: Some(Arc::new(appkit::backing::Dmabuf {
+                width: 48,
+                height: 30,
+                fourcc: 0,
+                modifier: 0,
+                planes: vec![],
+            })),
+            dma_sample: None,
+        }),
+        ..old.clone()
+    };
+    let proposed_scene = vec![background.clone(), proposed.clone()];
+    // Same translation as the competing present_impl() path. The worker has
+    // not yet staged the published revision. Guest drawable admission may
+    // update Metal pixels but not metadata of the proposed native image.
+    let safe = state.guest_present_scene(&proposed_scene);
+    assert_eq!(safe.len(), 2);
+    assert_eq!(
+        safe.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![background.id, old.id]
+    );
+    let reorder = state.guest_present_scene(&[proposed.clone(), background.clone()]);
+    assert_eq!(
+        reorder.iter().map(|p| p.id).collect::<Vec<_>>(),
+        vec![background.id, old.id],
+        "guest draw unexpectedly accepted native stacking/reorder before DMA admission"
+    );
+    assert!(safe[1].frame == old.frame);
+    assert_eq!(safe[1].opacity, old.opacity);
+    assert!(safe[1].clip == old.clip);
+    assert!(safe[1].rounded == old.rounded);
+    assert_eq!(safe[1].native.as_ref().unwrap().revision, 7);
+    state.synchronize_scene(window as usize, &safe);
+    let retained = state
+        .scene_placements
+        .iter()
+        .find(|s| s.id == old.id)
+        .unwrap();
+    assert!(retained.frame == old.frame);
+    assert_eq!(retained.opacity, 1.0);
+    assert!(retained.clip.is_none());
+    assert_eq!(retained.native.as_ref().unwrap().revision, 7);
+    assert_eq!(
+        stage_native_scene_source(&mut state, &proposed),
+        Err("native-dmabuf-import-refused".to_owned())
+    );
+    let recovered = preserve_refused_native_sources(&state, proposed_scene, &[old.id]);
+    assert!(recovered[1].frame == old.frame);
+    assert_eq!(recovered[1].opacity, old.opacity);
+    assert!(recovered[1].clip == old.clip);
+    state.synchronize_scene(window as usize, &recovered);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 24, 20),
+        [255, 0, 0, 255],
+        "failed revision lost original foreground pixels after competing guest present"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 88, 66),
+        [0, 255, 0, 255],
+        "unadmitted new placement incorrectly moved old CPU pixels"
+    );
+    let removal = state.guest_present_scene(std::slice::from_ref(&background));
+    assert_eq!(
+        removal.len(),
+        2,
+        "uncommitted native removal was applied by guest present"
+    );
+    assert!(removal[1].frame == old.frame);
+    let introduction = ScenePlacement {
+        id: old.id + 1,
+        ..proposed
+    };
+    let safe = state.guest_present_scene(&[background, introduction]);
+    assert!(
+        !safe.iter().any(|p| p.id == old.id + 1),
+        "unadmitted new native became guest-owned"
+    );
+    assert!(
+        safe.iter().any(|p| p.id == old.id),
+        "old native was pruned before worker commit"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// The 512 MiB scene budget is stricter than the 768 MiB window allocation
+/// ledger. Fence/transaction-pinned old images above that scene threshold
+/// must defer DMA import without poisoning the window's importer capability.
+#[test]
+#[cfg(target_os = "linux")]
+fn pinned_scene_generation_budget_defers_dma_and_recovers_after_retirement() {
+    if isolate_vulkan_graphical_test(
+        "pinned_scene_generation_budget_defers_dma_and_recovers_after_retirement",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let picture = real_gbm_picture_with_pixels(48, 44, |_, _| [0, 0, 255, 255]);
+    let view = appkit::view::Frame {
+        x: 12,
+        y: 16,
+        width: 48,
+        height: 44,
+        ..whole
+    };
+    let placement = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xb015,
+        frame: DirectFrame::from_frame(&view),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 11,
+            dmabuf: Some(picture),
+            dma_sample: None,
+        }),
+    };
+    assert!(!appkit::backing::dmabuf_import_refused(window));
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 4096,
+        height: 4096,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for _ in 0..9 {
+        state.transaction_pinned.push(
+            BackingImageLease::create_for_window(gpu, window as usize, &desc)
+                .expect("9 x 64MiB old snapshot leases under the 768MiB aggregate window budget"),
+        );
+    }
+    assert!(state.scene_gpu_bytes() > 512 * 1024 * 1024);
+    assert!(state.committed_scene_bytes() < 512 * 1024 * 1024);
+    let before = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    let denied = NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed);
+    assert_eq!(
+        stage_native_scene_source(&mut state, &placement),
+        Ok(false),
+        "temporary scene lease pressure was classified as a permanent failure"
+    );
+    assert!(
+        !appkit::backing::dmabuf_import_refused(window),
+        "temporary 512MiB scene pressure permanently poisoned DMA-BUF import"
+    );
+    assert_eq!(NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed), before);
+    assert_eq!(NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed), denied);
+    state.transaction_pinned.clear();
+    state.retire_copied();
+    assert_eq!(
+        stage_native_scene_source(&mut state, &placement),
+        Ok(true),
+        "valid DMA producer was not retried when old GPU leases retired"
+    );
+    assert!(!appkit::backing::dmabuf_import_refused(window));
+    state.synchronize_scene(window as usize, &[placement]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            25,
+            30
+        ),
+        [255, 0, 0, 255]
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
 }
 
 /// External backing pool reservations or fence-held leases are not a hard

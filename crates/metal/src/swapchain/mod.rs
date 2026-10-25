@@ -1514,8 +1514,13 @@ fn present_impl(
             })
             .collect::<Vec<_>>()
     });
+    // Only the worker can commit changed native placement metadata. A guest
+    // drawable may arrive while the new native revision is still pending DMA
+    // import, and must never overwrite the last accepted rollback geometry.
+    let drawable_scene = live_scene
+        .as_deref()
+        .map(|scene| swapchain.guest_present_scene(scene));
     if let Some(scene) = live_scene.as_deref() {
-        swapchain.synchronize_scene(window, scene);
         if layer != window && !scene.iter().any(|item| item.id == layer) {
             // A view removed while its GPU drawable was still queued cannot
             // resurrect itself by a late presentation.
@@ -1527,7 +1532,7 @@ fn present_impl(
     if joined {
         swapchain.layers.push(layer);
     }
-    if let Some(scene) = live_scene.as_deref() {
+    if let Some(scene) = drawable_scene.as_deref() {
         swapchain.synchronize_scene(window, scene);
     }
     // Only a layer that has presented here has anything of its own to keep:
@@ -2197,9 +2202,6 @@ fn stage_native_scene_source(
             state.scene_gpu_bytes(),
             image_bytes.saturating_mul(scratch_count),
         ) {
-            if native.dmabuf.is_some() {
-                appkit::backing::refuse_dmabufs(frame.window);
-            }
             // Fence-held retired leases may clear shortly. A committed
             // snapshot and its accumulator cannot disappear without new
             // scene membership. Distinguish those cases so a permanently
@@ -2210,6 +2212,12 @@ fn stage_native_scene_source(
                 image_bytes.saturating_mul(scratch_count),
             ) {
                 return Ok(false);
+            }
+            // Only a committed, non-evictable footprint is a hard failure.
+            // A temporarily pinned generation must never poison importer
+            // capability for the next attempt after GPU fence retirement.
+            if native.dmabuf.is_some() {
+                appkit::backing::refuse_dmabufs(frame.window);
             }
             return Err("native AppKit GPU scene budget exhausted".into());
         }
@@ -2244,56 +2252,62 @@ fn stage_native_scene_source(
             components: vk::ComponentMapping::default(),
         },
     )?;
-    if native.bytes.is_empty() {
-        gpu.one_shot(|device, cb| unsafe {
-            device.cmd_clear_color_image(
-                cb,
-                lease.image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue {
-                    float32: [0.0, 0.0, 0.0, 0.0],
-                },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
-        })?;
-    } else {
-        let _staging_charge = GpuCharge::reserve(frame.window as usize, native.bytes.len() as u64)?;
-        let staging = gpu.create_buffer(native.bytes.len() as u64)?;
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                native.bytes.as_ptr(),
-                staging.contents,
-                native.bytes.len(),
-            )
-        };
-        let upload = gpu.one_shot(|device, cb| unsafe {
-            device.cmd_copy_buffer_to_image(
-                cb,
-                staging.buffer,
-                lease.image.image,
-                vk::ImageLayout::GENERAL,
-                &[vk::BufferImageCopy::default()
-                    .image_subresource(vk::ImageSubresourceLayers {
+    // DMA-backed native tiles initialize their CPU base in the same GPU
+    // command buffer as the producer blend. CPU-only sources use the existing
+    // upload path; no buffer may be released before its submit fence signals.
+    if native.dmabuf.is_none() {
+        if native.bytes.is_empty() {
+            gpu.one_shot(|device, cb| unsafe {
+                device.cmd_clear_color_image(
+                    cb,
+                    lease.image.image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                    &[vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
-                        mip_level: 0,
+                        base_mip_level: 0,
+                        level_count: 1,
                         base_array_layer: 0,
                         layer_count: 1,
-                    })
-                    .image_extent(vk::Extent3D {
-                        width: frame.width,
-                        height: frame.height,
-                        depth: 1,
-                    })],
-            );
-        });
-        gpu.destroy_buffer(staging);
-        upload?;
+                    }],
+                );
+            })?;
+        } else {
+            let _staging_charge =
+                GpuCharge::reserve(frame.window as usize, native.bytes.len() as u64)?;
+            let staging = gpu.create_buffer(native.bytes.len() as u64)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    native.bytes.as_ptr(),
+                    staging.contents,
+                    native.bytes.len(),
+                )
+            };
+            let upload = gpu.one_shot(|device, cb| unsafe {
+                device.cmd_copy_buffer_to_image(
+                    cb,
+                    staging.buffer,
+                    lease.image.image,
+                    vk::ImageLayout::GENERAL,
+                    &[vk::BufferImageCopy::default()
+                        .image_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .image_extent(vk::Extent3D {
+                            width: frame.width,
+                            height: frame.height,
+                            depth: 1,
+                        })],
+                );
+            });
+            gpu.destroy_buffer(staging);
+            upload?;
+        }
     }
     // The existing DMA-BUF importer already validates external memory and
     // performs acquire/release barriers. Render onto a transparent (or CPU
@@ -2322,7 +2336,44 @@ fn stage_native_scene_source(
                 ),
             },
         }];
-        if !crate::overlay::blend(gpu, &lease.image, &output.image, &overlay)?.is_empty() {
+        let mut staging_charge = None;
+        let staging = if native.bytes.is_empty() {
+            None
+        } else {
+            staging_charge = Some(GpuCharge::reserve(
+                frame.window as usize,
+                native.bytes.len() as u64,
+            )?);
+            let staging = gpu.create_buffer(native.bytes.len() as u64)?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    native.bytes.as_ptr(),
+                    staging.contents,
+                    native.bytes.len(),
+                );
+            }
+            Some(staging)
+        };
+        let init = staging
+            .as_ref()
+            .map_or(crate::overlay::StoreInit::Transparent, |buffer| {
+                crate::overlay::StoreInit::Upload(buffer.buffer)
+            });
+        // blend_with_store_init waits for this submission fence. The staging
+        // allocation and its window-wide budget reservation stay live until
+        // the GPU is done copying the CPU base and sampling imported DMA.
+        let blended_result = crate::overlay::blend_with_store_init(
+            gpu,
+            &lease.image,
+            &output.image,
+            &overlay,
+            Some(init),
+        );
+        if let Some(staging) = staging {
+            gpu.destroy_buffer(staging);
+        }
+        drop(staging_charge);
+        if !blended_result?.is_empty() {
             appkit::backing::refuse_dmabufs(frame.window);
             // A producer-backed linear buffer can be mapped with DMA_BUF_SYNC.
             // If it cannot, request a CPU representation; a transparent
