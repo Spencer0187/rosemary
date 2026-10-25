@@ -85,11 +85,6 @@ pub(crate) struct Drawable {
     pub gpu: &'static Gpu,
     pub texture: Id,
     pub layer: Id,
-    /// The buffer the frame is read back into, kept for the life of the
-    /// drawable. Making one per frame is a `vkCreateBuffer` and a range of the
-    /// heap for every frame, and the drawable's size never changes: a layer
-    /// which resizes vends a new drawable.
-    readback: Option<crate::gpu::GpuBuffer>,
 }
 
 /// Three drawable images let the guest record ahead without ever writing an
@@ -349,7 +344,6 @@ fn make_drawable(
             gpu,
             texture,
             layer: objc::arc::retain(layer),
-            readback: None,
         },
     );
     if drawable.is_null() {
@@ -468,9 +462,6 @@ unsafe extern "C" fn drawable_present(receiver: Id, _sel: Sel) {
 unsafe extern "C" fn drawable_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a drawable of this crate's.
     let drawable = unsafe { object::body::<Drawable>(receiver) };
-    if let Some(readback) = drawable.readback.take() {
-        drawable.gpu.destroy_buffer(readback);
-    }
     // The texture owns the drawable's image, and destroys it in its own
     // `dealloc`.
     objc::arc::release(std::mem::replace(
@@ -1099,6 +1090,106 @@ fn present_readback(drawable: Id) {
     crate::stats::tick();
 }
 
+// The immediate submission must keep BOTH the mapped target and the
+// drawable's texture alive when a successful submit has an uncertain wait.
+// The old drawable-local reused target could be destroyed/reused early.
+struct ReadbackOwner {
+    gpu: &'static Gpu,
+    buffer: Option<crate::gpu::GpuBuffer>,
+    texture: usize,
+}
+
+impl Drop for ReadbackOwner {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.gpu.destroy_buffer(buffer);
+        }
+        objc::arc::release(self.texture as Id);
+    }
+}
+
+fn submit_owned_readback(
+    gpu: &'static Gpu,
+    texture_id: Id,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+) -> Result<std::sync::Arc<std::sync::Mutex<ReadbackOwner>>, String> {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+
+    let staging = match gpu.create_buffer(bytes) {
+        Ok(buffer) => buffer,
+        Err(reason) => return Err(format!("presentation staging failed: {reason}")),
+    };
+    // This strong owner survives drawable completion/teardown until the GPU
+    // actually signals its readback fence; it never reuses uncertain storage.
+    let staging = std::sync::Arc::new(std::sync::Mutex::new(ReadbackOwner {
+        gpu,
+        buffer: Some(staging),
+        texture: objc::arc::retain(texture_id) as usize,
+    }));
+    #[cfg(test)]
+    {
+        *LAST_READBACK_OWNER.lock().unwrap() = Some(std::sync::Arc::downgrade(&staging));
+    }
+    let copy = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(width)
+        .buffer_image_height(height)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        });
+    gpu.one_shot_owned(
+        std::sync::Arc::clone(&staging),
+        |device, command_buffer, staging| {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: recording into a command buffer the call owns; the image
+            // is in GENERAL layout from creation.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    staging.lock().unwrap().buffer.as_ref().unwrap().buffer,
+                    &[copy],
+                )
+            };
+        },
+    )?;
+    Ok(staging)
+}
+
 fn present_inner(drawable: Id) {
     if drawable.is_null() || !object::is_kind(drawable, c"RosemaryCAMetalDrawable") {
         return;
@@ -1132,90 +1223,36 @@ fn present_inner(drawable: Id) {
     let width = texture.image.width;
     let height = texture.image.height;
     let bytes = u64::from(width) * u64::from(height) * 4;
-
-    if described.readback.is_none() {
-        match gpu.create_buffer(bytes) {
-            Ok(staging) => described.readback = Some(staging),
-            Err(reason) => return gpu::trace(format!("presentation staging failed: {reason}")),
-        }
-    }
-    let staging = described.readback.as_ref().expect("just made");
-    let copy = vk::BufferImageCopy::default()
-        .buffer_offset(0)
-        .buffer_row_length(width)
-        .buffer_image_height(height)
-        .image_subresource(vk::ImageSubresourceLayers {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            mip_level: 0,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .image_extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        });
-    let image = texture.image.image;
     let result = crate::stats::timed(crate::stats::Counter::ReadbackMicros, || {
-        gpu.one_shot(|device, command_buffer| {
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            // SAFETY: recording into a command buffer the call owns; the image
-            // is in GENERAL layout from creation.
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-                device.cmd_copy_image_to_buffer(
-                    command_buffer,
-                    image,
-                    vk::ImageLayout::GENERAL,
-                    staging.buffer,
-                    &[copy],
+        submit_owned_readback(gpu, described.texture, texture.image.image, width, height)
+    });
+    match result {
+        Err(reason) => gpu::trace(format!("presentation readback failed: {reason}")),
+        Ok(staging) => {
+            // SAFETY: the readback completed and the staging buffer is mapped over
+            // the whole allocation.
+            let pixels = unsafe {
+                std::slice::from_raw_parts(
+                    staging.lock().unwrap().buffer.as_ref().unwrap().contents,
+                    bytes as usize,
                 )
             };
-        })
-    });
-    if let Err(reason) = result {
-        gpu::trace(format!("presentation readback failed: {reason}"));
-    } else {
-        // SAFETY: the readback completed and the staging buffer is mapped over
-        // the whole allocation.
-        let pixels = unsafe { std::slice::from_raw_parts(staging.contents, bytes as usize) };
-        gpu::milestone("presented frame");
-        crate::stats::frame();
-        dump_frame(pixels, width, height, texture.image.format);
-        if let Some(window) = window {
-            if let Some(properties) = sdl3::video::presentation_window(window) {
-                enqueue_completed_readback(ReadbackFrame {
-                    window: window as usize,
-                    window_id: properties.id,
-                    layer: described.layer as usize,
-                    pixels: pixels.to_vec(),
-                    width,
-                    height,
-                    format: texture.image.format,
-                    placement,
-                });
+            gpu::milestone("presented frame");
+            crate::stats::frame();
+            dump_frame(pixels, width, height, texture.image.format);
+            if let Some(window) = window {
+                if let Some(properties) = sdl3::video::presentation_window(window) {
+                    enqueue_completed_readback(ReadbackFrame {
+                        window: window as usize,
+                        window_id: properties.id,
+                        layer: described.layer as usize,
+                        pixels: pixels.to_vec(),
+                        width,
+                        height,
+                        format: texture.image.format,
+                        placement,
+                    });
+                }
             }
         }
     }
@@ -1599,15 +1636,30 @@ fn reserve_backing_source(
     Ok(true)
 }
 
+// A backing upload may outlive its StoreImage when a fence wait fails. The
+// buffer AND its charged allocation retire together only after completion.
+struct StoreStaging {
+    gpu: &'static Gpu,
+    buffer: Option<gpu::GpuBuffer>,
+    _charge: Option<crate::swapchain::GpuCharge>,
+}
+
+impl Drop for StoreStaging {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.gpu.destroy_buffer(buffer);
+        }
+    }
+}
+
 /// A window's CPU-drawn contents on the device: see [`present_store`].
 struct StoreImage {
     gpu: &'static Gpu,
     account_window: Option<usize>,
-    _staging_charge: Option<crate::swapchain::GpuCharge>,
     image: std::sync::Arc<crate::swapchain::BackingImageLease>,
     /// Recycle images only after every WSI copy and idle snapshot releases them.
     spare: Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
-    staging: gpu::GpuBuffer,
+    staging: Option<std::sync::Arc<std::sync::Mutex<StoreStaging>>>,
     /// The store with dma-buf overlays blended over it, made the first time
     /// the window has any.
     blended: Option<std::sync::Arc<crate::swapchain::BackingImageLease>>,
@@ -1667,7 +1719,6 @@ impl StoreImage {
 
     /// Every presentation that could name one of its images has finished.
     fn destroy(self) {
-        self.gpu.destroy_buffer(self.staging);
         // All regular and blended sources have ref-counted GPU lifetimes;
         // the WSI worker may still be reading one when this store retires.
     }
@@ -1717,10 +1768,13 @@ fn real_4k_backing_and_overlay_pools_respect_combined_budget() {
     let mut store = StoreImage {
         gpu,
         account_window: None,
-        _staging_charge: None,
         image,
         spare: Vec::new(),
-        staging,
+        staging: Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+            gpu,
+            buffer: Some(staging),
+            _charge: None,
+        }))),
         blended: None,
         blended_spare: Vec::new(),
     };
@@ -1809,10 +1863,13 @@ fn backing_upload_source_pool_is_bounded_and_reuses_released_images() {
     let mut store = StoreImage {
         gpu,
         account_window: None,
-        _staging_charge: None,
         image: first,
         spare: Vec::new(),
-        staging,
+        staging: Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+            gpu,
+            buffer: Some(staging),
+            _charge: None,
+        }))),
         blended: None,
         blended_spare: Vec::new(),
     };
@@ -2474,10 +2531,13 @@ pub(crate) fn present_store_synchronous(
             StoreImage {
                 gpu,
                 account_window: Some(window as usize),
-                _staging_charge: Some(staging_charge),
                 image,
                 spare: Vec::new(),
-                staging,
+                staging: Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+                    gpu,
+                    buffer: Some(staging),
+                    _charge: Some(staging_charge),
+                }))),
                 blended: None,
                 blended_spare: Vec::new(),
             },
@@ -2515,11 +2575,40 @@ pub(crate) fn present_store_synchronous(
             }
         }
     };
-    // SAFETY: the staging buffer is mapped over the store's whole length.
+    if entry.staging.is_none() {
+        // An uncertain prior upload cannot reuse its host mapping. Allocate
+        // a new, separately charged buffer only after the old one retires or
+        // when the physical window ledger can admit another in-flight copy.
+        let charge = match crate::swapchain::GpuCharge::reserve(
+            window as usize,
+            store.pixels.len() as u64,
+        ) {
+            Ok(charge) => charge,
+            Err(reason) => {
+                gpu::trace(format!("retrying backing staging budget: {reason}"));
+                return store_failure_outcome(window);
+            }
+        };
+        let buffer = match gpu.create_buffer(store.pixels.len() as u64) {
+            Ok(buffer) => buffer,
+            Err(reason) => {
+                gpu::trace(format!("retrying backing staging allocation: {reason}"));
+                return store_failure_outcome(window);
+            }
+        };
+        entry.staging = Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+            gpu,
+            buffer: Some(buffer),
+            _charge: Some(charge),
+        })));
+    }
+    let staging = std::sync::Arc::clone(entry.staging.as_ref().unwrap());
+    // SAFETY: this buffer is not concurrently submitted: only successful
+    // uploads are reusable, and the per-window StoreImage is held exclusively.
     unsafe {
         std::ptr::copy_nonoverlapping(
             store.pixels.as_ptr(),
-            entry.staging.contents,
+            staging.lock().unwrap().buffer.as_ref().unwrap().contents,
             store.pixels.len(),
         )
     };
@@ -2535,23 +2624,31 @@ pub(crate) fn present_store_synchronous(
             height: store.height,
             depth: 1,
         });
-    let (buffer, image) = (entry.staging.buffer, entry.image.image.image);
+    let image = entry.image.image.image;
     #[cfg(test)]
     TEST_STORE_UPLOAD_SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let uploaded = entry.gpu.one_shot(|device, command_buffer| {
-        // SAFETY: recording into a command buffer the call owns; the image is
-        // in GENERAL layout from creation.
-        unsafe {
-            device.cmd_copy_buffer_to_image(
-                command_buffer,
-                buffer,
-                image,
-                vk::ImageLayout::GENERAL,
-                &[copy],
-            )
-        };
-    });
+    let uploaded = entry.gpu.one_shot_owned(
+        (staging, std::sync::Arc::clone(&entry.image)),
+        |device, command_buffer, resources| {
+            let buffer = resources.0.lock().unwrap().buffer.as_ref().unwrap().buffer;
+            // SAFETY: recording into a command buffer the call owns; the image is
+            // in GENERAL layout from creation.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    buffer,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &[copy],
+                )
+            };
+        },
+    );
     if let Err(reason) = uploaded {
+        // This submission may have reached the queue. Drop the reusable
+        // pointer to the old staging buffer; the fence owns its remaining
+        // allocation and charge until completion is positively established.
+        entry.staging = None;
         gpu::trace(format!("window store upload failed: {reason}"));
         return store_failure_outcome(window);
     }
@@ -3272,4 +3369,78 @@ fn window_teardown_between_readback_identity_lookup_and_publish_never_queues_sta
     assert_eq!(sdl3::video::presentation_window(direct), None);
     flush_readbacks();
     assert!(READBACKS.lock().unwrap().is_empty());
+}
+
+#[cfg(test)]
+static LAST_READBACK_OWNER: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::sync::Weak<std::sync::Mutex<ReadbackOwner>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn failed_readback_fence_wait_retains_texture_and_buffer_past_drawable_release() {
+    if crate::swapchain::isolate_vulkan_graphical_test(
+        "present::failed_readback_fence_wait_retains_texture_and_buffer_past_drawable_release",
+    ) {
+        return;
+    }
+    crate::bootstrap();
+    let Some(gpu) = crate::vulkan::adapters()
+        .ok()
+        .and_then(|adapters| adapters.first().and_then(|adapter| adapter.gpu().ok()))
+    else {
+        return;
+    };
+    let image = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 16,
+            height: 16,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    let image_handle = image.image;
+    let texture = crate::resource::drawable_texture(gpu, image, 80);
+    assert!(!texture.is_null());
+    gpu.inject_immediate_wait_failure_for_test();
+    let error = submit_owned_readback(gpu, texture, image_handle, 16, 16)
+        .err()
+        .expect("injected post-submit failed wait");
+    assert!(error.contains("injected immediate fence wait error"));
+    // The outer drawable can release its texture at this point. The GPU
+    // command's strong readback owner still keeps both image and buffer.
+    objc::arc::release(texture);
+    let weak = LAST_READBACK_OWNER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let owned = weak
+        .upgrade()
+        .expect("submitted readback was freed before the GPU fence");
+    let first_buffer = owned.lock().unwrap().buffer.as_ref().unwrap().buffer;
+    assert_ne!(first_buffer, vk::Buffer::null());
+    // The next readback allocation cannot recycle a buffer still owned by
+    // an uncertain GPU submission, even after the drawable was released.
+    let next = gpu.create_buffer(16 * 16 * 4).unwrap();
+    assert_ne!(next.buffer, first_buffer);
+    gpu.destroy_buffer(next);
+    drop(owned);
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 1);
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert!(
+        weak.upgrade().is_none(),
+        "readback owner not retired after actual completion"
+    );
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
 }
