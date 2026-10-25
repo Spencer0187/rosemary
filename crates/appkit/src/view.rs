@@ -111,6 +111,7 @@ pub struct MetalSceneLayer {
     /// Independent CPU-backed native content stacked above a Metal layer.
     /// None for actual CAMetalLayers. The GPU worker uploads immutable bytes.
     pub native_pixels: Option<std::sync::Arc<Vec<u8>>>,
+    pub native_cpu_capture: Option<crate::backing::NativeCpuCapture>,
     pub native_dmabuf: Option<std::sync::Arc<crate::backing::Dmabuf>>,
     pub native_revision: u64,
     /// Full native frame and origin of this tile in the DMA source's scaled
@@ -691,6 +692,7 @@ fn visit_metal_scene(
                     rounded: rounded.clone(),
                     occluded: Vec::new(),
                     native_pixels: None,
+                    native_cpu_capture: None,
                     native_dmabuf: None,
                     native_revision: 0,
                     native_dma_sample: None,
@@ -758,9 +760,14 @@ fn visit_metal_scene(
                             && part.width == frame.width
                             && part.height == frame.height
                         {
-                            crate::backing::native_scene_pixels(view, frame.width, frame.height)
+                            crate::backing::native_scene_pixels_cropped_with_damage(
+                                view,
+                                frame.width,
+                                frame.height,
+                                cropped,
+                            )
                         } else {
-                            crate::backing::native_scene_pixels_cropped(
+                            crate::backing::native_scene_pixels_cropped_with_damage(
                                 view,
                                 frame.width,
                                 frame.height,
@@ -781,7 +788,7 @@ fn visit_metal_scene(
                             // Moving a large static DMA view can keep the
                             // visible output frame unchanged while changing
                             // which producer texels are sampled.
-                            let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
+                            let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
                                 ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
                                 ^ sample.map_or(0, |(w, h, x, y)| {
                                     (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
@@ -796,7 +803,13 @@ fn visit_metal_scene(
                                 clip: ca_clip,
                                 rounded: rounded.clone(),
                                 occluded: Vec::new(),
-                                native_pixels: cpu.map(|(pixels, _)| pixels),
+                                native_cpu_capture: cpu.as_ref().map(|(_, rev, damage)| {
+                                    crate::backing::NativeCpuCapture {
+                                        revision: *rev,
+                                        damage: *damage,
+                                    }
+                                }),
+                                native_pixels: cpu.map(|(pixels, _, _)| pixels),
                                 native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
                                 native_dma_sample: sample,
                                 native_revision: revision,
@@ -5241,6 +5254,7 @@ mod tests {
             rounded: vec![],
             occluded: vec![],
             native_pixels: None,
+            native_cpu_capture: None,
             native_dmabuf: Some(std::sync::Arc::new(crate::backing::Dmabuf {
                 width: 6016,
                 height: 3384,

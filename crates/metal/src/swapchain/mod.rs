@@ -134,6 +134,7 @@ const FRAMES_IN_FLIGHT: usize = 8;
 struct NativeCpuBaseCache {
     id: usize,
     source: std::sync::Weak<Vec<u8>>,
+    cpu_revision: Option<u64>,
     image: Arc<BackingImageLease>,
 }
 
@@ -543,6 +544,7 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
                 layer.native_revision,
                 layer.frame.width,
                 layer.frame.height,
+                layer.native_cpu_capture,
                 layer.native_dma_sample,
             ),
         })
@@ -1545,6 +1547,7 @@ fn present_impl(
                     item.native_revision,
                     item.frame.width,
                     item.frame.height,
+                    item.native_cpu_capture,
                     item.native_dma_sample,
                 ),
             })
@@ -1894,6 +1897,7 @@ fn native_scene_source(
     revision: u64,
     width: u32,
     height: u32,
+    cpu_capture: Option<appkit::backing::NativeCpuCapture>,
     dma_sample: Option<(u32, u32, u32, u32)>,
 ) -> Option<scene::NativeCpuSceneSource> {
     let supported = if pixels.is_some() {
@@ -1927,6 +1931,7 @@ fn native_scene_source(
     Some(scene::NativeCpuSceneSource {
         bytes: pixels,
         revision,
+        cpu_capture,
         dmabuf,
         dma_sample: dma_sample.map(
             |(full_width, full_height, crop_x, crop_y)| scene::DmaSample {
@@ -2188,22 +2193,45 @@ fn native_image_matches_placement(image: &scene::SceneLayer, proposed: &ScenePla
         && image.snapshot.image.height == proposed.frame.height
 }
 
-// Only an identical immutable pixel allocation and matching image geometry
-// may reuse the CPU base; DMA content is *never* reused by this lookup.
+// The producer attests to each changed rectangle relative to an exact CPU
+// capture identity. No arbitrary changed Arc is accepted as dirty evidence.
 fn cached_native_cpu_base<'a>(
     state: &'a Swapchain,
     layer: &ScenePlacement,
-) -> Option<&'a NativeCpuBaseCache> {
+) -> Option<(&'a NativeCpuBaseCache, Option<appkit::backing::Rect>)> {
     let native = layer.native.as_ref()?;
     if native.dmabuf.is_none() || native.bytes.is_empty() {
         return None;
     }
-    state.native_cpu_bases.iter().find(|base| {
+    let base = state.native_cpu_bases.iter().find(|base| {
         base.id == layer.id
             && base.image.image.width == layer.frame.width
             && base.image.image.height == layer.frame.height
-            && base.source.ptr_eq(&Arc::downgrade(&native.bytes))
-    })
+    })?;
+    if base.source.ptr_eq(&Arc::downgrade(&native.bytes)) {
+        return Some((base, None));
+    }
+    let capture = native.cpu_capture?;
+    let proof = capture.damage?;
+    if base.cpu_revision != Some(proof.from_revision) || Arc::strong_count(&base.image) != 1 {
+        return None;
+    }
+    let rect = proof.rect;
+    if rect.x < 0
+        || rect.y < 0
+        || rect.width <= 0
+        || rect.height <= 0
+        || rect.x.checked_add(rect.width)? > i64::from(layer.frame.width)
+        || rect.y.checked_add(rect.height)? > i64::from(layer.frame.height)
+    {
+        return None;
+    }
+    let rect_bytes = (rect.width as u64)
+        .checked_mul(rect.height as u64)?
+        .checked_mul(4)?;
+    // Large regions use the original independent image path. Never assume a
+    // partial transfer is cheaper or trade scene lifetime for an upload.
+    (rect_bytes < native.bytes.len() as u64 / 2).then_some((base, Some(rect)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2285,39 +2313,44 @@ fn stage_native_scene_source_effective(
         .saturating_mul(4);
     // Distinct published native revisions may share the same immutable CPU
     // base, but pointer identity never substitutes for revision admission.
+    // A producer may retire its old Arc after capturing new pixels. The
+    // exact CPU capture revision still authenticates its retained GPU base.
     state
         .native_cpu_bases
-        .retain(|item| item.source.strong_count() > 0);
+        .retain(|item| item.source.strong_count() > 0 || item.cpu_revision.is_some());
+    let mut patch = cached_native_cpu_base(state, layer).and_then(|(_, rect)| rect);
     let mut reuse_base = cached_native_cpu_base(state, layer).is_some();
     // One retained native source (the completed CPU base or DMA blend
     // result), one optional DMA output and one optional full CPU upload.
     // No second retained-scene blit allocation is necessary.
     let full_scratch_count =
         1 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty());
-    let mut scratch_count = if reuse_base { 1 } else { full_scratch_count };
-    if !scene::fits_scene_budget(
-        state.budgeted_scene_bytes(),
-        image_bytes.saturating_mul(scratch_count),
-    ) {
+    let full_scratch_bytes = image_bytes.saturating_mul(full_scratch_count);
+    let mut scratch_bytes = if reuse_base {
+        image_bytes.saturating_add(patch.map_or(0, |rect| {
+            u64::try_from(rect.width)
+                .unwrap_or(0)
+                .saturating_mul(u64::try_from(rect.height).unwrap_or(0))
+                .saturating_mul(4)
+        }))
+    } else {
+        full_scratch_bytes
+    };
+    if !scene::fits_scene_budget(state.budgeted_scene_bytes(), scratch_bytes) {
         // Optional bases are freed alongside other spares. Re-evaluate
         // admission against the full upload requirement before allocating:
         // otherwise a missing base could be used as uninitialized pixels.
         state.shed_scene_spares();
         reuse_base = false;
-        scratch_count = full_scratch_count;
-        if !scene::fits_scene_budget(
-            state.budgeted_scene_bytes(),
-            image_bytes.saturating_mul(scratch_count),
-        ) {
+        patch = None;
+        scratch_bytes = full_scratch_bytes;
+        if !scene::fits_scene_budget(state.budgeted_scene_bytes(), scratch_bytes) {
             // Fence-held retired leases may clear shortly. A committed
             // snapshot and its accumulator cannot disappear without new
             // scene membership. Distinguish those cases so a permanently
             // impossible native revision never spins the GPU presentation
             // worker in a 10-ms retry loop.
-            if scene::fits_scene_budget(
-                state.projected_committed_scene_bytes(),
-                image_bytes.saturating_mul(scratch_count),
-            ) {
+            if scene::fits_scene_budget(state.projected_committed_scene_bytes(), scratch_bytes) {
                 return Ok(None);
             }
             // Only a committed, non-evictable footprint is a hard failure.
@@ -2329,25 +2362,20 @@ fn stage_native_scene_source_effective(
     // Unlike an impossible committed-scene footprint, transient backing
     // and fence-retained window allocations may retire without a scene edit.
     // Defer these without allocating or permanently rejecting this revision.
-    if !window_gpu_capacity_available(
-        frame.window as usize,
-        image_bytes.saturating_mul(scratch_count),
-    ) {
+    if !window_gpu_capacity_available(frame.window as usize, scratch_bytes) {
         // A cached CPU base is optional. Shed it (and every other cache
         // entry) before declaring the physical window ledger exhausted.
         state.native_cpu_bases.clear();
         reuse_base = false;
-        scratch_count = full_scratch_count;
+        patch = None;
+        scratch_bytes = full_scratch_bytes;
     }
-    if !window_gpu_capacity_available(
-        frame.window as usize,
-        image_bytes.saturating_mul(scratch_count),
-    ) {
+    if !window_gpu_capacity_available(frame.window as usize, scratch_bytes) {
         // Fence-held allocations may disappear on retry. Rollback-pinned
         // *committed* images cannot: they need a different atomic transition
         // strategy, not a perpetual 10-ms poll. Do not disable DMA importing.
         if state.atomic_transition_gpu_floor()
-            > WINDOW_GPU_PAYLOAD_BUDGET.saturating_sub(image_bytes.saturating_mul(scratch_count))
+            > WINDOW_GPU_PAYLOAD_BUDGET.saturating_sub(scratch_bytes)
         {
             return Err("native AppKit atomic GPU transition peak exhausted".into());
         }
@@ -2356,13 +2384,23 @@ fn stage_native_scene_source_effective(
     #[cfg(test)]
     NATIVE_IMAGE_UPLOAD_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let gpu = state.gpu;
-    let reused_image = reuse_base.then(|| {
-        Arc::clone(
+    let reused_image = if reuse_base {
+        let image = Arc::clone(
             &cached_native_cpu_base(state, layer)
                 .expect("base lease was validated before staging")
+                .0
                 .image,
-        )
-    });
+        );
+        if patch.is_some() {
+            // A failed GPU wait makes the patched pixels uncertain. Drop the
+            // cache authority before submission; rollback owns an independent
+            // last-admitted DMA-blended scene image.
+            state.native_cpu_bases.retain(|base| base.id != layer.id);
+        }
+        Some(image)
+    } else {
+        None
+    };
     let lease = if let Some(image) = reused_image {
         image
     } else {
@@ -2475,24 +2513,49 @@ fn stage_native_scene_source_effective(
             },
         }];
         let mut staging_charge = None;
-        let staging = if native.bytes.is_empty() || reuse_base {
+        let upload_bytes = if let Some(rect) = patch {
+            (rect.width * rect.height * 4) as u64
+        } else if reuse_base {
+            0
+        } else {
+            native.bytes.len() as u64
+        };
+        let staging = if upload_bytes == 0 {
             None
         } else {
-            staging_charge = Some(GpuCharge::reserve(
-                frame.window as usize,
-                native.bytes.len() as u64,
-            )?);
-            let staging = gpu.create_staging_buffer(native.bytes.len() as u64)?;
+            staging_charge = Some(GpuCharge::reserve(frame.window as usize, upload_bytes)?);
+            let staging = gpu.create_staging_buffer(upload_bytes)?;
             unsafe {
-                std::ptr::copy_nonoverlapping(
-                    native.bytes.as_ptr(),
-                    staging.contents,
-                    native.bytes.len(),
-                );
+                if let Some(rect) = patch {
+                    let dst_stride = rect.width as usize * 4;
+                    let src_stride = frame.width as usize * 4;
+                    for row in 0..rect.height as usize {
+                        let src = (rect.y as usize + row) * src_stride + rect.x as usize * 4;
+                        std::ptr::copy_nonoverlapping(
+                            native.bytes.as_ptr().add(src),
+                            staging.contents.add(row * dst_stride),
+                            dst_stride,
+                        );
+                    }
+                } else {
+                    std::ptr::copy_nonoverlapping(
+                        native.bytes.as_ptr(),
+                        staging.contents,
+                        native.bytes.len(),
+                    );
+                }
             }
             Some(staging)
         };
-        let init = if reuse_base {
+        let init = if let Some(rect) = patch {
+            Some(crate::overlay::StoreInit::UploadRegion {
+                buffer: staging.as_ref().unwrap().buffer,
+                x: rect.x as u32,
+                y: rect.y as u32,
+                width: rect.width as u32,
+                height: rect.height as u32,
+            })
+        } else if reuse_base {
             None
         } else {
             Some(
@@ -2538,7 +2601,16 @@ fn stage_native_scene_source_effective(
     // Cache only when a new immutable base was actually uploaded and its
     // retained charge fits the scene budget. Existing native revisions may
     // share this GPU base but never share their DMA-blended result.
-    if native.dmabuf.is_some() && !native.bytes.is_empty() && !reuse_base {
+    if native.dmabuf.is_some() && !native.bytes.is_empty() && reuse_base && patch.is_none() {
+        if let Some(cached) = state
+            .native_cpu_bases
+            .iter_mut()
+            .find(|base| base.id == layer.id)
+        {
+            cached.cpu_revision = native.cpu_capture.map(|c| c.revision);
+        }
+    }
+    if native.dmabuf.is_some() && !native.bytes.is_empty() && (!reuse_base || patch.is_some()) {
         state.native_cpu_bases.retain(|old| old.id != layer.id);
         const MAX_CPU_BASE_CACHE: u64 = 128 * 1024 * 1024;
         let existing: u64 = state
@@ -2564,6 +2636,7 @@ fn stage_native_scene_source_effective(
             state.native_cpu_bases.push(NativeCpuBaseCache {
                 id: layer.id,
                 source: Arc::downgrade(&native.bytes),
+                cpu_revision: native.cpu_capture.map(|c| c.revision),
                 image: Arc::clone(&lease),
             });
         }

@@ -726,6 +726,7 @@ pub(super) struct DmaSample {
 pub(super) struct NativeCpuSceneSource {
     pub bytes: Arc<Vec<u8>>,
     pub revision: u64,
+    pub cpu_capture: Option<appkit::backing::NativeCpuCapture>,
     pub dmabuf: Option<Arc<appkit::backing::Dmabuf>>,
     pub dma_sample: Option<DmaSample>,
 }
@@ -905,6 +906,7 @@ impl Swapchain {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(NativeCpuSceneSource {
+                cpu_capture: None,
                 bytes: Arc::new(Vec::new()),
                 revision: 1,
                 dmabuf: None,

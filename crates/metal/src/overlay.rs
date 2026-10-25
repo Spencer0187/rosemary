@@ -557,6 +557,13 @@ pub(crate) fn target_description(width: u32, height: u32) -> ImageDescription {
 pub(crate) enum StoreInit {
     Transparent,
     Upload(vk::Buffer),
+    UploadRegion {
+        buffer: vk::Buffer,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    },
 }
 
 /// Copy a retained source into a target and blend DMA overlays in order.
@@ -646,6 +653,35 @@ pub(crate) fn blend_with_store_init_owned<'a, R: Send + 'static>(
                                 base_array_layer: 0,
                                 layer_count: 1,
                             }],
+                        ),
+                        StoreInit::UploadRegion {
+                            buffer,
+                            x,
+                            y,
+                            width,
+                            height,
+                        } => device.cmd_copy_buffer_to_image(
+                            command_buffer,
+                            buffer,
+                            store.image,
+                            vk::ImageLayout::GENERAL,
+                            &[vk::BufferImageCopy::default()
+                                .image_subresource(vk::ImageSubresourceLayers {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    mip_level: 0,
+                                    base_array_layer: 0,
+                                    layer_count: 1,
+                                })
+                                .image_offset(vk::Offset3D {
+                                    x: x as i32,
+                                    y: y as i32,
+                                    z: 0,
+                                })
+                                .image_extent(vk::Extent3D {
+                                    width,
+                                    height,
+                                    depth: 1,
+                                })],
                         ),
                         StoreInit::Upload(buffer) => device.cmd_copy_buffer_to_image(
                             command_buffer,

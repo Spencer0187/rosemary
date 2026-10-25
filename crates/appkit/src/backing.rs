@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -19,6 +19,8 @@ pub struct Store {
     /// Bumped by every change to what the store shows, so that a presenter
     /// can tell whether a copy it took is still current without comparing it.
     generation: u64,
+    // Bounded producer-authored changes. Missing generations mean full damage.
+    changes: VecDeque<(u64, Rect)>,
     /// 0 = unclassified, 1 = contains transparent pixels, 2 = fully opaque.
     /// Invalidated by every Store::touch and Store::resize. Atomic so immutable
     /// window snapshots remain shareable with the Vulkan worker.
@@ -39,6 +41,7 @@ impl Store {
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
+            changes: VecDeque::new(),
             alpha_class: AtomicU8::new(0),
         }
     }
@@ -49,9 +52,56 @@ impl Store {
 
     /// What the store shows changed, and has to be presented again.
     fn touch(&mut self) {
+        self.touch_region(Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(self.width),
+            height: i64::from(self.height),
+        });
+    }
+
+    fn touch_region(&mut self, area: Rect) {
+        const MAX_GENERATIONS: usize = 32;
         self.alpha_class.store(0, Ordering::Relaxed);
         self.dirty = true;
-        self.generation = self.generation.wrapping_add(1);
+        let next = self.generation.wrapping_add(1);
+        if next <= self.generation {
+            self.changes.clear();
+        }
+        self.generation = next;
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(self.width),
+            height: i64::from(self.height),
+        };
+        self.changes.push_back((next, area.intersection(&whole)));
+        if self.changes.len() > MAX_GENERATIONS {
+            self.changes.pop_front();
+        }
+    }
+
+    /// Only consecutive producer-verified versions may authorize partial work.
+    /// A missing generation, replaced Store, or wraparound fails closed.
+    fn damage_since(&self, generation: u64) -> Option<Rect> {
+        if generation >= self.generation {
+            return None;
+        }
+        let mut expected = generation.checked_add(1)?;
+        let mut union = None;
+        for &(at, rect) in &self.changes {
+            if at < expected {
+                continue;
+            }
+            if at != expected {
+                return None;
+            }
+            union = Some(union.map_or(rect, |prev: Rect| prev.union(&rect)));
+            expected = expected.checked_add(1)?;
+        }
+        (expected == self.generation.checked_add(1)?)
+            .then_some(union?)
+            .filter(|rect| !rect.is_empty())
     }
 
     fn fully_opaque(&self) -> bool {
@@ -92,6 +142,7 @@ impl Store {
             pixels,
             dirty: true,
             generation: self.generation.wrapping_add(1),
+            changes: VecDeque::new(),
             alpha_class: AtomicU8::new(0),
         };
     }
@@ -214,6 +265,19 @@ static VIEW_STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
 /// the view's window placement, opacity, corner mask or ancestor geometry.
 /// Only the AppKit owner thread accesses these entries. The GPU worker gets
 /// an Arc snapshot and never follows an Objective-C view pointer.
+/// Exact producer damage from one captured CPU image to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCpuDamage {
+    pub from_revision: u64,
+    pub rect: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCpuCapture {
+    pub revision: u64,
+    pub damage: Option<NativeCpuDamage>,
+}
+
 struct NativeCapture {
     layer: usize,
     width: u32,
@@ -224,8 +288,10 @@ struct NativeCapture {
     overlay_generation: u64,
     ca_content_revision: u64,
     ca_descendant_revision: u64,
+    plain_store: bool,
     pixels: std::sync::Arc<Vec<u8>>,
     revision: u64,
+    damage: Option<NativeCpuDamage>,
 }
 type CaptureKey = (usize, i64, i64, u32, u32);
 const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
@@ -588,13 +654,14 @@ pub(crate) fn paint_coverage(left: i64, top: i64, width: usize, coverage: &[f32]
                 }
             }
         }
-        store.touch();
-        Rect {
+        let changed = Rect {
             x: x0,
             y: y0,
             width: x1 - x0,
             height: y1 - y0,
-        }
+        };
+        store.touch_region(changed);
+        changed
     };
     if focus.offscreen {
         return;
@@ -712,8 +779,8 @@ pub(crate) fn draw_focused(draw: impl FnOnce(&mut [u8], u32, u32) -> Option<Rect
             .or_insert_with(|| Store::new(width, height));
         store.resize(width, height);
         let drawn = draw(&mut store.pixels, store.width, store.height);
-        if drawn.is_some_and(|r| !r.is_empty()) {
-            store.touch();
+        if let Some(area) = drawn.filter(|r| !r.is_empty()) {
+            store.touch_region(area);
         }
         drawn
     };
@@ -832,13 +899,14 @@ fn draw_into(
             }
         }
     }
-    store.touch();
-    Rect {
+    let changed = Rect {
         x: x0,
         y: y0,
         width: x1 - x0,
         height: y1 - y0,
-    }
+    };
+    store.touch_region(changed);
+    changed
 }
 
 /// Mark a view for `-drawRect:` at the next pump.
@@ -1445,6 +1513,7 @@ pub fn native_scene_dma_extent_supported(width: u32, height: u32) -> bool {
             .is_some_and(|bytes| bytes > 0 && bytes <= 256 * 1024 * 1024)
 }
 
+#[cfg(test)]
 pub(crate) fn native_scene_pixels(
     view: Id,
     width: u32,
@@ -1466,6 +1535,31 @@ pub(crate) fn native_scene_pixels(
 /// Rasterize only the visible window-pixel portion of a larger NSView. Keep
 /// the full logical source extent for CA and overlay coordinate projection;
 /// otherwise a clipped view's backing content gets scaled to its crop.
+pub(crate) fn native_scene_pixels_cropped_with_damage(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64, Option<NativeCpuDamage>)> {
+    let (pixels, revision) = native_scene_pixels_cropped(view, width, height, crop)?;
+    let key = (
+        view as usize,
+        crop.x,
+        crop.y,
+        crop.width as u32,
+        crop.height as u32,
+    );
+    let damage = NATIVE_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .filter(|capture| {
+            capture.revision == revision && std::sync::Arc::ptr_eq(&capture.pixels, &pixels)
+        })
+        .and_then(|capture| capture.damage);
+    Some((pixels, revision, damage))
+}
+
 pub fn native_scene_pixels_cropped(
     view: Id,
     width: u32,
@@ -1533,6 +1627,39 @@ pub fn native_scene_pixels_cropped(
     {
         return Some((std::sync::Arc::clone(&hit.pixels), hit.revision));
     }
+    // CA animations, overlay content and sublayer rendering have their own
+    // invalidation paths: only a plain source store can assert narrow damage.
+    let plain_store = !content_animating
+        && overlay.is_none()
+        && !crate::coreanimation::has_tree(layer)
+        && source.is_some();
+    let damage = if plain_store && let Some(source) = source {
+        NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .and_then(|prior| {
+                (prior.plain_store
+                    && prior.layer == layer as usize
+                    && prior.ca_content_revision == ca_content_revision
+                    && prior.ca_descendant_revision == ca_descendant_revision
+                    && prior.overlay_generation == overlay_generation)
+                    .then_some(prior)?;
+                let region = source
+                    .damage_since(prior.view_generation?)?
+                    .intersection(&crop);
+                (!region.is_empty()).then_some(NativeCpuDamage {
+                    from_revision: prior.revision,
+                    rect: Rect {
+                        x: region.x - crop.x,
+                        y: region.y - crop.y,
+                        ..region
+                    },
+                })
+            })
+    } else {
+        None
+    };
     #[cfg(test)]
     NATIVE_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut output = Store::new(crop.width as u32, crop.height as u32);
@@ -1618,8 +1745,10 @@ pub fn native_scene_pixels_cropped(
                 overlay_generation,
                 ca_content_revision,
                 ca_descendant_revision,
+                plain_store,
                 pixels: std::sync::Arc::clone(&pixels),
                 revision,
+                damage,
             },
         );
         // Bound cached pixel payload across all views to 256 MiB, retaining
@@ -2843,6 +2972,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
             dirty: false,
             // An overlay that changes damages the store under it.
             generation: store.generation,
+            changes: VecDeque::new(),
             alpha_class: AtomicU8::new(0),
         });
         blend_overlay_clipped(
@@ -3289,6 +3419,145 @@ mod tests {
     use super::*;
 
     #[test]
+    fn store_producer_damage_requires_contiguous_versions_and_full_unknown_fallback() {
+        let mut store = Store::new(32, 16);
+        assert_eq!(store.damage_since(0), None);
+        store.touch_region(Rect {
+            x: 2,
+            y: 3,
+            width: 2,
+            height: 1,
+        });
+        store.touch_region(Rect {
+            x: 8,
+            y: 5,
+            width: 3,
+            height: 2,
+        });
+        assert_eq!(
+            store.damage_since(0),
+            Some(Rect {
+                x: 2,
+                y: 3,
+                width: 9,
+                height: 4
+            })
+        );
+        assert_eq!(
+            store.damage_since(1),
+            Some(Rect {
+                x: 8,
+                y: 5,
+                width: 3,
+                height: 2
+            })
+        );
+        store.touch();
+        assert_eq!(
+            store.damage_since(0),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 16
+            })
+        );
+        for _ in 0..34 {
+            store.touch_region(Rect {
+                x: 9,
+                y: 7,
+                width: 1,
+                height: 1,
+            });
+        }
+        assert_eq!(
+            store.damage_since(0),
+            None,
+            "missing generations must disable partial uploads"
+        );
+        assert_eq!(
+            store.damage_since(store.generation() - 1),
+            Some(Rect {
+                x: 9,
+                y: 7,
+                width: 1,
+                height: 1
+            })
+        );
+        let before = store.generation();
+        store.resize(64, 8);
+        assert_eq!(
+            store.damage_since(before),
+            None,
+            "resize invalidates previous extent authority"
+        );
+    }
+
+    #[test]
+    fn plain_view_capture_carries_exact_dirty_pixel_provenance() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(8, 6);
+        store.pixels = [255, 0, 0, 255].repeat(8 * 6);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        };
+        let first = native_scene_pixels_cropped_with_damage(view, 8, 6, crop).unwrap();
+        assert_eq!(first.2, None);
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            let at = (2 * 8 + 4) * 4;
+            store.pixels[at..at + 4].copy_from_slice(&[0, 255, 0, 255]);
+            store.touch_region(Rect {
+                x: 4,
+                y: 2,
+                width: 1,
+                height: 1,
+            });
+        }
+        let second = native_scene_pixels_cropped_with_damage(view, 8, 6, crop).unwrap();
+        assert_eq!(
+            second.2,
+            Some(NativeCpuDamage {
+                from_revision: first.1,
+                rect: Rect {
+                    x: 2,
+                    y: 1,
+                    width: 1,
+                    height: 1
+                },
+            })
+        );
+        assert_eq!(
+            &second.0[(1 * 4 + 2) * 4..(1 * 4 + 2) * 4 + 4],
+            &[0, 255, 0, 255]
+        );
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            store.pixels.fill(0);
+            store.touch();
+        }
+        let third = native_scene_pixels_cropped_with_damage(view, 8, 6, crop);
+        assert!(
+            third.is_none(),
+            "fully transparent source is not emitted as foreground"
+        );
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
     fn deferred_backing_store_survives_the_pump_while_another_window_progresses() {
         fn presenter(
             window: sdl3::Window,
@@ -3627,6 +3896,7 @@ mod tests {
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
+            changes: VecDeque::new(),
             alpha_class: AtomicU8::new(0),
         }
     }
