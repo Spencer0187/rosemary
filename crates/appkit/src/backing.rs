@@ -288,12 +288,13 @@ struct NativeCapture {
     overlay_generation: u64,
     ca_content_revision: u64,
     ca_descendant_revision: u64,
+    excluded_view_layers: u64,
     plain_store: bool,
     pixels: std::sync::Arc<Vec<u8>>,
     revision: u64,
     damage: Option<NativeCpuDamage>,
 }
-type CaptureKey = (usize, i64, i64, u32, u32);
+type CaptureKey = (usize, i64, i64, u32, u32, bool);
 const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1130,7 +1131,7 @@ pub(crate) fn forget(view: Id) {
     NATIVE_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|(owner, _, _, _, _), _| *owner != key);
+        .retain(|(owner, _, _, _, _, _), _| *owner != key);
     crate::view::forget_native_tile_ids(view);
     NEEDS_DISPLAY
         .lock()
@@ -1731,6 +1732,7 @@ pub(crate) fn native_scene_pixels_cropped_with_damage(
         crop.y,
         crop.width as u32,
         crop.height as u32,
+        false,
     );
     let damage = NATIVE_CAPTURES
         .lock()
@@ -1749,6 +1751,25 @@ pub fn native_scene_pixels_cropped(
     height: u32,
     crop: Rect,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_impl(view, width, height, crop, false)
+}
+
+pub(crate) fn metal_sublayers_pixels_cropped(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_impl(view, width, height, crop, true)
+}
+
+fn native_scene_pixels_impl(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+    metal_children: bool,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
     if crop.x < 0
         || crop.y < 0
         || crop.is_empty()
@@ -1764,16 +1785,29 @@ pub fn native_scene_pixels_cropped(
         crop.y,
         crop.width as u32,
         crop.height as u32,
+        metal_children,
     );
     let layer = crate::view::layer_of(view);
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     let source = views.as_ref().and_then(|all| all.get(&(view as usize)));
     let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
-    let overlay = overlays
-        .iter()
-        .find(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
-        .map(|(_, entry)| entry);
-    if source.is_none() && overlay.is_none() && !crate::coreanimation::has_tree(layer) {
+    let source = if metal_children { None } else { source };
+    let overlay = if metal_children {
+        None
+    } else {
+        overlays
+            .iter()
+            .find(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
+            .map(|(_, entry)| entry)
+    };
+    if metal_children
+        && (!crate::layer::is_metal(layer)
+            || !crate::coreanimation::has_renderable_sublayers(layer))
+        || (!metal_children
+            && source.is_none()
+            && overlay.is_none()
+            && !crate::coreanimation::has_tree(layer))
+    {
         NATIVE_CAPTURES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1789,6 +1823,14 @@ pub fn native_scene_pixels_cropped(
         .unwrap_or(0);
     let ca_content_revision = crate::coreanimation::native_scene_content_revision(layer);
     let ca_descendant_revision = crate::coreanimation::native_scene_descendant_revision(layer);
+    let excluded_view_layers = if metal_children {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        crate::view::descendant_view_layers(view).hash(&mut hash);
+        hash.finish()
+    } else {
+        0
+    };
     let content_animating =
         crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time());
     if !content_animating
@@ -1806,6 +1848,7 @@ pub fn native_scene_pixels_cropped(
                     && hit.overlay_generation == overlay_generation
                     && hit.ca_content_revision == ca_content_revision
                     && hit.ca_descendant_revision == ca_descendant_revision
+                    && hit.excluded_view_layers == excluded_view_layers
             })
     {
         return Some((std::sync::Arc::clone(&hit.pixels), hit.revision));
@@ -1887,14 +1930,16 @@ pub fn native_scene_pixels_cropped(
             height: i64::from(height),
         };
         use crate::coreanimation::{Pass, render_with_root_opacity};
-        render_with_root_opacity(
-            view,
-            &mut output,
-            logical,
-            whole,
-            Pass::Background,
-            Some(1.0),
-        );
+        if !metal_children {
+            render_with_root_opacity(
+                view,
+                &mut output,
+                logical,
+                whole,
+                Pass::Background,
+                Some(1.0),
+            );
+        }
         if let Some(source) = source {
             // CA/view opacity is applied by the retained scene, not a second time
             // during this isolated pixel capture.
@@ -1914,14 +1959,18 @@ pub fn native_scene_pixels_cropped(
                 whole,
             );
         }
-        render_with_root_opacity(
-            view,
-            &mut output,
-            logical,
-            whole,
-            Pass::Sublayers,
-            Some(1.0),
-        );
+        if metal_children {
+            crate::coreanimation::render_metal_sublayers(view, &mut output, logical, whole);
+        } else {
+            render_with_root_opacity(
+                view,
+                &mut output,
+                logical,
+                whole,
+                Pass::Sublayers,
+                Some(1.0),
+            );
+        }
         output
     };
     if output
@@ -1958,6 +2007,7 @@ pub fn native_scene_pixels_cropped(
                 overlay_generation,
                 ca_content_revision,
                 ca_descendant_revision,
+                excluded_view_layers,
                 plain_store,
                 pixels: std::sync::Arc::clone(&pixels),
                 revision,

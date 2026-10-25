@@ -127,6 +127,33 @@ static NATIVE_TILE_IDS: std::sync::LazyLock<Mutex<HashMap<(usize, u32), usize>>>
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static NATIVE_NEXT_TILE: AtomicUsize = AtomicUsize::new(1);
 
+pub(crate) fn descendant_view_layers(view: Id) -> Vec<usize> {
+    fn collect(view: Id, result: &mut Vec<usize>, depth: usize) {
+        if depth >= 64 || !is_view(view) {
+            return;
+        }
+        let children = view_of(view).subviews;
+        if let Some(children) =
+            unsafe { corefoundation::collections::array(children as *const c_void) }
+        {
+            for &child in &children.values {
+                let child = child as Id;
+                if !is_view(child) {
+                    continue;
+                }
+                let layer = view_of(child).layer;
+                if !layer.is_null() {
+                    result.push(layer as usize);
+                }
+                collect(child, result, depth + 1);
+            }
+        }
+    }
+    let mut result = Vec::new();
+    collect(view, &mut result, 0);
+    result
+}
+
 fn native_tile_id(view: Id, index: u32) -> usize {
     if index == 0 {
         return view as usize | (1usize << (usize::BITS - 1));
@@ -700,6 +727,75 @@ fn visit_metal_scene(
                 });
                 *seen_metal = true;
             }
+        }
+    }
+    // Non-view CALayer children of a CAMetalLayer draw ABOVE its drawable.
+    // Capture them as a separately retained CPU source; the drawable can be
+    // static while a child's contents or presentation animation changes.
+    if !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && crate::coreanimation::has_renderable_sublayers(layer)
+        && let Some(frame) = unsafe { presentation_frame(view) }
+        && frame.window == window
+    {
+        let viewport = Frame {
+            x: 0,
+            y: 0,
+            width: frame.window_width,
+            height: frame.window_height,
+            ..frame
+        };
+        let visible = intersect_scene_clips(frame, viewport);
+        let visible = ca_clip.map_or(visible, |clip| intersect_scene_clips(visible, clip));
+        const TILE_EDGE: u32 = 2048;
+        let mut index = 0u32;
+        let mut y = 0u32;
+        while y < visible.height {
+            let height = (visible.height - y).min(TILE_EDGE);
+            let mut x = 0u32;
+            while x < visible.width {
+                let width = (visible.width - x).min(TILE_EDGE);
+                let part = Frame {
+                    x: visible.x.saturating_add(x as i32),
+                    y: visible.y.saturating_add(y as i32),
+                    width,
+                    height,
+                    ..visible
+                };
+                let crop = crate::backing::Rect {
+                    x: i64::from(part.x) - i64::from(frame.x),
+                    y: i64::from(part.y) - i64::from(frame.y),
+                    width: i64::from(width),
+                    height: i64::from(height),
+                };
+                if let Some((pixels, revision)) = crate::backing::metal_sublayers_pixels_cropped(
+                    view,
+                    frame.width,
+                    frame.height,
+                    crop,
+                ) {
+                    // Use an exclusive ID namespace for a root Metal view's
+                    // rasterized descendants; its GPU drawable keeps `layer`.
+                    scene.push(MetalSceneLayer {
+                        layer: native_tile_id(view, index),
+                        native_owner: view as usize,
+                        frame: part,
+                        opacity: (effective_alpha(view) as f32) * layer_opacity,
+                        opaque: false,
+                        clip: ca_clip,
+                        rounded: rounded.clone(),
+                        occluded: Vec::new(),
+                        native_cpu_capture: None,
+                        native_pixels: Some(pixels),
+                        native_dmabuf: None,
+                        native_revision: revision,
+                        native_dma_sample: None,
+                    });
+                }
+                index += 1;
+                x += width;
+            }
+            y += height;
         }
     }
     // Per-view native content needs its own source above the preceding
@@ -3886,6 +3982,120 @@ mod tests {
         assert!(
             covers().is_empty(),
             "hidden ancestor CA layer still occluded metal"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn metal_root_nonview_ca_sublayers_are_independent_ordered_native_pixels() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 100.0, 80.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 100.0, 80.0));
+        let metal_view = view(rect(0.0, 0.0, 100.0, 80.0));
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ordinary = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { make(metal_cls as *const _ as Id, objc::sel::get("layer")) };
+        let child = unsafe { make(ordinary as *const _ as Id, objc::sel::get("layer")) };
+        let set_layer: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_layer: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let color = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        unsafe {
+            set_layer(window, objc::sel::get("setContentView:"), content);
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_layer(content, objc::sel::get("addSubview:"), metal_view);
+            set_frame(child, objc::sel::get("setFrame:"), rect(10., 10., 22., 15.));
+            set_layer(child, objc::sel::get("setBackgroundColor:"), color as Id);
+            add_layer(metal, objc::sel::get("addSublayer:"), child);
+        }
+        flush_metal_scenes();
+        let initial = metal_scene(sdl).unwrap();
+        assert_eq!(initial[0].layer, metal as usize);
+        let native = initial
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .expect("non-view CALayer child missing above Metal drawable");
+        assert_eq!(native.native_owner, metal_view as usize);
+        let before = native.native_pixels.as_ref().unwrap();
+        assert!(before.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert!(
+            before.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            "root Metal background must not be rasterized over its drawable"
+        );
+        let original_revision = native.native_revision;
+        let original_pixels = std::sync::Arc::clone(before);
+        // Move the non-view child; no new Metal drawable is submitted.
+        unsafe {
+            set_frame(child, objc::sel::get("setFrame:"), rect(44., 20., 22., 15.));
+        }
+        flush_metal_scenes();
+        let moved = metal_scene(sdl).unwrap();
+        assert_eq!(moved[0].layer, metal as usize);
+        let changed = moved
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert_ne!(changed.native_revision, original_revision);
+        assert_ne!(
+            &**changed.native_pixels.as_ref().unwrap(),
+            &*original_pixels
+        );
+        assert!(std::sync::Arc::ptr_eq(&original_pixels, before));
+        // Root opacity is scene metadata, not pre-applied to sublayer pixels.
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(metal, 0.5);
+        }
+        flush_metal_scenes();
+        let faded = metal_scene(sdl).unwrap();
+        assert!((faded[1].opacity - 0.5).abs() < 0.001);
+        assert_eq!(faded[1].native_revision, changed.native_revision);
+        // Descendant opacity modifies CPU pixels, unlike Metal root opacity.
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(metal, 1.0);
+        }
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(child, 0.5);
+        }
+        flush_metal_scenes();
+        let translucent = metal_scene(sdl).unwrap();
+        let alpha = translucent[1]
+            .native_pixels
+            .as_ref()
+            .unwrap()
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .max()
+            .unwrap();
+        assert!((127..=129).contains(&alpha));
+        assert_ne!(translucent[1].native_revision, changed.native_revision);
+        // Removing the descendant must restore the prior Metal-only scene.
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            remove(child, objc::sel::get("removeFromSuperlayer"));
+        }
+        flush_metal_scenes();
+        assert_eq!(
+            metal_scene(sdl)
+                .unwrap()
+                .iter()
+                .filter(|layer| layer.native_pixels.is_some())
+                .count(),
+            0
         );
         objc::arc::release(window);
     }

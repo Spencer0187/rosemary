@@ -14215,3 +14215,425 @@ fn unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry() {
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
+
+/// A non-NSView CALayer descendant must paint above the retained Metal
+/// drawable and move without any subsequent guest Metal frame submission.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable() {
+    if isolate_vulkan_graphical_test(
+        "metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    appkit::bootstrap();
+    use foundation::geometry::{NSPoint, NSRect, NSSize};
+    use objc::object::Id;
+    let rect = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let window = objc::object::create_instance(
+        objc::class::lookup(c"NSWindow").unwrap(),
+        appkit::window::INSTANCE_SIZE,
+    );
+    let initialize: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect, usize, usize, u8) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    assert_eq!(
+        unsafe {
+            initialize(
+                window,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect(0., 0., 120., 90.),
+                0,
+                0,
+                0,
+            )
+        },
+        window
+    );
+    let sdl = unsafe { appkit::window::sdl_window(window) };
+    assert!(!sdl.is_null());
+    let make_view = || {
+        let v = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let init: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { init(v, objc::sel::get("initWithFrame:"), rect(0., 0., 120., 90.)) }
+    };
+    let content = make_view();
+    let metal_view = make_view();
+    let make_layer = |class: &str| {
+        let c = objc::class::lookup(std::ffi::CString::new(class).unwrap().as_c_str()).unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { make(c as *const _ as Id, objc::sel::get("layer")) }
+    };
+    let metal_layer = make_layer("CAMetalLayer");
+    let child = make_layer("CALayer");
+    let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let red = unsafe { appkit::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+    unsafe {
+        set(window, objc::sel::get("setContentView:"), content);
+        set(metal_view, objc::sel::get("setLayer:"), metal_layer);
+        set(content, objc::sel::get("addSubview:"), metal_view);
+        set_frame(child, objc::sel::get("setFrame:"), rect(13., 12., 24., 20.));
+        set(child, objc::sel::get("setBackgroundColor:"), red as Id);
+        set(metal_layer, objc::sel::get("addSublayer:"), child);
+    }
+    appkit::event::pump(std::ptr::null_mut());
+    let scene_before = appkit::view::metal_scene(sdl).unwrap();
+    assert_eq!(scene_before[0].layer, metal_layer as usize);
+    let overlay_before = scene_before
+        .iter()
+        .find(|part| part.native_pixels.is_some())
+        .expect("Metal root CA child must be separately composited");
+    let old_pixels = overlay_before.native_pixels.as_ref().unwrap();
+    let first_red = old_pixels.chunks_exact(4).position(|p| p[3] != 0).unwrap();
+    let old_point = ((first_red % 120) as u32, (first_red / 120) as u32);
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    sdl3::video::presentation_window(sdl).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(sdl, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        sdl,
+        vk::Extent2D {
+            width: 120,
+            height: 90,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let source = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 120,
+            height: 90,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            source.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0., 1., 0., 1.],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let physical = appkit::view::Frame {
+        window: sdl,
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 90,
+        window_width: 120,
+        window_height: 90,
+    };
+    let make_scene = |items: Vec<appkit::view::MetalSceneLayer>| -> Vec<ScenePlacement> {
+        items
+            .into_iter()
+            .map(|item| ScenePlacement {
+                id: item.layer,
+                frame: DirectFrame::from_frame(&item.frame),
+                opacity: item.opacity,
+                opaque: item.opaque,
+                clip: item.clip.map(|clip| DirectFrame::from_frame(&clip)),
+                rounded: item
+                    .rounded
+                    .into_iter()
+                    .map(|r| scene::RoundedClip {
+                        frame: DirectFrame::from_frame(&r.frame),
+                        radius: r.radius,
+                    })
+                    .collect(),
+                occluded: Some(vec![]),
+                native: native_scene_source(
+                    item.native_pixels,
+                    item.native_dmabuf,
+                    item.native_revision,
+                    item.frame.width,
+                    item.frame.height,
+                    item.native_cpu_capture,
+                    item.native_dma_sample,
+                ),
+            })
+            .collect()
+    };
+    let initial = make_scene(scene_before.clone());
+    state.layers.push(metal_layer as usize);
+    state.synchronize_scene(sdl as usize, &initial);
+    assert_eq!(
+        state.stage_composite_source(
+            metal_layer as usize,
+            &physical,
+            PresentSource::from(&source),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    for native in initial.iter().filter(|p| p.native.is_some()) {
+        assert_eq!(stage_native_scene_source(&mut state, native), Ok(true));
+    }
+    state.synchronize_scene(sdl as usize, &initial);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    let accumulated = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, accumulated, 120, 90, old_point.0, old_point.1),
+        [255, 0, 0, 255]
+    );
+    // Move a CALayer-only overlay after the Metal image was last submitted.
+    unsafe {
+        set_frame(child, objc::sel::get("setFrame:"), rect(64., 40., 24., 20.));
+    }
+    appkit::event::pump(std::ptr::null_mut());
+    let changed = appkit::view::metal_scene(sdl).unwrap();
+    let updated = changed
+        .iter()
+        .find(|part| part.native_pixels.is_some())
+        .unwrap();
+    let new_pixels = updated.native_pixels.as_ref().unwrap();
+    let new_red = new_pixels
+        .chunks_exact(4)
+        .enumerate()
+        .find(|(i, p)| p[3] != 0 && old_pixels[i * 4 + 3] == 0)
+        .map(|(i, _)| i)
+        .unwrap();
+    let new_point = ((new_red % 120) as u32, (new_red / 120) as u32);
+    let next = make_scene(changed);
+    for native in next.iter().filter(|p| p.native.is_some()) {
+        assert_eq!(stage_native_scene_source(&mut state, native), Ok(true));
+    }
+    state.synchronize_scene(sdl as usize, &next);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    let output = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, output, 120, 90, old_point.0, old_point.1),
+        [0, 255, 0, 255],
+        "old CALayer-only foreground remained after move"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, output, 120, 90, new_point.0, new_point.1),
+        [255, 0, 0, 255],
+        "CALayer-only foreground was not composited above Metal"
+    );
+    drop(state);
+    gpu.destroy_image(source);
+    objc::arc::release(window);
+}
+
+/// Explicitly opt-in real Vulkan measurement. Only the position/opacity of
+/// one small native overlay changes while all retained GPU content is static.
+/// Records producer-side scene recomposition, not physical monitor scanout.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
+    if std::env::var_os("ROSEMARY_BENCH_SCENE_METADATA").is_none() {
+        return;
+    }
+    if isolate_vulkan_graphical_test(
+        "metadata_only_animation_over_static_metal_recomposition_benchmark",
+    ) {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    for (width, height, count) in [(1280u32, 720u32, 8usize), (1920, 1080, 24)] {
+        let window =
+            sdl3::video::create_window(c"metadata scene benchmark", width as i32, height as i32, 0)
+                .unwrap();
+        sdl3::video::show_window(window);
+        sdl3::video::presentation_window(window).unwrap();
+        let instance = crate::vulkan::instance_handle().unwrap();
+        let surface =
+            sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library())
+                .unwrap();
+        let mut state = Swapchain::create(
+            gpu,
+            window,
+            vk::Extent2D { width, height },
+            surface,
+            instance,
+        )
+        .unwrap();
+        if !uses_layer_compositor(state.present_mode) {
+            drop(state);
+            sdl3::video::destroy_window(window);
+            continue;
+        }
+        let metal = gpu
+            .create_image(&ImageDescription {
+                image_type: vk::ImageType::TYPE_2D,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: vk::Format::B8G8R8A8_UNORM,
+                width,
+                height,
+                depth: 1,
+                levels: 1,
+                layers: 1,
+                samples: 1,
+                usage: gpu::USAGE_RENDER_TARGET,
+                cube: false,
+                components: vk::ComponentMapping::default(),
+            })
+            .unwrap();
+        gpu.one_shot(|device, cb| unsafe {
+            device.cmd_clear_color_image(
+                cb,
+                metal.image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [0., 1., 0., 1.],
+                },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        })
+        .unwrap();
+        let frame = appkit::view::Frame {
+            window,
+            x: 0,
+            y: 0,
+            width,
+            height,
+            window_width: width,
+            window_height: height,
+        };
+        let base_id = window as usize;
+        let mut placements = vec![ScenePlacement {
+            id: base_id,
+            frame: DirectFrame::from_frame(&frame),
+            opacity: 1.,
+            opaque: true,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: None,
+        }];
+        let pixel = Arc::new([0u8, 0u8, 255u8, 255u8].repeat(32 * 32));
+        for i in 0..count {
+            let at = appkit::view::Frame {
+                x: ((i * 41) % (width as usize - 64)) as i32,
+                y: ((i * 37) % (height as usize - 64)) as i32,
+                width: 32,
+                height: 32,
+                ..frame
+            };
+            placements.push(ScenePlacement {
+                id: (1usize << (usize::BITS - 1)) | (0x6f00 + i),
+                frame: DirectFrame::from_frame(&at),
+                opacity: 1.,
+                opaque: false,
+                clip: None,
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: Some(scene::NativeCpuSceneSource {
+                    bytes: Arc::clone(&pixel),
+                    revision: 7,
+                    cpu_capture: None,
+                    dmabuf: None,
+                    dma_sample: None,
+                }),
+            });
+        }
+        state.layers.push(base_id);
+        state.synchronize_scene(window as usize, &placements);
+        assert_eq!(
+            state.stage_composite_source(
+                base_id,
+                &frame,
+                PresentSource::from(&metal),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+        for source in placements.iter().filter(|source| source.native.is_some()) {
+            assert_eq!(stage_native_scene_source(&mut state, source), Ok(true));
+        }
+        state.synchronize_scene(window as usize, &placements);
+        assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+        state.idle();
+        let mut samples = Vec::with_capacity(24);
+        for iteration in 0..24 {
+            placements[count].frame.x = (16 + iteration * 5) as i32;
+            placements[count].opacity = if iteration % 2 == 0 { 1.0 } else { 0.5 };
+            let now = Instant::now();
+            state.synchronize_scene(window as usize, &placements);
+            assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+            state.idle();
+            samples.push(now.elapsed().as_secs_f64() * 1000.0);
+        }
+        samples.sort_by(f64::total_cmp);
+        let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+        let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+        println!(
+            "metadata-only full-scene Vulkan {}x{} {} retained layers: mean={mean:.3}ms p95={p95:.3}ms",
+            width,
+            height,
+            count + 1
+        );
+        // Final pixels: this overlay remains visible without a new Metal draw.
+        let at = &placements[count].frame;
+        assert_ne!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                width,
+                height,
+                at.x as u32 + 4,
+                at.y as u32 + 4
+            ),
+            [0, 255, 0, 255]
+        );
+        drop(state);
+        gpu.destroy_image(metal);
+        sdl3::video::destroy_window(window);
+    }
+}

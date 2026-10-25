@@ -2618,6 +2618,34 @@ fn draw_layer(
     now: f64,
     depth: usize,
 ) -> bool {
+    draw_layer_filtered(
+        store,
+        mapping,
+        layer,
+        origin,
+        clip,
+        opacity,
+        now,
+        depth,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_layer_filtered(
+    store: &mut Store,
+    mapping: &Mapping,
+    layer: Id,
+    origin: NSPoint,
+    clip: Rect,
+    opacity: f64,
+    now: f64,
+    depth: usize,
+    excluded: &[usize],
+) -> bool {
+    if excluded.contains(&(layer as usize)) {
+        return false;
+    }
     if depth > 64 {
         return false;
     }
@@ -2650,7 +2678,7 @@ fn draw_layer(
         y: frame.origin.y - presented.bounds_origin.y,
     };
     for child in presented.sublayers {
-        animating |= draw_layer(
+        animating |= draw_layer_filtered(
             store,
             mapping,
             child as Id,
@@ -2659,6 +2687,58 @@ fn draw_layer(
             opacity,
             now,
             depth + 1,
+            excluded,
+        );
+    }
+    animating
+}
+
+/// A Metal root's own background/contents are not an overlay; its ordinary
+/// non-view descendants are composited above its retained drawable.
+pub(crate) fn has_renderable_sublayers(layer: Id) -> bool {
+    read_node(layer, |node| {
+        node.is_some_and(|node| !node.sublayers.is_empty())
+    })
+}
+
+pub(crate) fn render_metal_sublayers(view: Id, store: &mut Store, rect: Rect, clip: Rect) -> bool {
+    let root = crate::view::layer_of(view);
+    if root.is_null() || !crate::layer::is_metal(root) {
+        return false;
+    }
+    let Some(mapping) = Mapping::for_view(view, rect) else {
+        return false;
+    };
+    let now = darwin::mach::media_time();
+    let presented = presentation(root, now);
+    if presented.hidden {
+        return false;
+    }
+    let excluded = crate::view::descendant_view_layers(view);
+    let clip = if presented.masks_to_bounds {
+        clip.intersection(&mapping.to_pixels(mapping.view_bounds))
+    } else {
+        clip
+    };
+    let origin = NSPoint {
+        x: mapping.view_bounds.origin.x - presented.bounds_origin.x,
+        y: mapping.view_bounds.origin.y - presented.bounds_origin.y,
+    };
+    let mut animating = false;
+    for child in presented.sublayers {
+        if excluded.contains(&child) {
+            continue;
+        }
+        animating |= draw_layer_filtered(
+            store,
+            &mapping,
+            child as Id,
+            origin,
+            clip,
+            1.0,
+            now,
+            0,
+            &excluded,
         );
     }
     animating
