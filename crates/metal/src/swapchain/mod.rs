@@ -138,6 +138,15 @@ struct NativeCpuBaseCache {
     image: Arc<BackingImageLease>,
 }
 
+// An unsupported *individual* immutable DMA producer does not need another
+// futile GPU allocation on the same revision. This cache is not a window-wide
+// capability flag and never covers an unrelated producer or transient error.
+struct UnsupportedNativeDma {
+    id: usize,
+    revision: u64,
+    producer: std::sync::Weak<appkit::backing::Dmabuf>,
+}
+
 /// The per-window state presentation goes through.
 // A queued native upload owns its charge, buffer and every GPU image the
 // command references until the submitted fence is confirmed complete.
@@ -211,6 +220,7 @@ struct Swapchain {
     // Bounded optional GPU copies of immutable native CPU bases. Never an
     // authoritative scene image; safe to drop on any budget pressure.
     native_cpu_bases: Vec<NativeCpuBaseCache>,
+    unsupported_native_dma: Vec<UnsupportedNativeDma>,
     /// Old image leases pinned by the current native admission transaction.
     /// GPU bytes remain charged even after their live SceneLayer is replaced.
     transaction_pinned: Vec<Arc<BackingImageLease>>,
@@ -2266,6 +2276,18 @@ fn stage_native_scene_source_effective(
     let Some(native) = layer.native.as_ref() else {
         return Ok(None);
     };
+    state
+        .unsupported_native_dma
+        .retain(|item| item.producer.strong_count() > 0);
+    if let Some(picture) = &native.dmabuf {
+        if state.unsupported_native_dma.iter().any(|item| {
+            item.id == layer.id
+                && item.revision == native.revision
+                && item.producer.ptr_eq(&Arc::downgrade(picture))
+        }) {
+            return Err("native-dmabuf-import-refused".into());
+        }
+    }
     if native.dmabuf.is_some()
         && appkit::backing::dmabuf_import_refused(layer.frame.window as sdl3::Window)
     {
@@ -2584,8 +2606,31 @@ fn stage_native_scene_source_effective(
             init,
             owned,
         );
-        if !blended_result?.is_empty() {
-            appkit::backing::refuse_dmabufs(frame.window);
+        if let Some(failure) = blended_result?.into_iter().next() {
+            if failure.kind == crate::overlay::ImportFailureKind::UnsupportedProducer {
+                const MAX_UNSUPPORTED_SOURCES: usize = 64;
+                state
+                    .unsupported_native_dma
+                    .retain(|item| item.id != layer.id);
+                if state.unsupported_native_dma.len() == MAX_UNSUPPORTED_SOURCES {
+                    state.unsupported_native_dma.remove(0);
+                }
+                state.unsupported_native_dma.push(UnsupportedNativeDma {
+                    id: layer.id,
+                    revision: native.revision,
+                    producer: Arc::downgrade(native.dmabuf.as_ref().unwrap()),
+                });
+            }
+            // Static device/format incompatibilities are isolated to this
+            // producer. Transient Vulkan/descriptor failures may recover on
+            // the next revision; neither may disable imports for the window.
+            gpu::trace(format!(
+                "native dma import {:?}, view {}: {}",
+                failure.kind, failure.producer_view, failure.reason,
+            ));
+            // An individual rejected import may be transient (allocation,
+            // descriptors or driver pressure). Never disable GPU importing
+            // for every future DMA source on this window.
             // A producer-backed linear buffer can be mapped with DMA_BUF_SYNC.
             // If it cannot, request a CPU representation; a transparent
             // replacement is not an acceptable fallback for unknown pixels.
@@ -4284,6 +4329,7 @@ impl Swapchain {
             layers: Vec::new(),
             scene_layers: Vec::new(),
             native_cpu_bases: Vec::new(),
+            unsupported_native_dma: Vec::new(),
             transaction_pinned: Vec::new(),
             transaction_retiring_bytes: 0,
             scene_placements: Vec::new(),

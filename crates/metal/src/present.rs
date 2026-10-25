@@ -2570,8 +2570,7 @@ pub(crate) fn present_store_synchronous(
             Ok(false) => return Deferred,
             Err(reason) => {
                 gpu::trace(format!("no image to blend overlays into: {reason}"));
-                appkit::backing::refuse_dmabufs(window);
-                false // Existing allocation-error fallback: show raw store.
+                false // Recoverable allocation failure: show raw store this frame.
             }
         }
     };
@@ -2712,7 +2711,7 @@ pub(crate) fn present_store_synchronous(
 /// Blend into the source reserved before the backing-store upload. Only
 /// call this after `reserve_blended_source` succeeds while STORE_IMAGES is held.
 fn blend_overlays(
-    window: sdl3::Window,
+    _window: sdl3::Window,
     entry: &mut StoreImage,
     overlays: &[appkit::backing::GpuOverlay],
 ) -> std::sync::Arc<crate::swapchain::BackingImageLease> {
@@ -2730,13 +2729,14 @@ fn blend_overlays(
     ) {
         Ok(refused) => {
             if !refused.is_empty() {
-                appkit::backing::refuse_dmabufs(window);
+                // Incomplete blending is not a reason to blacklist later
+                // unrelated DMA producers. Preserve the existing CPU store.
+                return std::sync::Arc::clone(&entry.image);
             }
             std::sync::Arc::clone(blended)
         }
         Err(reason) => {
             gpu::trace(format!("blending overlays failed: {reason}"));
-            appkit::backing::refuse_dmabufs(window);
             std::sync::Arc::clone(&entry.image)
         }
     }

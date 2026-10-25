@@ -153,7 +153,20 @@ unsafe impl Send for Imported {}
 /// destroyed at the next blend, once the one that used it last has finished.
 static IMPORTED: Mutex<Vec<Imported>> = Mutex::new(Vec::new());
 
+#[cfg(test)]
+static INJECT_IMPORT_FAILURE_ONCE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+pub(crate) fn fail_next_dma_import_for_test() {
+    INJECT_IMPORT_FAILURE_ONCE.store(true, std::sync::atomic::Ordering::Release);
+}
+
 fn import(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<(vk::Image, vk::ImageView), String> {
+    #[cfg(test)]
+    if INJECT_IMPORT_FAILURE_ONCE.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        return Err("injected temporary DMA allocation failure".into());
+    }
     let mut imported = IMPORTED.lock().expect("imported dma-bufs");
     if let Some(found) = imported
         .iter()
@@ -566,17 +579,50 @@ pub(crate) enum StoreInit {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ImportFailureKind {
+    // No path through this import backend can represent this producer on the
+    // current device. Other producers may still be supported.
+    UnsupportedProducer,
+    // Vulkan allocation, fd availability, descriptor pressure or a driver
+    // error may recover; retry this producer on a future transaction.
+    Retryable,
+}
+
+#[derive(Debug)]
+pub(crate) struct ImportRefusal {
+    pub kind: ImportFailureKind,
+    pub reason: String,
+    pub producer_view: usize,
+}
+
+fn import_failure_kind(gpu: &'static Gpu, picture: &Dmabuf) -> ImportFailureKind {
+    let static_mismatch = gpu.dmabuf.is_none()
+        || !FORMATS.iter().any(|(code, _, _)| *code == picture.fourcc)
+        || picture.planes.first().is_none_or(|first| {
+            picture
+                .planes
+                .iter()
+                .any(|plane| !same_file(plane.fd.as_raw_fd(), first.fd.as_raw_fd()))
+        });
+    if static_mismatch {
+        ImportFailureKind::UnsupportedProducer
+    } else {
+        ImportFailureKind::Retryable
+    }
+}
+
 /// Copy a retained source into a target and blend DMA overlays in order.
 /// The caller owns any image/upload leases touched by this blend. The pass,
 /// producer pictures and these leases retire together on the submission fence.
-pub(crate) fn blend_with_store_init_owned<'a, R: Send + 'static>(
+pub(crate) fn blend_with_store_init_owned<R: Send + 'static>(
     gpu: &'static Gpu,
     store: &GpuImage,
     target: &GpuImage,
-    overlays: &'a [GpuOverlay],
+    overlays: &[GpuOverlay],
     base: Option<StoreInit>,
     retained: R,
-) -> Result<Vec<&'a GpuOverlay>, String> {
+) -> Result<Vec<ImportRefusal>, String> {
     let pass = lease_pass(gpu)?;
     prune(gpu);
 
@@ -586,8 +632,15 @@ pub(crate) fn blend_with_store_init_owned<'a, R: Send + 'static>(
         match import(gpu, &overlay.picture) {
             Ok((image, view)) => placed.push((overlay, image, view)),
             Err(reason) => {
-                gpu::trace_once(format!("a dma-buf overlay was not imported: {reason}"));
-                refused.push(overlay);
+                let kind = import_failure_kind(gpu, &overlay.picture);
+                gpu::trace_once(format!(
+                    "a dma-buf overlay was not imported ({kind:?}): {reason}"
+                ));
+                refused.push(ImportRefusal {
+                    kind,
+                    reason,
+                    producer_view: overlay.view,
+                });
             }
         }
     }

@@ -5887,8 +5887,8 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         Err("native-dmabuf-import-refused".to_string())
     );
     assert!(
-        !appkit::backing::shows_dmabufs(window),
-        "failed external import did not disable DMA-BUF output for CPU fallback"
+        !appkit::backing::dmabuf_import_refused(window),
+        "one unsupported producer must not disable future DMA-BUF imports"
     );
     let upload_count = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
     for _ in 0..16 {
@@ -5900,7 +5900,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     assert_eq!(
         NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed),
         upload_count,
-        "permanently rejected DMA-BUF allocated or uploaded again"
+        "unchanged statically unsupported DMA producer retried GPU allocations"
     );
     assert!(
         state.scene_layers.iter().all(|layer| layer.id != native_id),
@@ -13589,6 +13589,85 @@ fn extra_native_window_crop_invalidates_damage_before_mixed_dma_gpu_upload() {
         [0, 0, 200, 255]
     );
     drop(old);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Temporary failure importing one GPU-only producer must not downgrade the
+/// entire window: a later, different producer must retain its exact texels.
+#[test]
+#[cfg(target_os = "linux")]
+fn transient_native_dma_import_retries_new_gpu_only_producer_without_window_blacklist() {
+    if isolate_vulkan_graphical_test(
+        "transient_native_dma_import_retries_new_gpu_only_producer_without_window_blacklist",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let first = real_gbm_picture_with_pixels(32, 32, |_, _| [0, 0, 255, 255]);
+    let second = real_gbm_picture_with_pixels(32, 32, |_, _| [40, 60, 80, 255]);
+    let id = (1usize << (usize::BITS - 1)) | 0xdab1;
+    let mut source = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 8,
+            y: 9,
+            width: 32,
+            height: 32,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 17,
+            cpu_capture: None,
+            dmabuf: Some(Arc::clone(&first)),
+            dma_sample: None,
+        }),
+    };
+    crate::overlay::fail_next_dma_import_for_test();
+    // The first linear producer may recover by uploading exact CPU pixels;
+    // the failed GPU import must nevertheless be limited to this attempt.
+    assert_eq!(stage_native_scene_source(&mut state, &source), Ok(true));
+    assert_ne!(
+        state
+            .scene_layers
+            .iter()
+            .find(|layer| layer.id == id)
+            .unwrap()
+            .native_revision,
+        Some(17),
+        "injected failure must exercise CPU fallback"
+    );
+    assert!(
+        !appkit::backing::dmabuf_import_refused(window),
+        "a temporary per-buffer importer failure poisoned the entire window"
+    );
+    let native = source.native.as_mut().unwrap();
+    native.revision = 18;
+    native.dmabuf = Some(Arc::clone(&second));
+    assert_eq!(stage_native_scene_source(&mut state, &source), Ok(true));
+    let accepted = state
+        .scene_layers
+        .iter()
+        .find(|layer| layer.id == id && layer.ready)
+        .expect("next GPU-only DMA producer was not admitted");
+    assert_eq!(accepted.native_revision, Some(18));
+    assert_eq!(
+        read_scene_pixel(gpu, accepted.snapshot.image.image, 32, 32, 4, 4),
+        [80, 60, 40, 255]
+    );
+    assert!(!appkit::backing::dmabuf_import_refused(window));
     drop(state);
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
