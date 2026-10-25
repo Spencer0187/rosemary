@@ -13480,3 +13480,116 @@ fn native_cpu_producer_damage_reuses_only_exact_gpu_base_and_rolls_back_on_faile
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn extra_native_window_crop_invalidates_damage_before_mixed_dma_gpu_upload() {
+    if isolate_vulkan_graphical_test(
+        "extra_native_window_crop_invalidates_damage_before_mixed_dma_gpu_upload",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let picture = real_gbm_picture_with_pixels(30, 16, |_, _| [0, 0, 0, 0]);
+    let mut pixels = [200u8, 0, 0, 255].repeat(30 * 16);
+    let mut placement = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xabce,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: -5,
+            y: 10,
+            width: 30,
+            height: 16,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(pixels.clone()),
+            revision: 7,
+            cpu_capture: Some(appkit::backing::NativeCpuCapture {
+                revision: 77,
+                damage: None,
+            }),
+            dmabuf: Some(Arc::clone(&picture)),
+            dma_sample: None,
+        }),
+    };
+    let first = crop_native_to_window(placement.clone()).unwrap();
+    assert_eq!((first.frame.x, first.frame.width), (0, 25));
+    assert_eq!(stage_native_scene_source(&mut state, &first), Ok(true));
+    let old = Arc::clone(
+        &state
+            .scene_layers
+            .iter()
+            .find(|item| item.id == first.id)
+            .unwrap()
+            .snapshot,
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, old.image.image, 25, 16, 1, 4),
+        [0, 0, 200, 255]
+    );
+    // Original source x=6 becomes cropped-source x=1. x=6 would be *inside*
+    // the new bounds too, so retaining its old hint would silently repaint
+    // a valid yet incorrect texel.
+    let changed_index = (4 * 30 + 6) * 4;
+    pixels[changed_index..changed_index + 4].copy_from_slice(&[0, 255, 0, 255]);
+    let native = placement.native.as_mut().unwrap();
+    native.bytes = Arc::new(pixels);
+    native.revision = 8;
+    native.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+        revision: 78,
+        damage: Some(appkit::backing::NativeCpuDamage {
+            from_revision: 77,
+            rect: appkit::backing::Rect {
+                x: 6,
+                y: 4,
+                width: 1,
+                height: 1,
+            },
+        }),
+    });
+    let next = crop_native_to_window(placement).unwrap();
+    assert_eq!((next.frame.x, next.frame.width), (0, 25));
+    assert!(
+        next.native
+            .as_ref()
+            .unwrap()
+            .cpu_capture
+            .unwrap()
+            .damage
+            .is_none(),
+        "an additional worker crop cannot inherit uncropped damage coordinates"
+    );
+    assert_eq!(stage_native_scene_source(&mut state, &next), Ok(true));
+    let updated = &state
+        .scene_layers
+        .iter()
+        .find(|item| item.id == next.id)
+        .unwrap()
+        .snapshot;
+    assert_eq!(
+        read_scene_pixel(gpu, updated.image.image, 25, 16, 1, 4),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, updated.image.image, 25, 16, 6, 4),
+        [0, 0, 200, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, old.image.image, 25, 16, 1, 4),
+        [0, 0, 200, 255]
+    );
+    drop(old);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}

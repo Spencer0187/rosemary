@@ -2883,6 +2883,13 @@ fn crop_native_to_window(mut placement: ScenePlacement) -> Option<ScenePlacement
     let native = placement.native.as_mut().expect("validated above");
     native.bytes = cropped;
     native.revision = revision;
+    // This is an additional worker-side crop, independent of AppKit's
+    // source-local capture. Its new pixels/revision do not have the previous
+    // source's damage-coordinate identity: force a full upload rather than
+    // silently using a stale hint at the wrong cropped coordinate.
+    if let Some(capture) = native.cpu_capture.as_mut() {
+        capture.damage = None;
+    }
     if native.dmabuf.is_some() {
         let mut sample = native.dma_sample.unwrap_or(scene::DmaSample {
             full_width: full.width,
