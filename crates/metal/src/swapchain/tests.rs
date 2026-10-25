@@ -14216,6 +14216,91 @@ fn unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry() {
     sdl3::video::destroy_window(window);
 }
 
+/// Structural DMA producer errors are hard refusals even when the GPU can
+/// import the exact FourCC and modifier from a correctly formed producer.
+#[test]
+#[cfg(target_os = "linux")]
+fn invalid_supported_dma_plane_layout_is_not_retried() {
+    if isolate_vulkan_graphical_test("invalid_supported_dma_plane_layout_is_not_retried") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let picture = real_gbm_picture_with_pixels(32, 32, |_, _| [1, 2, 3, 255]);
+    let malformed = Arc::new(appkit::backing::Dmabuf {
+        width: picture.width,
+        height: picture.height,
+        fourcc: picture.fourcc,
+        modifier: picture.modifier,
+        planes: picture
+            .planes
+            .iter()
+            .map(|p| appkit::backing::DmabufPlane {
+                fd: p.fd.try_clone().unwrap(),
+                offset: p.offset,
+                stride: 0,
+            })
+            .collect(),
+    });
+    let native = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xda91,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 8,
+            y: 8,
+            width: 32,
+            height: 32,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 18,
+            cpu_capture: None,
+            dmabuf: Some(Arc::clone(&malformed)),
+            dma_sample: None,
+        }),
+    };
+    let before = crate::overlay::import_attempts_for_test();
+    assert_eq!(
+        stage_native_scene_source(&mut state, &native),
+        Err("native-dmabuf-import-refused".into())
+    );
+    assert_eq!(state.unsupported_native_dma.len(), 1);
+    assert_eq!(crate::overlay::import_attempts_for_test(), before + 1);
+    for _ in 0..16 {
+        assert_eq!(
+            stage_native_scene_source(&mut state, &native),
+            Err("native-dmabuf-import-refused".into())
+        );
+    }
+    assert_eq!(crate::overlay::import_attempts_for_test(), before + 1);
+    // A different valid producer still reaches the Vulkan importer.
+    let other = ScenePlacement {
+        id: native.id + 1,
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 19,
+            cpu_capture: None,
+            dmabuf: Some(Arc::clone(&picture)),
+            dma_sample: None,
+        }),
+        ..native
+    };
+    assert_eq!(stage_native_scene_source(&mut state, &other), Ok(true));
+    assert!(crate::overlay::import_attempts_for_test() > before + 1);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 /// A non-NSView CALayer descendant must paint above the retained Metal
 /// drawable and move without any subsequent guest Metal frame submission.
 #[test]

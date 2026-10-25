@@ -204,33 +204,145 @@ fn import(
     {
         return Ok((found.image, found.view));
     }
-    let made = make(gpu, picture)
-        .map_err(|reason| (import_failure_kind(gpu, picture, &reason), reason))?;
+    let made = make(gpu, picture).map_err(|error| {
+        let kind = if error.kind == ImportFailureKind::UnsupportedProducer {
+            error.kind
+        } else {
+            import_failure_kind(gpu, picture, &error.reason)
+        };
+        (kind, error.reason)
+    })?;
     let handles = (made.image, made.view);
     imported.push(made);
     Ok(handles)
 }
 
-fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
+struct ImportMakeError {
+    kind: ImportFailureKind,
+    reason: String,
+}
+
+impl ImportMakeError {
+    fn unsupported(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ImportFailureKind::UnsupportedProducer,
+            reason: reason.into(),
+        }
+    }
+    fn retryable(reason: impl Into<String>) -> Self {
+        Self {
+            kind: ImportFailureKind::Retryable,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl From<String> for ImportMakeError {
+    fn from(reason: String) -> Self {
+        Self::retryable(reason)
+    }
+}
+impl From<&str> for ImportMakeError {
+    fn from(reason: &str) -> Self {
+        Self::retryable(reason)
+    }
+}
+
+fn permanent_vk_import_error(error: vk::Result) -> bool {
+    matches!(
+        error,
+        vk::Result::ERROR_FORMAT_NOT_SUPPORTED
+            | vk::Result::ERROR_FEATURE_NOT_PRESENT
+            | vk::Result::ERROR_INVALID_DRM_FORMAT_MODIFIER_PLANE_LAYOUT_EXT
+            | vk::Result::ERROR_INVALID_EXTERNAL_HANDLE
+    )
+}
+
+fn vk_import_error(stage: &str, error: vk::Result) -> ImportMakeError {
+    let reason = format!("{stage} failed with {error:?}");
+    if permanent_vk_import_error(error) {
+        ImportMakeError::unsupported(reason)
+    } else {
+        ImportMakeError::retryable(reason)
+    }
+}
+
+fn modifier_plane_count(
+    instance: &ash::Instance,
+    physical: vk::PhysicalDevice,
+    format: vk::Format,
+    modifier: u64,
+) -> Option<u32> {
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default();
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe { instance.get_physical_device_format_properties2(physical, format, &mut properties) };
+    let mut entries = vec![
+        vk::DrmFormatModifierPropertiesEXT::default();
+        list.drm_format_modifier_count as usize
+    ];
+    let mut list = vk::DrmFormatModifierPropertiesListEXT::default()
+        .drm_format_modifier_properties(&mut entries);
+    let mut properties = vk::FormatProperties2::default().push_next(&mut list);
+    unsafe { instance.get_physical_device_format_properties2(physical, format, &mut properties) };
+    let filled = list.drm_format_modifier_count as usize;
+    entries.truncate(filled);
+    entries
+        .iter()
+        .find(|entry| entry.drm_format_modifier == modifier)
+        .map(|entry| entry.drm_format_modifier_plane_count)
+}
+
+fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, ImportMakeError> {
     let support = gpu
         .dmabuf
         .as_ref()
-        .ok_or("the device cannot import dma-bufs")?;
+        .ok_or_else(|| ImportMakeError::unsupported("the device cannot import dma-bufs"))?;
     let &(_, format, opaque) = FORMATS
         .iter()
         .find(|(code, _, _)| *code == picture.fourcc)
-        .ok_or_else(|| format!("fourcc {:#x} is not one the pass samples", picture.fourcc))?;
+        .ok_or_else(|| {
+            ImportMakeError::unsupported(format!(
+                "fourcc {:#x} is not one the pass samples",
+                picture.fourcc
+            ))
+        })?;
     // The advertised modifier list already verifies sampled-image features
     // AND external DMA_BUF importability for the selected physical device.
     // An unsupported tuple cannot become valid through retrying allocations.
     if let Some(instance) = crate::vulkan::instance() {
         if !modifiers(instance, gpu.physical, format).contains(&picture.modifier) {
-            return Err(
-                "the device cannot sample this DRM format/modifier as an external DMA-BUF".into(),
-            );
+            return Err(ImportMakeError::unsupported(
+                "the device cannot sample this DRM format/modifier as an external DMA-BUF",
+            ));
         }
     }
-    let first = picture.planes.first().ok_or("a dma-buf with no planes")?;
+    if let Some(instance) = crate::vulkan::instance() {
+        if let Some(planes) = modifier_plane_count(instance, gpu.physical, format, picture.modifier)
+            && picture.planes.len() != planes as usize
+        {
+            return Err(ImportMakeError::unsupported(format!(
+                "DRM modifier requires {planes} planes, producer supplied {}",
+                picture.planes.len()
+            )));
+        }
+    }
+    if picture.planes.iter().any(|plane| plane.stride == 0) {
+        return Err(ImportMakeError::unsupported("zero DMA-BUF plane stride"));
+    }
+    if picture.modifier == 0
+        && picture
+            .planes
+            .iter()
+            .any(|plane| plane.stride < picture.width.checked_mul(4).unwrap_or(u32::MAX))
+    {
+        return Err(ImportMakeError::unsupported(
+            "linear DMA-BUF stride shorter than one row",
+        ));
+    }
+    let first = picture
+        .planes
+        .first()
+        .ok_or_else(|| ImportMakeError::unsupported("a dma-buf with no planes"))?;
     // One allocation holds every plane; planes in separate buffers would
     // need a disjoint image.
     if picture
@@ -238,7 +350,9 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
         .iter()
         .any(|plane| !same_file(plane.fd.as_raw_fd(), first.fd.as_raw_fd()))
     {
-        return Err("a dma-buf whose planes are in separate buffers".into());
+        return Err(ImportMakeError::unsupported(
+            "a dma-buf whose planes are in separate buffers",
+        ));
     }
     let layouts: Vec<vk::SubresourceLayout> = picture
         .planes
@@ -274,7 +388,7 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
     let device = &gpu.device;
     // SAFETY: a well-formed create info on this live device.
     let image = unsafe { device.create_image(&info, None) }
-        .map_err(|error| format!("vkCreateImage for a dma-buf failed with {error:?}"))?;
+        .map_err(|error| vk_import_error("vkCreateImage for a dma-buf", error))?;
     let image = gpu::Guard::new(image, |image| {
         // SAFETY: an image of this device's, referred to by nothing.
         unsafe { device.destroy_image(image, None) };
@@ -290,12 +404,14 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
             &mut accepted,
         )
     }
-    .map_err(|error| format!("vkGetMemoryFdPropertiesKHR failed with {error:?}"))?;
+    .map_err(|error| vk_import_error("vkGetMemoryFdPropertiesKHR", error))?;
     // SAFETY: the image was just created by this device.
     let requirements = unsafe { device.get_image_memory_requirements(*image) };
     let types = requirements.memory_type_bits & accepted.memory_type_bits;
     if types == 0 {
-        return Err("no memory type both the image and the dma-buf allow".into());
+        return Err(ImportMakeError::unsupported(
+            "no memory type both the image and the dma-buf allow",
+        ));
     }
     let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().image(*image);
     let mut import = vk::ImportMemoryFdInfoKHR::default()
@@ -317,7 +433,7 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
     });
     // SAFETY: fresh, unbound image and memory from this device.
     unsafe { device.bind_image_memory(*image, *memory, 0) }
-        .map_err(|error| format!("vkBindImageMemory for a dma-buf failed with {error:?}"))?;
+        .map_err(|error| vk_import_error("vkBindImageMemory for a dma-buf", error))?;
     let alpha = match opaque {
         true => vk::ComponentSwizzle::ONE,
         false => vk::ComponentSwizzle::IDENTITY,
