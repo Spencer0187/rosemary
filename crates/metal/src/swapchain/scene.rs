@@ -1895,28 +1895,31 @@ impl Swapchain {
         let src = accumulated.image;
         let dst = snapshot.image.image;
         let extent = self.extent;
-        self.gpu.one_shot(|device, cb| unsafe {
-            scene_sync(
-                device,
-                cb,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                &[(
-                    src,
-                    vk::AccessFlags::MEMORY_WRITE,
-                    vk::AccessFlags::TRANSFER_READ,
-                )],
-            );
-            let area = [
-                vk::Offset3D::default(),
-                vk::Offset3D {
-                    x: extent.width as i32,
-                    y: extent.height as i32,
-                    z: 1,
-                },
-            ];
-            blit(device, cb, src, area, dst, vk::ImageLayout::GENERAL, area);
-        })?;
+        self.gpu.one_shot_owned(
+            (Arc::clone(accumulated), Arc::clone(&snapshot)),
+            |device, cb, _images| unsafe {
+                scene_sync(
+                    device,
+                    cb,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    &[(
+                        src,
+                        vk::AccessFlags::MEMORY_WRITE,
+                        vk::AccessFlags::TRANSFER_READ,
+                    )],
+                );
+                let area = [
+                    vk::Offset3D::default(),
+                    vk::Offset3D {
+                        x: extent.width as i32,
+                        y: extent.height as i32,
+                        z: 1,
+                    },
+                ];
+                blit(device, cb, src, area, dst, vk::ImageLayout::GENERAL, area);
+            },
+        )?;
         let window = self
             .scene_frames
             .iter()

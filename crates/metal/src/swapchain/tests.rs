@@ -13672,3 +13672,164 @@ fn transient_native_dma_import_retries_new_gpu_only_producer_without_window_blac
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
+
+/// Immediate accumulation and snapshot copies must never destroy GPU-owned
+/// images after a successful queue submit with an uncertain fence wait.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn immediate_composite_clear_and_scene_snapshot_quarantine_gpu_image_charges() {
+    if isolate_vulkan_graphical_test(
+        "immediate_composite_clear_and_scene_snapshot_quarantine_gpu_image_charges",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, _whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let ledger = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let starting = ledger.held.load(Ordering::Acquire);
+
+    gpu.inject_immediate_wait_failure_for_test();
+    let err = state.composite().unwrap_err();
+    assert!(err.contains("injected immediate fence wait error"));
+    assert!(state.composite.is_none());
+    assert!(
+        ledger.held.load(Ordering::Acquire) > starting,
+        "failed accumulator clear destroyed an in-flight Vulkan image"
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(
+        ledger.held.load(Ordering::Acquire),
+        starting,
+        "completed accumulator clear retained an obsolete image/charge"
+    );
+
+    let composite = state.composite().unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            composite,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    state.layers.push(7);
+    let before = ledger.held.load(Ordering::Acquire);
+    let accepted = Arc::clone(state.composite.as_ref().unwrap());
+    gpu.inject_immediate_wait_failure_for_test();
+    let err = state.capture_single_scene_from_composite().unwrap_err();
+    assert!(err.contains("injected immediate fence wait error"));
+    assert!(Arc::ptr_eq(&accepted, state.composite.as_ref().unwrap()));
+    assert!(state.scene_layers.is_empty());
+    assert!(
+        ledger.held.load(Ordering::Acquire) > before,
+        "failed snapshot destroyed its in-flight destination"
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(ledger.held.load(Ordering::Acquire), before);
+    state.capture_single_scene_from_composite().unwrap();
+    let copied = state.scene_layers.last().unwrap();
+    assert_eq!(
+        read_scene_pixel(gpu, copied.snapshot.image.image, 160, 120, 3, 4),
+        [0, 255, 0, 255],
+        "confirmed snapshot lost its source texels"
+    );
+    drop(accepted);
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn immediate_resize_copy_retains_old_and_new_accumulators_after_failed_wait() {
+    if isolate_vulkan_graphical_test(
+        "immediate_resize_copy_retains_old_and_new_accumulators_after_failed_wait",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, _whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    state.composite().unwrap();
+    let original = Arc::clone(state.composite.as_ref().unwrap());
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let ledger = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let baseline = ledger.held.load(Ordering::Acquire);
+    assert!(sdl3::video::set_window_size(window, 208, 144));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        sdl3::pump();
+        let caps = unsafe {
+            crate::vulkan::surface_api()
+                .unwrap()
+                .get_physical_device_surface_capabilities(gpu.physical, state.surface)
+        }
+        .unwrap();
+        if caps.current_extent.width == u32::MAX
+            || (caps.current_extent.width, caps.current_extent.height) == (208, 144)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "surface resize not reflected in Vulkan"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    gpu.inject_immediate_wait_failure_for_test();
+    let error = state
+        .rebuild(vk::Extent2D {
+            width: 208,
+            height: 144,
+        })
+        .unwrap_err();
+    assert!(
+        error.contains("injected immediate fence wait error"),
+        "{error}"
+    );
+    assert!(
+        Arc::ptr_eq(&original, state.composite.as_ref().unwrap()),
+        "rejected resize replaced the accepted old source"
+    );
+    assert!(
+        ledger.held.load(Ordering::Acquire) > baseline,
+        "failed resize destroyed in-flight destination or its charge"
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(
+        ledger.held.load(Ordering::Acquire),
+        baseline,
+        "retired resize left its failed destination allocated"
+    );
+    drop(original);
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}

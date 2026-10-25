@@ -128,6 +128,34 @@ fn gpu_image_payload_bytes(width: u32, height: u32, format: vk::Format) -> u64 {
 /// those small copies are still in the GPU queue.
 const FRAMES_IN_FLIGHT: usize = 8;
 
+// Keep the historical Vulkan image handle at `.image` for callers while
+// retaining the actual allocation and its ledger charge behind an Arc.
+struct CompositeImage {
+    image: vk::Image,
+    lease: Arc<BackingImageLease>,
+}
+
+impl CompositeImage {
+    fn create(
+        gpu: &'static Gpu,
+        window: usize,
+        description: &ImageDescription,
+    ) -> Result<Arc<Self>, String> {
+        let lease = BackingImageLease::create_for_window(gpu, window, description)?;
+        Ok(Arc::new(Self {
+            image: lease.image.image,
+            lease,
+        }))
+    }
+}
+
+impl std::ops::Deref for CompositeImage {
+    type Target = GpuImage;
+    fn deref(&self) -> &GpuImage {
+        &self.lease.image
+    }
+}
+
 // A cached CPU-only base is safe to sample across DMA-content revisions only
 // while its original immutable Arc<Vec<u8>> and exact extent still match.
 // GPU snapshots of the *blended* result remain separately revision-owned.
@@ -206,8 +234,7 @@ struct Swapchain {
     presented: Vec<PresentFence>,
     /// Where layers accumulate when the window has more than one. `None`
     /// while a single layer covers the window, which needs no accumulator.
-    composite: Option<GpuImage>,
-    composite_charge: Option<GpuCharge>,
+    composite: Option<Arc<CompositeImage>>,
     /// The latest full-window opaque drawable, retained until a later direct
     /// frame replaces it or a second layer needs it as a GPU snapshot.
     direct: Option<DirectLayer>,
@@ -416,6 +443,12 @@ impl From<&GpuImage> for PresentSource {
             width: image.width,
             height: image.height,
         }
+    }
+}
+
+impl From<&Arc<CompositeImage>> for PresentSource {
+    fn from(image: &Arc<CompositeImage>) -> Self {
+        Self::from(&image.lease.image)
     }
 }
 
@@ -4324,7 +4357,6 @@ impl Swapchain {
             blitted: Vec::new(),
             presented: Vec::new(),
             composite: None,
-            composite_charge: None,
             direct: None,
             layers: Vec::new(),
             scene_layers: Vec::new(),
@@ -4596,23 +4628,20 @@ impl Swapchain {
             {
                 None
             } else {
-                let charge = GpuCharge::reserve(
-                    self.window,
-                    gpu_image_payload_bytes(
-                        description.width,
-                        description.height,
-                        description.format,
-                    ),
-                )?;
-                let replacement = self.gpu.create_image(&description)?;
-                let copied = self.gpu.one_shot(|device, command_buffer| unsafe {
-                    keep_top_left(device, command_buffer, old, &replacement);
-                });
-                if let Err(reason) = copied {
-                    self.gpu.destroy_image(replacement);
-                    return Err(reason);
-                }
-                Some((replacement, charge))
+                let replacement = CompositeImage::create(self.gpu, self.window, &description)?;
+                let copied = self.gpu.one_shot_owned(
+                    (Arc::clone(old), Arc::clone(&replacement)),
+                    |device, command_buffer, resources| unsafe {
+                        keep_top_left(
+                            device,
+                            command_buffer,
+                            &resources.0.lease.image,
+                            &resources.1.lease.image,
+                        );
+                    },
+                );
+                copied?;
+                Some(replacement)
             }
         } else {
             None
@@ -4649,17 +4678,9 @@ impl Swapchain {
         self.extent = extent;
         self.images = images;
         if !keep_fifo {
-            if let Some(composite) = self.composite.take() {
-                self.gpu.destroy_image(composite);
-            }
-            self.composite_charge = None;
-        } else if let Some((replacement, charge)) = replace_composite {
-            let old = self
-                .composite
-                .replace(replacement)
-                .expect("old window snapshot");
-            self.gpu.destroy_image(old);
-            self.composite_charge = Some(charge);
+            self.composite = None;
+        } else if let Some(replacement) = replace_composite {
+            self.composite = Some(replacement);
         }
         // A surface that cannot show premultiplied alpha is presented
         // opaque, which the pass would only get wrong.
@@ -4814,11 +4835,7 @@ impl Swapchain {
         if self.composite.is_none() {
             let description =
                 Self::composite_description(self.format, self.extent, self.corners.is_some());
-            let charge = GpuCharge::reserve(
-                self.window,
-                gpu_image_payload_bytes(description.width, description.height, description.format),
-            )?;
-            let image = self.gpu.create_image(&description)?;
+            let image = CompositeImage::create(self.gpu, self.window, &description)?;
             // A fresh image's contents are undefined, and the frame that
             // brings the composite into existence has only the one layer
             // that asked for it - so everywhere the other layers have not
@@ -4831,25 +4848,21 @@ impl Swapchain {
                 base_array_layer: 0,
                 layer_count: 1,
             };
-            let cleared = self.gpu.one_shot(|device, command_buffer| {
-                // SAFETY: recording into a command buffer the call owns; the
-                // image is in GENERAL from creation.
-                unsafe {
-                    device.cmd_clear_color_image(
-                        command_buffer,
-                        image.image,
-                        vk::ImageLayout::GENERAL,
-                        &clear,
-                        &[range],
-                    )
-                };
-            });
-            if let Err(reason) = cleared {
-                self.gpu.destroy_image(image);
-                return Err(reason);
-            }
+            self.gpu
+                .one_shot_owned(Arc::clone(&image), |device, command_buffer, owner| {
+                    // SAFETY: recording into a command buffer the call owns; the
+                    // image is in GENERAL from creation.
+                    unsafe {
+                        device.cmd_clear_color_image(
+                            command_buffer,
+                            owner.image,
+                            vk::ImageLayout::GENERAL,
+                            &clear,
+                            &[range],
+                        )
+                    };
+                })?;
             self.composite = Some(image);
-            self.composite_charge = Some(charge);
         }
         Ok(self.composite.as_ref().expect("just made").image)
     }
@@ -5406,10 +5419,7 @@ impl Drop for Swapchain {
         }
         // SAFETY: the pool owns the command buffers, which are freed with it.
         unsafe { device.destroy_command_pool(self.pool, None) };
-        if let Some(composite) = self.composite.take() {
-            self.gpu.destroy_image(composite);
-        }
-        self.composite_charge = None;
+        self.composite = None;
         if let Some(instance) = crate::vulkan::instance_handle() {
             sdl3::video::vulkan::destroy_surface(instance, self.surface.as_raw());
         }
