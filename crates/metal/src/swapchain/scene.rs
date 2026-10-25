@@ -20,6 +20,8 @@ pub(super) struct SceneLayer {
     /// Original AppKit publication revision for the *retained GPU image*.
     /// The GPU revision may instead hash clipping or DMA mapping details.
     pub(super) native_published_revision: Option<u64>,
+    /// Exact producer-to-tile sampling transform of the retained GPU texels.
+    pub(super) native_dma_sample: Option<DmaSample>,
     pub(super) ready: bool,
 }
 
@@ -52,7 +54,7 @@ pub(super) fn fits_scene_budget(held: u64, incoming: u64) -> bool {
 }
 pub(super) const MAX_SCENE_IMAGES_PER_LAYER: usize = FRAMES_IN_FLIGHT;
 
-fn scene_image_bytes(source: PresentSource) -> u64 {
+pub(super) fn scene_image_bytes(source: PresentSource) -> u64 {
     let bytes = match source.format {
         vk::Format::R8G8B8A8_UNORM
         | vk::Format::B8G8R8A8_UNORM
@@ -367,7 +369,7 @@ pub(super) struct RoundedClip {
     pub radius: f32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) struct DmaSample {
     pub full_width: u32,
     pub full_height: u32,
@@ -485,6 +487,49 @@ fn intersection_for_scene(a: &appkit::view::Frame, b: &appkit::view::Frame) -> a
         width: right.saturating_sub(left).clamp(0, i64::from(u32::MAX)) as u32,
         height: bottom.saturating_sub(top).clamp(0, i64::from(u32::MAX)) as u32,
         ..*a
+    }
+}
+
+impl Swapchain {
+    #[cfg(test)]
+    pub(super) fn seed_accepted_native_for_budget_test(
+        &mut self,
+        id: usize,
+        frame: DirectFrame,
+        snapshot: Arc<BackingImageLease>,
+    ) {
+        self.layers.push(id);
+        self.scene_frames.push((id, frame));
+        self.scene_placements.push(ScenePlacement {
+            id,
+            frame,
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: Some(NativeCpuSceneSource {
+                bytes: Arc::new(Vec::new()),
+                revision: 1,
+                dmabuf: None,
+                dma_sample: None,
+            }),
+        });
+        self.scene_layers.push(SceneLayer {
+            id,
+            frame,
+            snapshot,
+            spare: Vec::new(),
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            regions: None,
+            native_revision: Some(1),
+            native_published_revision: Some(1),
+            native_dma_sample: None,
+            ready: true,
+        });
     }
 }
 
@@ -773,6 +818,20 @@ impl Swapchain {
         bytes
     }
 
+    /// The 512 MiB retained-scene ceiling applies to the scene *after* a
+    /// membership transaction, not to rollback-only images of views being
+    /// removed. The latter remain genuinely allocated and subject to the
+    /// separate 768 MiB window-wide GPU allocation ledger until commit.
+    pub(super) fn budgeted_scene_bytes(&self) -> u64 {
+        self.scene_gpu_bytes()
+            .saturating_sub(self.transaction_retiring_bytes)
+    }
+
+    pub(super) fn projected_committed_scene_bytes(&self) -> u64 {
+        self.committed_scene_bytes()
+            .saturating_sub(self.transaction_retiring_bytes)
+    }
+
     /// Lower bound on scene capacity with *all* previous submissions retired.
     /// This is the non-evictable set; a new native source which cannot fit
     /// alongside it will not become stageable by polling fences or sleeping.
@@ -856,9 +915,9 @@ impl Swapchain {
             .and_then(|_| self.composite.as_ref())
             .map(PresentSource::from);
         if let Some(source) = previous_image_source {
-            if !fits_scene_budget(self.scene_gpu_bytes(), scene_image_bytes(source)) {
+            if !fits_scene_budget(self.budgeted_scene_bytes(), scene_image_bytes(source)) {
                 self.shed_scene_spares();
-                if !fits_scene_budget(self.scene_gpu_bytes(), scene_image_bytes(source)) {
+                if !fits_scene_budget(self.budgeted_scene_bytes(), scene_image_bytes(source)) {
                     return Err(
                         "retained scene GPU budget exhausted capturing previous layer".into(),
                     );
@@ -916,9 +975,9 @@ impl Swapchain {
             // source capture and in-flight/retired leases. No "mandatory"
             // bypass: a new layer or resize can never overcommit GPU memory.
             let incoming = previous_image_bytes.saturating_add(scene_image_bytes(source));
-            if !fits_scene_budget(self.scene_gpu_bytes(), incoming) {
+            if !fits_scene_budget(self.budgeted_scene_bytes(), incoming) {
                 self.shed_scene_spares();
-                if !fits_scene_budget(self.scene_gpu_bytes(), incoming) {
+                if !fits_scene_budget(self.budgeted_scene_bytes(), incoming) {
                     return Err("retained scene GPU allocation budget exhausted".into());
                 }
             }
@@ -953,6 +1012,7 @@ impl Swapchain {
                 regions: None,
                 native_revision: None,
                 native_published_revision: None,
+                native_dma_sample: None,
                 ready: false,
             });
         }
@@ -1000,6 +1060,7 @@ impl Swapchain {
                 regions: regions.map(|r| r.to_vec()),
                 native_revision: None,
                 native_published_revision: None,
+                native_dma_sample: None,
                 ready: false,
             });
         }
@@ -1427,6 +1488,7 @@ impl Swapchain {
             regions: None,
             native_revision: None,
             native_published_revision: None,
+            native_dma_sample: None,
             ready: true,
         });
         Ok(())

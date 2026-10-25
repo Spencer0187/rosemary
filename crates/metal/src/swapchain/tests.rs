@@ -6613,6 +6613,399 @@ fn pinned_scene_generation_budget_defers_dma_and_recovers_after_retirement() {
     sdl3::video::destroy_window(window);
 }
 
+/// Full AppKit publication to Vulkan compositor: move a real 6K native
+/// NSView that owns one unchanged DMA producer behind the same small window.
+/// Both AppKit's change identity and retained GPU pixels must follow the crop.
+#[test]
+#[cfg(target_os = "linux")]
+fn appkit_moving_six_k_dma_source_updates_static_metal_window_pixels() {
+    if isolate_vulkan_graphical_test(
+        "appkit_moving_six_k_dma_source_updates_static_metal_window_pixels",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    appkit::bootstrap();
+    use foundation::geometry::{NSPoint, NSRect, NSSize};
+    use objc::object::Id;
+    let rect = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let window = objc::object::create_instance(
+        objc::class::lookup(c"NSWindow").unwrap(),
+        appkit::window::INSTANCE_SIZE,
+    );
+    let init: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect, usize, usize, u8) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    assert_eq!(
+        unsafe {
+            init(
+                window,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect(0.0, 0.0, 160.0, 120.0),
+                0,
+                0,
+                0,
+            )
+        },
+        window
+    );
+    let sdl = unsafe { appkit::window::sdl_window(window) };
+    assert!(!sdl.is_null());
+    let mk_view = |x, y, width, height| {
+        let v = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let f: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            f(
+                v,
+                objc::sel::get("initWithFrame:"),
+                rect(x, y, width, height),
+            )
+        }
+    };
+    let content = mk_view(0.0, 0.0, 160.0, 120.0);
+    let metal_view = mk_view(0.0, 0.0, 160.0, 120.0);
+    let native = mk_view(-5800.0, -3200.0, 6016.0, 3384.0);
+    let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+    let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let metal_layer = unsafe { make(metal_cls as *const _ as Id, objc::sel::get("layer")) };
+    unsafe {
+        set(window, objc::sel::get("setContentView:"), content);
+        set(metal_view, objc::sel::get("setLayer:"), metal_layer);
+        set(content, objc::sel::get("addSubview:"), metal_view);
+        set(content, objc::sel::get("addSubview:"), native);
+    }
+    let producer = real_gbm_picture_with_pixels(6016, 3384, |x, _| {
+        if x >= 5700 {
+            [0, 0, 255, 255]
+        } else {
+            [255, 0, 0, 255]
+        }
+    });
+    appkit::backing::set_overlay(
+        native,
+        appkit::backing::Overlay {
+            width: 6016,
+            height: 3384,
+            picture: appkit::backing::Picture::Dmabuf(Arc::clone(&producer)),
+        },
+    );
+    appkit::event::pump(std::ptr::null_mut());
+    let capture = || {
+        appkit::view::metal_scene(sdl)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.native_owner == native as usize)
+            .expect("native foreground published above Metal")
+    };
+    let initial = capture();
+    assert_eq!(
+        (
+            initial.frame.x,
+            initial.frame.y,
+            initial.frame.width,
+            initial.frame.height
+        ),
+        (0, 0, 160, 120)
+    );
+    assert_eq!(initial.native_dma_sample, Some((6016, 3384, 5800, 64)));
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    sdl3::video::presentation_window(sdl).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(sdl, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        sdl,
+        vk::Extent2D {
+            width: 160,
+            height: 120,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let to_placement = |item: appkit::view::MetalSceneLayer| ScenePlacement {
+        id: item.layer,
+        frame: DirectFrame::from_frame(&item.frame),
+        opacity: item.opacity,
+        opaque: item.opaque,
+        clip: item.clip.map(|c| DirectFrame::from_frame(&c)),
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: native_scene_source(
+            item.native_pixels,
+            item.native_dmabuf,
+            item.native_revision,
+            item.frame.width,
+            item.frame.height,
+            item.native_dma_sample,
+        ),
+    };
+    let old = to_placement(initial.clone());
+    assert_eq!(stage_native_scene_source(&mut state, &old), Ok(true));
+    state.synchronize_scene(sdl as usize, &[old]);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, 160, 120, 40, 30),
+        [255, 0, 0, 255]
+    );
+    let set_origin: unsafe extern "C" fn(Id, objc::sel::Sel, NSPoint) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        set_origin(
+            native,
+            objc::sel::get("setFrameOrigin:"),
+            NSPoint {
+                x: -5500.0,
+                y: -3200.0,
+            },
+        )
+    };
+    appkit::event::pump(std::ptr::null_mut());
+    let shifted = capture();
+    assert_eq!(
+        (
+            shifted.frame.x,
+            shifted.frame.y,
+            shifted.frame.width,
+            shifted.frame.height
+        ),
+        (0, 0, 160, 120)
+    );
+    assert_eq!(shifted.native_dma_sample, Some((6016, 3384, 5500, 64)));
+    assert_ne!(shifted.native_revision, initial.native_revision);
+    let new = to_placement(shifted);
+    assert_eq!(stage_native_scene_source(&mut state, &new), Ok(true));
+    state.synchronize_scene(sdl as usize, &[new]);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, 160, 120, 40, 30),
+        [0, 0, 255, 255],
+        "moved AppKit foreground retained old DMA sample pixels in GPU window"
+    );
+    drop(state);
+    appkit::backing::remove_overlay(native);
+    objc::arc::release(window);
+}
+
+/// Moving a static 6K DMA producer behind an unchanged 160x120 viewport
+/// must replace the retained GPU sampling image even when its published
+/// setter revision, view ID and visible placement dimensions are unchanged.
+#[test]
+#[cfg(target_os = "linux")]
+fn moving_static_large_dma_source_changes_retained_gpu_pixels() {
+    if isolate_vulkan_graphical_test("moving_static_large_dma_source_changes_retained_gpu_pixels") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let picture = real_gbm_picture_with_pixels(6016, 3384, |x, _| {
+        if x >= 5700 {
+            [0, 0, 255, 255]
+        } else {
+            [255, 0, 0, 255]
+        }
+    });
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let id = (1usize << (usize::BITS - 1)) | 0x9911;
+    let make = |crop_x| ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 42,
+            dmabuf: Some(Arc::clone(&picture)),
+            dma_sample: Some(scene::DmaSample {
+                full_width: 6016,
+                full_height: 3384,
+                crop_x,
+                crop_y: 3200,
+            }),
+        }),
+    };
+    let first = make(5800);
+    assert_eq!(stage_native_scene_source(&mut state, &first), Ok(true));
+    state.synchronize_scene(window as usize, &[first]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 40, 30),
+        [255, 0, 0, 255]
+    );
+    let changed = make(5500);
+    assert_eq!(stage_native_scene_source(&mut state, &changed), Ok(true));
+    assert_eq!(
+        state
+            .scene_layers
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap()
+            .native_dma_sample,
+        changed.native.as_ref().unwrap().dma_sample
+    );
+    state.synchronize_scene(window as usize, &[changed]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 40, 30),
+        [0, 0, 255, 255],
+        "moved DMA source reused an old crop at an unchanged output position"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// A 512MiB final-scene budget must not permanently block replacing seven
+/// obsolete 4096-square native images with one supported 2048-square mixed
+/// source. Old generations are still physically pinned for rollback, and
+/// every allocation remains charged under the 768MiB window-wide ceiling.
+#[test]
+#[cfg(target_os = "linux")]
+fn replacing_obsolete_native_gpu_generations_makes_forward_progress() {
+    if isolate_vulkan_graphical_test(
+        "replacing_obsolete_native_gpu_generations_makes_forward_progress",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let picture = real_gbm_picture_with_pixels(2048, 2048, |_, _| [0, 0, 255, 255]);
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window =
+        sdl3::video::create_window(c"native membership replacement", 2048, 2048, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: 2048,
+            height: 2048,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 2048,
+        height: 2048,
+        window_width: 2048,
+        window_height: 2048,
+    };
+    let old_desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 4096,
+        height: 4096,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for n in 0..8usize {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &old_desc)
+            .expect("old 64MiB accepted image");
+        state.seed_accepted_native_for_budget_test(
+            (1usize << (usize::BITS - 1)) | 0xc100 | n,
+            DirectFrame::from_frame(&whole),
+            lease,
+        );
+    }
+    assert!(state.scene_gpu_bytes() >= 512 * 1024 * 1024);
+    let new_id = (1usize << (usize::BITS - 1)) | 0xc200;
+    let replacement = ScenePlacement {
+        id: new_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([255u8, 0, 0, 255].repeat(2048 * 2048)),
+            revision: 2,
+            dmabuf: Some(picture),
+            dma_sample: None,
+        }),
+    };
+    let original = state.scene_layers.clone();
+    state.transaction_pinned = original.iter().map(|l| Arc::clone(&l.snapshot)).collect();
+    state.transaction_retiring_bytes = original
+        .iter()
+        .map(|l| scene::scene_image_bytes(PresentSource::from(&l.snapshot.image)))
+        .sum();
+    assert!(
+        !scene::fits_scene_budget(state.scene_gpu_bytes(), 4 * 2048 * 2048 * 4),
+        "fixture did not trigger obsolete-image 512MiB contention"
+    );
+    assert!(scene::fits_scene_budget(
+        state.budgeted_scene_bytes(),
+        4 * 2048 * 2048 * 4
+    ));
+    assert_eq!(
+        stage_native_scene_source(&mut state, &replacement),
+        Ok(true)
+    );
+    assert!(!appkit::backing::dmabuf_import_refused(window));
+    state.synchronize_scene(window as usize, &[replacement]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, 2048, 2048, 60, 40),
+        [255, 0, 0, 255],
+        "new mixed source failed to replace obsolete native images"
+    );
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    assert_eq!(state.scene_layers.iter().filter(|s| s.ready).count(), 1);
+    assert!(state.scene_gpu_bytes() < 512 * 1024 * 1024);
+    drop(state);
+    sdl3::video::destroy_window(window);
+}
+
 /// External backing pool reservations or fence-held leases are not a hard
 /// scene-size impossibility. Deferred native staging must avoid a wasted
 /// Vulkan upload and resume when unrelated GPU image ownership retires.

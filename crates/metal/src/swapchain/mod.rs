@@ -183,6 +183,9 @@ struct Swapchain {
     /// Old image leases pinned by the current native admission transaction.
     /// GPU bytes remain charged even after their live SceneLayer is replaced.
     transaction_pinned: Vec<Arc<BackingImageLease>>,
+    /// Rollback-pinned images of native views absent from the proposed scene.
+    /// Excluded only from projected 512 MiB capacity, never actual allocations.
+    transaction_retiring_bytes: u64,
     scene_placements: Vec<ScenePlacement>,
     scene_blender: Option<SceneBlender>,
     /// The previous layer's frame is needed when its contents must first be
@@ -2166,6 +2169,7 @@ fn stage_native_scene_source(
         s.id == layer.id
             && s.ready
             && s.native_revision == Some(native.revision)
+            && s.native_dma_sample == native.dma_sample
             && s.snapshot.image.width == layer.frame.width
             && s.snapshot.image.height == layer.frame.height
     }) {
@@ -2194,12 +2198,12 @@ fn stage_native_scene_source(
     let scratch_count: u64 =
         2 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty());
     if !scene::fits_scene_budget(
-        state.scene_gpu_bytes(),
+        state.budgeted_scene_bytes(),
         image_bytes.saturating_mul(scratch_count),
     ) {
         state.shed_scene_spares();
         if !scene::fits_scene_budget(
-            state.scene_gpu_bytes(),
+            state.budgeted_scene_bytes(),
             image_bytes.saturating_mul(scratch_count),
         ) {
             // Fence-held retired leases may clear shortly. A committed
@@ -2208,7 +2212,7 @@ fn stage_native_scene_source(
             // impossible native revision never spins the GPU presentation
             // worker in a 10-ms retry loop.
             if scene::fits_scene_budget(
-                state.committed_scene_bytes(),
+                state.projected_committed_scene_bytes(),
                 image_bytes.saturating_mul(scratch_count),
             ) {
                 return Ok(false);
@@ -2216,9 +2220,6 @@ fn stage_native_scene_source(
             // Only a committed, non-evictable footprint is a hard failure.
             // A temporarily pinned generation must never poison importer
             // capability for the next attempt after GPU fence retirement.
-            if native.dmabuf.is_some() {
-                appkit::backing::refuse_dmabufs(frame.window);
-            }
             return Err("native AppKit GPU scene budget exhausted".into());
         }
     }
@@ -2406,6 +2407,7 @@ fn stage_native_scene_source(
     state.frames[slot].backing = Some(blended.unwrap_or(lease));
     if let Some(scene) = state.scene_layers.iter_mut().find(|s| s.id == layer.id) {
         scene.native_revision = Some(native.revision);
+        scene.native_dma_sample = native.dma_sample;
         // Staging is not a committed original AppKit publication.
         scene.native_published_revision = None;
     }
@@ -2765,6 +2767,18 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             .chain(layer.spare.iter().map(Arc::clone))
                     })
                     .collect();
+                // Count only pre-transaction native images whose view is
+                // removed by the complete proposal. These leases stay alive
+                // in previous_layers/transaction_pinned for rollback; the
+                // window-wide allocator still charges their physical bytes.
+                state.transaction_retiring_bytes = previous_layers
+                    .iter()
+                    .filter(|old| {
+                        old.native_revision.is_some()
+                            && !live.iter().any(|proposed| proposed.id == old.id)
+                    })
+                    .map(|old| scene::scene_image_bytes(PresentSource::from(&old.snapshot.image)))
+                    .sum();
                 let previous_order = state.layers.clone();
                 let previous_frames = state.scene_frames.clone();
                 let mut native_ready = true;
@@ -2773,7 +2787,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 let mut unrepresented = false;
                 for layer in live.iter().filter(|p| p.native.is_some()) {
                     let revision = layer.native.as_ref().expect("filtered").revision;
-                    let committed = state.committed_scene_bytes();
+                    let committed = state.projected_committed_scene_bytes();
                     // A hard-rejected revision cannot become admissible until
                     // the committed footprint drops or the source changes.
                     if refused_revisions
@@ -2802,6 +2816,8 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 image.id == layer.id
                                     && image.ready
                                     && image.native_revision == revision
+                                    && image.native_dma_sample
+                                        == layer.native.as_ref().and_then(|n| n.dma_sample)
                             }) {
                                 // Bind the exact original publication to the
                                 // retained image, not simply to the layer ID.
@@ -2954,6 +2970,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 // Once the batch has committed or restored its previous
                 // layers, these leases become ordinary scene/frame ownership.
                 state.transaction_pinned.clear();
+                state.transaction_retiring_bytes = 0;
             }
             drop(_presenting);
             // Never acquire AppKit backing/scene locks while holding the
@@ -3860,6 +3877,7 @@ impl Swapchain {
             layers: Vec::new(),
             scene_layers: Vec::new(),
             transaction_pinned: Vec::new(),
+            transaction_retiring_bytes: 0,
             scene_placements: Vec::new(),
             scene_blender: None,
             scene_frames: Vec::new(),

@@ -770,8 +770,23 @@ fn visit_metal_scene(
                         // A DMA source remains one coherent GPU image. A CPU
                         // tile never borrows a DMA producer's unrelated frame.
                         if cpu.is_some() || dma.is_some() {
+                            let sample = dma.as_ref().map(|_| {
+                                (
+                                    frame.width,
+                                    frame.height,
+                                    cropped.x as u32,
+                                    cropped.y as u32,
+                                )
+                            });
+                            // Moving a large static DMA view can keep the
+                            // visible output frame unchanged while changing
+                            // which producer texels are sampled.
                             let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
-                                ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
+                                ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
+                                ^ sample.map_or(0, |(w, h, x, y)| {
+                                    (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
+                                        ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
+                                });
                             scene.push(MetalSceneLayer {
                                 layer: native_tile_id(view, index),
                                 native_owner: view as usize,
@@ -783,14 +798,7 @@ fn visit_metal_scene(
                                 occluded: Vec::new(),
                                 native_pixels: cpu.map(|(pixels, _)| pixels),
                                 native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
-                                native_dma_sample: dma.as_ref().map(|_| {
-                                    (
-                                        frame.width,
-                                        frame.height,
-                                        cropped.x as u32,
-                                        cropped.y as u32,
-                                    )
-                                }),
+                                native_dma_sample: sample,
                                 native_revision: revision,
                             });
                         }
@@ -880,6 +888,7 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
                 && a.clip == b.clip
                 && a.occluded == b.occluded
                 && a.native_revision == b.native_revision
+                && a.native_dma_sample == b.native_dma_sample
                 && a.native_pixels.is_some() == b.native_pixels.is_some()
                 && a.native_dmabuf.is_some() == b.native_dmabuf.is_some()
                 && a.rounded.len() == b.rounded.len()
@@ -5210,6 +5219,44 @@ mod tests {
         for window in windows {
             objc::arc::release(window);
         }
+    }
+
+    #[test]
+    fn moved_static_dma_source_sampling_must_invalidate_identical_output_frame() {
+        let mut old = MetalSceneLayer {
+            layer: 7,
+            frame: Frame {
+                window: std::ptr::null_mut(),
+                x: 0,
+                y: 0,
+                width: 160,
+                height: 120,
+                window_width: 160,
+                window_height: 120,
+            },
+            native_owner: 3,
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: vec![],
+            native_pixels: None,
+            native_dmabuf: Some(std::sync::Arc::new(crate::backing::Dmabuf {
+                width: 6016,
+                height: 3384,
+                fourcc: 0,
+                modifier: 0,
+                planes: vec![],
+            })),
+            native_dma_sample: Some((6016, 3384, 5500, 3200)),
+            native_revision: 88,
+        };
+        let previous = vec![old.clone()];
+        old.native_dma_sample = Some((6016, 3384, 5800, 3200));
+        assert!(
+            !same_metal_scene(&previous, &[old]),
+            "moving a static producer behind the same visible window must publish a new source"
+        );
     }
 
     #[test]

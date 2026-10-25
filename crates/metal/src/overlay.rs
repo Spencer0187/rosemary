@@ -389,8 +389,44 @@ struct Pass {
 // SAFETY: Vulkan handles, used under `PASSES`.
 unsafe impl Send for Pass {}
 
-/// One pass per device, made on first use and kept for the run.
+/// Free descriptor/pipeline passes. A pass is exclusively leased through its
+/// final GPU completion fence: no other window can modify its descriptor sets
+/// while a previous command buffer still uses them. The registry mutex is
+/// held only while checking out or returning a pass, never during GPU waits.
 static PASSES: Mutex<Vec<Pass>> = Mutex::new(Vec::new());
+
+struct PassLease(Option<Pass>);
+
+impl std::ops::Deref for PassLease {
+    type Target = Pass;
+    fn deref(&self) -> &Pass {
+        self.0.as_ref().expect("owned overlay pass")
+    }
+}
+
+impl Drop for PassLease {
+    fn drop(&mut self) {
+        if let Some(pass) = self.0.take() {
+            PASSES.lock().expect("overlay passes").push(pass);
+        }
+    }
+}
+
+fn lease_pass(gpu: &'static Gpu) -> Result<PassLease, String> {
+    let cached = {
+        let mut registry = PASSES.lock().expect("overlay passes");
+        registry
+            .iter()
+            .position(|pass| std::ptr::eq(pass.gpu, gpu))
+            .map(|i| registry.swap_remove(i))
+    };
+    // A second worker obtains independent Vulkan descriptor resources. The
+    // expensive first-time Pass::new is also outside the shared registry lock.
+    Ok(PassLease(Some(match cached {
+        Some(pass) => pass,
+        None => Pass::new(gpu)?,
+    })))
+}
 
 impl Pass {
     fn new(gpu: &'static Gpu) -> Result<Self, String> {
@@ -532,14 +568,7 @@ pub(crate) fn blend_with_store_init<'a>(
     overlays: &'a [GpuOverlay],
     base: Option<StoreInit>,
 ) -> Result<Vec<&'a GpuOverlay>, String> {
-    let mut passes = PASSES.lock().expect("overlay passes");
-    if !passes.iter().any(|pass| std::ptr::eq(pass.gpu, gpu)) {
-        passes.push(Pass::new(gpu)?);
-    }
-    let pass = passes
-        .iter()
-        .find(|pass| std::ptr::eq(pass.gpu, gpu))
-        .expect("made above");
+    let pass = lease_pass(gpu)?;
     prune(gpu);
 
     let mut refused = Vec::new();
@@ -1336,6 +1365,34 @@ mod tests {
         assert_eq!(&bytes[24..28], &(-2i32).to_ne_bytes());
         assert_eq!(&bytes[40..44], &0.5f32.to_ne_bytes());
         assert_eq!(&bytes[56..60], &0u32.to_ne_bytes());
+    }
+
+    /// Two windows on the same GPU must not share a descriptor set while the
+    /// first one's GPU command is still in flight. The second checkout must
+    /// succeed without waiting for the first lease to return its pass.
+    #[test]
+    fn independent_overlay_pass_leases_do_not_hold_registry_across_gpu_waits() {
+        if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+            return;
+        }
+        let gpu = crate::vulkan::adapters()
+            .unwrap()
+            .first()
+            .unwrap()
+            .gpu()
+            .unwrap();
+        let first = lease_pass(gpu).expect("first window descriptor resources");
+        let original_set = first.sets[0];
+        let second = std::thread::spawn(move || {
+            let leased = lease_pass(gpu).expect("independent second window descriptor resources");
+            leased.sets[0]
+        })
+        .join()
+        .unwrap();
+        assert_ne!(
+            original_set, second,
+            "one window reused a descriptor set still leased by another window"
+        );
     }
 
     #[test]
