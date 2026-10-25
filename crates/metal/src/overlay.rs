@@ -154,6 +154,14 @@ unsafe impl Send for Imported {}
 static IMPORTED: Mutex<Vec<Imported>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
+static TEST_IMPORT_ATTEMPTS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn import_attempts_for_test() -> usize {
+    TEST_IMPORT_ATTEMPTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
 static INJECT_IMPORT_FAILURE_ONCE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
@@ -173,6 +181,8 @@ fn import(
     gpu: &'static Gpu,
     picture: &Arc<Dmabuf>,
 ) -> Result<(vk::Image, vk::ImageView), (ImportFailureKind, String)> {
+    #[cfg(test)]
+    TEST_IMPORT_ATTEMPTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
     if INJECT_IMPORT_FAILURE_ONCE.swap(false, std::sync::atomic::Ordering::AcqRel) {
         return Err((
@@ -194,7 +204,8 @@ fn import(
     {
         return Ok((found.image, found.view));
     }
-    let made = make(gpu, picture).map_err(|reason| (import_failure_kind(gpu, picture), reason))?;
+    let made = make(gpu, picture)
+        .map_err(|reason| (import_failure_kind(gpu, picture, &reason), reason))?;
     let handles = (made.image, made.view);
     imported.push(made);
     Ok(handles)
@@ -209,6 +220,16 @@ fn make(gpu: &'static Gpu, picture: &Arc<Dmabuf>) -> Result<Imported, String> {
         .iter()
         .find(|(code, _, _)| *code == picture.fourcc)
         .ok_or_else(|| format!("fourcc {:#x} is not one the pass samples", picture.fourcc))?;
+    // The advertised modifier list already verifies sampled-image features
+    // AND external DMA_BUF importability for the selected physical device.
+    // An unsupported tuple cannot become valid through retrying allocations.
+    if let Some(instance) = crate::vulkan::instance() {
+        if !modifiers(instance, gpu.physical, format).contains(&picture.modifier) {
+            return Err(
+                "the device cannot sample this DRM format/modifier as an external DMA-BUF".into(),
+            );
+        }
+    }
     let first = picture.planes.first().ok_or("a dma-buf with no planes")?;
     // One allocation holds every plane; planes in separate buffers would
     // need a disjoint image.
@@ -616,14 +637,22 @@ pub(crate) struct ImportRefusal {
     pub producer_view: usize,
 }
 
-fn import_failure_kind(gpu: &'static Gpu, picture: &Dmabuf) -> ImportFailureKind {
-    let static_mismatch = gpu.dmabuf.is_none()
-        || !FORMATS.iter().any(|(code, _, _)| *code == picture.fourcc)
+fn import_failure_kind(gpu: &'static Gpu, picture: &Dmabuf, reason: &str) -> ImportFailureKind {
+    let format = FORMATS.iter().find(|(code, _, _)| *code == picture.fourcc);
+    let static_mismatch = reason.contains("ERROR_FORMAT_NOT_SUPPORTED")
+        || reason.contains("ERROR_FEATURE_NOT_PRESENT")
+        || gpu.dmabuf.is_none()
+        || format.is_none()
         || picture.planes.first().is_none_or(|first| {
             picture
                 .planes
                 .iter()
                 .any(|plane| !same_file(plane.fd.as_raw_fd(), first.fd.as_raw_fd()))
+        })
+        || format.is_some_and(|(_, format, _)| {
+            crate::vulkan::instance().is_some_and(|instance| {
+                !modifiers(instance, gpu.physical, *format).contains(&picture.modifier)
+            })
         });
     if static_mismatch {
         ImportFailureKind::UnsupportedProducer

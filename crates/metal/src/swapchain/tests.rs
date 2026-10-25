@@ -14128,3 +14128,90 @@ fn cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change() {
     gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
+
+/// Real Vulkan device reports support for a FourCC but not an arbitrary
+/// non-linear modifier: reject once, never retry as an allocation failure.
+#[test]
+#[cfg(target_os = "linux")]
+fn unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry() {
+    if isolate_vulkan_graphical_test(
+        "unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let valid = real_gbm_picture_with_pixels(32, 32, |_, _| [0, 0, 220, 255]);
+    let mut invalid_modifier = u64::MAX;
+    let importer = crate::overlay::importer().expect("Vulkan DMA importer");
+    assert!(!importer.formats.contains(&(valid.fourcc, invalid_modifier)));
+    if invalid_modifier == valid.modifier {
+        invalid_modifier -= 1;
+    }
+    let unsupported = Arc::new(appkit::backing::Dmabuf {
+        width: valid.width,
+        height: valid.height,
+        fourcc: valid.fourcc,
+        modifier: invalid_modifier,
+        planes: valid
+            .planes
+            .iter()
+            .map(|p| appkit::backing::DmabufPlane {
+                fd: p.fd.try_clone().unwrap(),
+                offset: p.offset,
+                stride: p.stride,
+            })
+            .collect(),
+    });
+    let native = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0xdaf0,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 8,
+            y: 8,
+            width: 32,
+            height: 32,
+            ..whole
+        }),
+        opacity: 1.,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 92,
+            cpu_capture: None,
+            dmabuf: Some(Arc::clone(&unsupported)),
+            dma_sample: None,
+        }),
+    };
+    let before = crate::overlay::import_attempts_for_test();
+    assert_eq!(
+        stage_native_scene_source(&mut state, &native),
+        Err("native-dmabuf-import-refused".into())
+    );
+    assert_eq!(state.unsupported_native_dma.len(), 1);
+    assert_eq!(crate::overlay::import_attempts_for_test(), before + 1);
+    for _ in 0..16 {
+        assert_eq!(
+            stage_native_scene_source(&mut state, &native),
+            Err("native-dmabuf-import-refused".into())
+        );
+    }
+    assert_eq!(
+        crate::overlay::import_attempts_for_test(),
+        before + 1,
+        "unsupported non-linear modifier kept retrying GPU allocations"
+    );
+    assert!(
+        !appkit::backing::dmabuf_import_refused(window),
+        "one unsupported modifier cannot poison the window"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
