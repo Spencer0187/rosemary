@@ -180,6 +180,9 @@ struct Swapchain {
     /// Latest GPU-owned contents for each layer in the flattened window tree.
     /// Scene images must survive both drawable reuse and in-flight GPU reads.
     scene_layers: Vec<SceneLayer>,
+    /// Old image leases pinned by the current native admission transaction.
+    /// GPU bytes remain charged even after their live SceneLayer is replaced.
+    transaction_pinned: Vec<Arc<BackingImageLease>>,
     scene_placements: Vec<ScenePlacement>,
     scene_blender: Option<SceneBlender>,
     /// The previous layer's frame is needed when its contents must first be
@@ -2647,6 +2650,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 // previously committed image leases alive through the whole
                 // batch; metadata-only rollback is not sufficient.
                 let previous_layers = state.scene_layers.clone();
+                state.transaction_pinned = previous_layers
+                    .iter()
+                    .flat_map(|layer| {
+                        std::iter::once(Arc::clone(&layer.snapshot))
+                            .chain(layer.spare.iter().map(Arc::clone))
+                    })
+                    .collect();
                 let previous_order = state.layers.clone();
                 let previous_frames = state.scene_frames.clone();
                 let mut native_ready = true;
@@ -2833,6 +2843,9 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         admitted_update = Some(confirmed);
                     }
                 }
+                // Once the batch has committed or restored its previous
+                // layers, these leases become ordinary scene/frame ownership.
+                state.transaction_pinned.clear();
             }
             drop(_presenting);
             // Never acquire AppKit backing/scene locks while holding the
@@ -3738,6 +3751,7 @@ impl Swapchain {
             direct: None,
             layers: Vec::new(),
             scene_layers: Vec::new(),
+            transaction_pinned: Vec::new(),
             scene_placements: Vec::new(),
             scene_blender: None,
             scene_frames: Vec::new(),

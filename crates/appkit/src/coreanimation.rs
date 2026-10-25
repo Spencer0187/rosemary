@@ -180,29 +180,29 @@ struct Running {
 
 static NODES: Mutex<Option<HashMap<usize, Node>>> = Mutex::new(None);
 
-/// Only the layers that have a live opacity animation. Most applications
-/// never animate opacity; avoid locking/scanning all CA nodes every pump.
-static OPACITY_ANIMATION_LAYERS: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+/// Only layers animating presentation properties consumed by retained Metal.
+/// Static windows never scan their full CA hierarchy in the event pump.
+static SCENE_ANIMATION_LAYERS: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
-static OPACITY_ANIMATION_COUNT: AtomicUsize = AtomicUsize::new(0);
+static SCENE_ANIMATION_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-fn update_opacity_animation_registry(layer: Id) {
+fn update_scene_animation_registry(layer: Id) {
     let active = read_node(layer, |node| {
         node.is_some_and(|node| {
             node.animations
                 .iter()
-                .any(|(_, a)| a.spec.key_path == "opacity")
+                .any(|(_, a)| is_animatable(&a.spec.key_path))
         })
     });
-    let mut registered = OPACITY_ANIMATION_LAYERS
+    let mut registered = SCENE_ANIMATION_LAYERS
         .lock()
-        .expect("CA opacity registry");
+        .expect("CA scene animation registry");
     if active {
         registered.insert(layer as usize);
     } else {
         registered.remove(&(layer as usize));
     }
-    OPACITY_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
+    SCENE_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
 }
 
 fn with_node<T>(layer: Id, f: impl FnOnce(&mut Node) -> T) -> T {
@@ -231,11 +231,11 @@ pub(crate) fn forget(layer: Id) {
         return;
     };
     {
-        let mut registered = OPACITY_ANIMATION_LAYERS
+        let mut registered = SCENE_ANIMATION_LAYERS
             .lock()
-            .expect("CA opacity registry");
+            .expect("CA scene animation registry");
         registered.remove(&(layer as usize));
-        OPACITY_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
+        SCENE_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
     }
     for sublayer in &node.sublayers {
         with_node(*sublayer as Id, |child| child.superlayer = 0);
@@ -412,7 +412,7 @@ pub(crate) fn set_underlay_animation_for_test(layer: Id, fraction: Option<f64>) 
             ));
         }
     });
-    update_opacity_animation_registry(layer);
+    update_scene_animation_registry(layer);
 }
 
 #[cfg(test)]
@@ -577,27 +577,27 @@ fn changed_metadata(layer: Id) {
     crate::view::invalidate_ca_layer(root);
 }
 
-/// Whether a currently progressing opacity animation needs a new retained
+/// Whether a currently progressing CA presentation animation needs a retained
 /// scene at the next video-thread pump, independent of drawable submissions.
-pub(crate) fn scene_opacity_animating(now: f64) -> Vec<usize> {
-    if OPACITY_ANIMATION_COUNT.load(Ordering::Acquire) == 0 {
+pub(crate) fn scene_animation_roots(now: f64) -> Vec<usize> {
+    if SCENE_ANIMATION_COUNT.load(Ordering::Acquire) == 0 {
         return Vec::new();
     }
     // Snapshot only registered layer IDs, not the full CA hierarchy. Never
     // hold the registry lock while reading NODES or evaluating animations.
-    let ids: Vec<_> = OPACITY_ANIMATION_LAYERS
+    let ids: Vec<_> = SCENE_ANIMATION_LAYERS
         .lock()
-        .expect("CA opacity registry")
+        .expect("CA scene animation registry")
         .iter()
         .copied()
         .collect();
-    let (active, expired) = read_all_nodes(|nodes| {
+    let (mut active, expired) = read_all_nodes(|nodes| {
         let mut active = Vec::new();
         let mut expired = Vec::new();
         for id in &ids {
             let running = nodes.get(id).is_some_and(|node| {
                 node.animations.iter().any(|(_, animation)| {
-                    animation.spec.key_path == "opacity"
+                    is_animatable(&animation.spec.key_path)
                         && !progress(&animation.spec, animation.start, now).1
                 })
             });
@@ -610,9 +610,18 @@ pub(crate) fn scene_opacity_animating(now: f64) -> Vec<usize> {
         (active, expired)
     });
     if !expired.is_empty() {
-        let mut registered = OPACITY_ANIMATION_LAYERS
+        // A completed position/bounds animation restores model geometry
+        // even if an unrelated animation remains live. Schedule the exact
+        // owner's final frame before removing its registry entry.
+        active.extend(read_all_nodes(|nodes| {
+            expired
+                .iter()
+                .map(|id| scene_root_key(nodes, *id))
+                .collect::<Vec<_>>()
+        }));
+        let mut registered = SCENE_ANIMATION_LAYERS
             .lock()
-            .expect("CA opacity registry");
+            .expect("CA scene animation registry");
         // A new animation may have been added after the node snapshot.
         // Re-check only expired IDs, preserving a concurrent replacement.
         let expired: Vec<_> = read_all_nodes(|nodes| {
@@ -621,7 +630,7 @@ pub(crate) fn scene_opacity_animating(now: f64) -> Vec<usize> {
                 .filter(|id| {
                     !nodes.get(id).is_some_and(|node| {
                         node.animations.iter().any(|(_, a)| {
-                            a.spec.key_path == "opacity" && !progress(&a.spec, a.start, now).1
+                            is_animatable(&a.spec.key_path) && !progress(&a.spec, a.start, now).1
                         })
                     })
                 })
@@ -630,7 +639,7 @@ pub(crate) fn scene_opacity_animating(now: f64) -> Vec<usize> {
         for id in expired {
             registered.remove(&id);
         }
-        OPACITY_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
+        SCENE_ANIMATION_COUNT.store(registered.len(), Ordering::Release);
     }
     active
 }
@@ -1635,7 +1644,7 @@ unsafe extern "C" fn add_animation(receiver: Id, _sel: Sel, animation: Id, key: 
     if let Some(old) = replaced {
         release_running(&old);
     }
-    update_opacity_animation_registry(receiver);
+    update_scene_animation_registry(receiver);
     changed(receiver);
 }
 
@@ -1664,7 +1673,7 @@ unsafe extern "C" fn remove_animation_for_key(receiver: Id, _sel: Sel, key: Id) 
     });
     if let Some(running) = removed {
         release_running(&running);
-        update_opacity_animation_registry(receiver);
+        update_scene_animation_registry(receiver);
         changed(receiver);
     }
 }
@@ -1674,7 +1683,7 @@ unsafe extern "C" fn remove_all_animations(receiver: Id, _sel: Sel) {
     for (_, running) in &removed {
         release_running(running);
     }
-    update_opacity_animation_registry(receiver);
+    update_scene_animation_registry(receiver);
     changed(receiver);
 }
 
@@ -1922,7 +1931,7 @@ fn retire(layer: Id, now: f64) -> bool {
     // Static CA layers are rendered far more often than animations change.
     // Registry refreshes belong to a real removal, not every draw traversal.
     if removed {
-        update_opacity_animation_registry(layer);
+        update_scene_animation_registry(layer);
     }
     running
 }
@@ -3674,11 +3683,11 @@ mod tests {
                 nodes.insert(id, Node::default());
             }
         }
-        assert_eq!(OPACITY_ANIMATION_COUNT.load(Ordering::Acquire), 0);
+        assert_eq!(SCENE_ANIMATION_COUNT.load(Ordering::Acquire), 0);
         let nodes = NODES.lock().expect("CA nodes held during event-pump tick");
         let start = std::time::Instant::now();
         for _ in 0..10_000 {
-            assert!(scene_opacity_animating(darwin::mach::media_time()).is_empty());
+            assert!(scene_animation_roots(darwin::mach::media_time()).is_empty());
         }
         let elapsed = start.elapsed();
         drop(nodes);

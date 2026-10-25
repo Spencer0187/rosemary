@@ -227,7 +227,8 @@ struct NativeCapture {
     pixels: std::sync::Arc<Vec<u8>>,
     revision: u64,
 }
-static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<usize, NativeCapture>>> =
+type CaptureKey = (usize, i64, i64, u32, u32);
+static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static NATIVE_RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -939,7 +940,8 @@ pub(crate) fn forget(view: Id) {
     NATIVE_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .remove(&key);
+        .retain(|(owner, _, _, _, _), _| *owner != key);
+    crate::view::forget_native_tile_ids(view);
     NEEDS_DISPLAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1388,7 +1390,7 @@ pub(crate) fn live_metal_occlusion(
                 .iter()
                 .filter(|native| {
                     native.layer & native_id_bit != 0
-                        && opaque.contains(&(native.layer & !native_id_bit))
+                        && opaque.contains(&native.native_owner)
                         && native.opacity >= 1.0
                         // Rounded clips are not fully covered by any rectangle.
                         && native.rounded.is_empty()
@@ -1478,6 +1480,13 @@ pub fn native_scene_pixels_cropped(
     {
         return None;
     }
+    let key = (
+        view as usize,
+        crop.x,
+        crop.y,
+        crop.width as u32,
+        crop.height as u32,
+    );
     let layer = crate::view::layer_of(view);
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     let source = views.as_ref().and_then(|all| all.get(&(view as usize)));
@@ -1490,7 +1499,7 @@ pub fn native_scene_pixels_cropped(
         NATIVE_CAPTURES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&(view as usize));
+            .remove(&key);
         return None;
     }
     let view_generation = source.map(Store::generation);
@@ -1508,7 +1517,7 @@ pub fn native_scene_pixels_cropped(
         && let Some(hit) = NATIVE_CAPTURES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&(view as usize))
+            .get(&key)
             .filter(|hit| {
                 hit.layer == layer as usize
                     && hit.width == crop.width as u32
@@ -1584,7 +1593,7 @@ pub fn native_scene_pixels_cropped(
         NATIVE_CAPTURES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&(view as usize));
+            .remove(&key);
         return None;
     }
     use std::hash::{Hash, Hasher};
@@ -1594,10 +1603,10 @@ pub fn native_scene_pixels_cropped(
     let pixels = std::sync::Arc::new(output.pixels);
     let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
     if content_animating {
-        captures.remove(&(view as usize));
+        captures.remove(&key);
     } else {
         captures.insert(
-            view as usize,
+            key,
             NativeCapture {
                 layer: layer as usize,
                 width: crop.width as u32,
@@ -1616,11 +1625,7 @@ pub fn native_scene_pixels_cropped(
         // the current capture. In-progress GPU users own their own Arc.
         let mut used: usize = captures.values().map(|entry| entry.pixels.len()).sum();
         if used > 128 * 1024 * 1024 {
-            let keys: Vec<_> = captures
-                .keys()
-                .copied()
-                .filter(|id| *id != view as usize)
-                .collect();
+            let keys: Vec<_> = captures.keys().copied().filter(|id| *id != key).collect();
             for id in keys {
                 if used <= 128 * 1024 * 1024 {
                     break;
@@ -1679,19 +1684,29 @@ fn admitted_native_in_published_scene(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let accepted = admitted.get(&(sdl as usize));
-    let live = crate::view::metal_scene(sdl).unwrap_or_default();
-    live.into_iter()
-        .filter(|layer| {
-            let has_pixels = layer.native_pixels.is_some() || layer.native_dmabuf.is_some();
-            let relevant = if dma_only {
-                layer.native_dmabuf.is_some()
-            } else {
-                has_pixels
-            };
-            relevant
-                && accepted.is_some_and(|a| a.get(&layer.layer) == Some(&layer.native_revision))
+    let mut grouped = HashMap::<usize, (usize, usize)>::new();
+    for layer in crate::view::metal_scene(sdl).unwrap_or_default() {
+        let relevant = if dma_only {
+            layer.native_dmabuf.is_some()
+        } else {
+            layer.native_pixels.is_some() || layer.native_dmabuf.is_some()
+        };
+        if !relevant {
+            continue;
+        }
+        let member = grouped.entry(layer.native_owner).or_default();
+        member.0 += 1;
+        if accepted.is_some_and(|a| a.get(&layer.layer) == Some(&layer.native_revision)) {
+            member.1 += 1;
+        }
+    }
+    // A multi-tile native view may be excluded from CPU backing only once
+    // every visible, nontransparent tile has its exact GPU revision admitted.
+    grouped
+        .into_iter()
+        .filter_map(|(owner, (total, ready))| {
+            (owner != 0 && total == ready).then_some(owner | (1usize << (usize::BITS - 1)))
         })
-        .map(|layer| layer.layer)
         .collect()
 }
 

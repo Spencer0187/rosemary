@@ -3624,6 +3624,735 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
     sdl3::video::destroy_window(window);
 }
 
+/// An intermediate CALayer above a static CAMetalLayer animates its own
+/// position and bounds. The AppKit event pump publishes changing CA clips
+/// even though Metal submits no new drawable; Vulkan final pixels track them.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
+    if isolate_vulkan_graphical_test("animated_geometry_mask_recomposes_static_metal_gpu_pixels") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    appkit::bootstrap();
+    use foundation::geometry::{NSPoint, NSRect, NSSize};
+    use objc::object::Id;
+    let rect = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let window = objc::object::create_instance(
+        objc::class::lookup(c"NSWindow").unwrap(),
+        appkit::window::INSTANCE_SIZE,
+    );
+    let init: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect, usize, usize, u8) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    assert_eq!(
+        unsafe {
+            init(
+                window,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect(0.0, 0.0, 120.0, 90.0),
+                0,
+                0,
+                0,
+            )
+        },
+        window
+    );
+    let sdl = unsafe { appkit::window::sdl_window(window) };
+    assert!(!sdl.is_null());
+    let mk_view = |width, height| {
+        let v = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let initialize: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            initialize(
+                v,
+                objc::sel::get("initWithFrame:"),
+                rect(0.0, 0.0, width, height),
+            )
+        }
+    };
+    let content = mk_view(120.0, 90.0);
+    let metal_view = mk_view(120.0, 90.0);
+    let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let layer = |class: &str| {
+        let cls = objc::class::lookup(std::ffi::CString::new(class).unwrap().as_c_str()).unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { make(cls as *const _ as Id, objc::sel::get("layer")) }
+    };
+    let root = layer("CALayer");
+    let mask = layer("CALayer");
+    let metal_layer = layer("CAMetalLayer");
+    let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let set_bool: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        set(window, objc::sel::get("setContentView:"), content);
+        set(content, objc::sel::get("setLayer:"), root);
+        set(metal_view, objc::sel::get("setLayer:"), metal_layer);
+        set(content, objc::sel::get("addSubview:"), metal_view);
+        set_frame(
+            mask,
+            objc::sel::get("setFrame:"),
+            rect(9.0, 8.0, 38.0, 25.0),
+        );
+        set(root, objc::sel::get("addSublayer:"), mask);
+        set(mask, objc::sel::get("addSublayer:"), metal_layer);
+        set_bool(mask, objc::sel::get("setMasksToBounds:"), 1);
+    }
+    appkit::event::pump(std::ptr::null_mut());
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    sdl3::video::presentation_window(sdl).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(sdl, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        sdl,
+        vk::Extent2D {
+            width: 120,
+            height: 90,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let source = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 120,
+            height: 90,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            source.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+    })
+    .unwrap();
+    let initial = appkit::view::metal_scene(sdl).expect("static Metal published");
+    let metal_id = metal_layer as usize;
+    let physical = appkit::view::Frame {
+        window: sdl,
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 90,
+        window_width: 120,
+        window_height: 90,
+    };
+    let scene_from_ca = || {
+        let entry = appkit::view::metal_scene(sdl)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.layer == metal_id)
+            .expect("static CAMetalLayer in AppKit tree");
+        let clip = entry
+            .clip
+            .expect("intermediate CA mask clip projected onto Metal");
+        (
+            ScenePlacement {
+                id: metal_id,
+                frame: DirectFrame::from_frame(&entry.frame),
+                opacity: entry.opacity,
+                opaque: true,
+                clip: Some(DirectFrame::from_frame(&clip)),
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: None,
+            },
+            clip,
+        )
+    };
+    assert!(initial.iter().any(|s| s.layer == metal_id));
+    let (initial_p, initial_clip) = scene_from_ca();
+    state.layers.push(metal_id);
+    state.synchronize_scene(sdl as usize, &[initial_p.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            metal_id,
+            &physical,
+            PresentSource::from(&source),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    state.synchronize_scene(sdl as usize, &[initial_p]);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    let comp = state.composite.as_ref().unwrap().image;
+    let check_clip = |state: &Swapchain, clip: &appkit::view::Frame| {
+        let image = state.composite.as_ref().unwrap().image;
+        let cx = (clip.x + clip.width as i32 / 2).clamp(0, 119) as u32;
+        let cy = (clip.y + clip.height as i32 / 2).clamp(0, 89) as u32;
+        assert_eq!(
+            read_scene_pixel(gpu, image, 120, 90, cx, cy),
+            [0, 255, 0, 255],
+            "static Metal pixels missing inside animated CA mask"
+        );
+        assert_eq!(
+            read_scene_pixel(gpu, image, 120, 90, 0, 0),
+            [0, 0, 0, 0],
+            "static Metal appeared outside intermediate ancestor clip"
+        );
+    };
+    check_clip(&state, &initial_clip);
+    let anim_cls = objc::class::lookup(c"CABasicAnimation").unwrap();
+    let mk: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let set_seconds: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let add: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let animate = |path: &str, start: f64, end: f64| {
+        let key = foundation::string::from_str(path);
+        let obj = unsafe {
+            mk(
+                anim_cls as *const _ as Id,
+                objc::sel::get("animationWithKeyPath:"),
+                key,
+            )
+        };
+        let number = |x: f64| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(x))
+                as Id
+        };
+        let from = number(start);
+        let to = number(end);
+        unsafe {
+            set(obj, objc::sel::get("setFromValue:"), from);
+            set(obj, objc::sel::get("setToValue:"), to);
+            set_seconds(obj, objc::sel::get("setDuration:"), 0.30);
+            set_seconds(
+                obj,
+                objc::sel::get("setBeginTime:"),
+                darwin::mach::media_time() - 0.15,
+            );
+            add(mask, objc::sel::get("addAnimation:forKey:"), obj, key);
+        }
+        objc::arc::release(from);
+        objc::arc::release(to);
+        objc::arc::release(key);
+    };
+    animate("position.x", 30.0, 65.0);
+    animate("bounds.size.width", 32.0, 75.0);
+    appkit::event::pump(std::ptr::null_mut());
+    let (middle_p, middle_clip) = scene_from_ca();
+    assert!(middle_clip.x != initial_clip.x || middle_clip.width != initial_clip.width);
+    state.synchronize_scene(sdl as usize, &[middle_p]);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    check_clip(&state, &middle_clip);
+    std::thread::sleep(Duration::from_millis(30));
+    appkit::event::pump(std::ptr::null_mut());
+    let (later_p, later_clip) = scene_from_ca();
+    assert!(later_clip.x != middle_clip.x || later_clip.width != middle_clip.width);
+    state.synchronize_scene(sdl as usize, &[later_p]);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    check_clip(&state, &later_clip);
+    std::thread::sleep(Duration::from_millis(160));
+    appkit::event::pump(std::ptr::null_mut());
+    let (final_p, final_clip) = scene_from_ca();
+    assert_eq!(
+        (
+            final_clip.x,
+            final_clip.y,
+            final_clip.width,
+            final_clip.height
+        ),
+        (
+            initial_clip.x,
+            initial_clip.y,
+            initial_clip.width,
+            initial_clip.height
+        ),
+        "finished geometry animation failed to restore static drawable's model-state clipping"
+    );
+    state.synchronize_scene(sdl as usize, &[final_p]);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    check_clip(&state, &final_clip);
+    assert_eq!(
+        state.composite.as_ref().unwrap().image,
+        comp,
+        "CA clipping unexpectedly replaced whole static GPU accumulator"
+    );
+    drop(state);
+    gpu.destroy_image(source);
+    objc::arc::release(window);
+}
+
+/// A real 6016x3384 opaque Metal window remains visible beneath the entire
+/// CPU-backed native foreground. Each source allocation stays <=64MiB; all
+/// final pixels are read from the actual Vulkan window accumulator, including
+/// seams and later static-Metal membership changes.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
+    if isolate_vulkan_graphical_test(
+        "fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    const WIDTH: u32 = 6016;
+    const HEIGHT: u32 = 3384;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(
+        c"six-k tiled native above Metal",
+        WIDTH as i32,
+        HEIGHT as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        surface,
+        instance,
+    )
+    .expect("real 6K Vulkan WSI surface");
+    assert!(uses_layer_compositor(state.present_mode));
+    let source = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: WIDTH,
+            height: HEIGHT,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            source.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+    })
+    .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: WIDTH,
+        height: HEIGHT,
+        window_width: WIDTH,
+        window_height: HEIGHT,
+    };
+    let metal_id = 301usize;
+    let base = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.push(metal_id);
+    state.synchronize_scene(window as usize, &[base.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            metal_id,
+            &whole,
+            PresentSource::from(&source),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|layer| layer.id == metal_id && layer.ready),
+        "static Metal source not retained ahead of native tile staging"
+    );
+    let mut placements = vec![base.clone()];
+    let mut tile_no = 0usize;
+    for y in (0..HEIGHT).step_by(2048) {
+        for x in (0..WIDTH).step_by(2048) {
+            let tw = (WIDTH - x).min(2048);
+            let th = (HEIGHT - y).min(2048);
+            let tile = ScenePlacement {
+                id: (3usize << (usize::BITS - 2)) | (tile_no + 1),
+                frame: DirectFrame::from_frame(&appkit::view::Frame {
+                    x: x as i32,
+                    y: y as i32,
+                    width: tw,
+                    height: th,
+                    ..whole
+                }),
+                opacity: 1.0,
+                opaque: false,
+                clip: None,
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: Some(scene::NativeCpuSceneSource {
+                    bytes: Arc::new([0u8, 0, 128, 128].repeat(tw as usize * th as usize)),
+                    revision: 91 + tile_no as u64,
+                    dmabuf: None,
+                }),
+            };
+            assert!(tile.native.as_ref().unwrap().bytes.len() <= 64 * 1024 * 1024);
+            assert_eq!(stage_native_scene_source(&mut state, &tile), Ok(true));
+            placements.push(tile);
+            tile_no += 1;
+        }
+    }
+    assert!(tile_no >= 6);
+    state.synchronize_scene(window as usize, &placements);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    for (x, y) in [
+        (0, 0),
+        (2047, 2047),
+        (2048, 2048),
+        (4095, 2047),
+        (4096, 2048),
+        (6015, 3383),
+    ] {
+        let rgba = read_scene_pixel(gpu, image, WIDTH, HEIGHT, x, y);
+        assert!(
+            (i32::from(rgba[0]) - 128).abs() <= 2
+                && (i32::from(rgba[1]) - 127).abs() <= 2
+                && rgba[3] == 255,
+            "tile seam or foreground at ({x},{y}) fell behind opaque Metal: {rgba:?}"
+        );
+    }
+    // Drop the bottom-right tile, leaving the last Metal drawable static.
+    // A fresh compositing pass must reveal the original green pixel there,
+    // never retain stale native coverage from an old scene.
+    let removed = placements.pop().unwrap();
+    assert_eq!(removed.frame.x, 4096);
+    assert_eq!(removed.frame.y, 2048);
+    state.synchronize_scene(window as usize, &placements);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, WIDTH, HEIGHT, 5000, 3000),
+        [0, 255, 0, 255],
+        "removing final tile erased or corrupted the static opaque Metal source"
+    );
+    drop(state);
+    gpu.destroy_image(source);
+    sdl3::video::destroy_window(window);
+}
+
+/// An atomic replacement of twelve independently retained native images
+/// must make forward progress with both prior and new generations alive.
+/// These old sources exceed the number of GPU submission frame slots.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
+    if isolate_vulkan_graphical_test(
+        "twelve_retained_native_replacements_commit_with_old_generations_pinned",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+    })
+    .unwrap();
+    let metal_id = 905usize;
+    let background = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.push(metal_id);
+    state.synchronize_scene(window as usize, &[background.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            metal_id,
+            &whole,
+            PresentSource::from(&metal),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    let mut old = vec![background.clone()];
+    for n in 0..12u64 {
+        let x = 5 + (n % 4) * 33;
+        let y = 6 + (n / 4) * 31;
+        let red = ScenePlacement {
+            id: (1usize << (usize::BITS - 1)) | (n as usize + 0x400),
+            frame: DirectFrame::from_frame(&appkit::view::Frame {
+                x: x as i32,
+                y: y as i32,
+                width: 20,
+                height: 18,
+                ..whole
+            }),
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: Some(scene::NativeCpuSceneSource {
+                bytes: Arc::new([0u8, 0, 255, 255].repeat(20 * 18)),
+                revision: 1,
+                dmabuf: None,
+            }),
+        };
+        assert_eq!(stage_native_scene_source(&mut state, &red), Ok(true));
+        old.push(red);
+    }
+    state.synchronize_scene(window as usize, &old);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(state.scene_layers.len() > state.frames.len());
+    let before = state.scene_gpu_bytes();
+    state.transaction_pinned = state
+        .scene_layers
+        .iter()
+        .map(|layer| Arc::clone(&layer.snapshot))
+        .collect();
+    let mut updated = old.clone();
+    for entry in &mut updated[1..] {
+        let changed = entry.native.as_mut().unwrap();
+        changed.bytes = Arc::new([255u8, 0, 0, 255].repeat(20 * 18));
+        changed.revision = 2;
+        assert_eq!(stage_native_scene_source(&mut state, entry), Ok(true));
+    }
+    assert!(
+        state.scene_gpu_bytes() > before,
+        "replaced source generations pinned solely for rollback disappeared from accounting"
+    );
+    state.synchronize_scene(window as usize, &updated);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    for entry in &updated[1..] {
+        let x = (entry.frame.x + 5) as u32;
+        let y = (entry.frame.y + 5) as u32;
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                whole.width,
+                whole.height,
+                x,
+                y
+            ),
+            [0, 0, 255, 255],
+            "one of twelve new native GPU generations failed to commit"
+        );
+    }
+    let pinned_footprint = state.scene_gpu_bytes();
+    state.transaction_pinned.clear();
+    state.idle();
+    state.shed_scene_spares();
+    let after = state.scene_gpu_bytes();
+    assert!(
+        after < pinned_footprint,
+        "commit did not release transaction-only GPU generations"
+    );
+    assert!(
+        after <= before.saturating_add(12 * 20 * 18 * 4),
+        "committed 12 native replacements retained too many old GPU generations"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Twelve replaced scene generations may outlive the eight frame slots
+/// solely through transaction rollback pins. They must remain budgeted until
+/// the entire batch commits/rolls back, then capacity must recover.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn twelve_transaction_pinned_gpu_generations_count_toward_scene_budget() {
+    if isolate_vulkan_graphical_test(
+        "twelve_transaction_pinned_gpu_generations_count_toward_scene_budget",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let before = state.scene_gpu_bytes();
+    let dimensions = (2048u32, 2048u32);
+    let one = u64::from(dimensions.0) * u64::from(dimensions.1) * 4;
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: dimensions.0,
+        height: dimensions.1,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for _ in 0..12 {
+        let pinned = BackingImageLease::create_for_window(gpu, window as usize, &desc)
+            .expect("twelve distinct committed old generations");
+        state.transaction_pinned.push(pinned);
+    }
+    assert!(state.transaction_pinned.len() > state.frames.len());
+    assert_eq!(
+        state.scene_gpu_bytes(),
+        before + 12 * one,
+        "rollback-only GPU snapshots vanished from the 512MiB budget"
+    );
+    // Identity-based dedup: an old scene and its transaction pin are one
+    // backing allocation, never twice the physical bytes.
+    state
+        .transaction_pinned
+        .push(Arc::clone(&state.transaction_pinned[0]));
+    assert_eq!(state.scene_gpu_bytes(), before + 12 * one);
+    let future = 350 * 1024 * 1024u64;
+    assert!(
+        !scene::fits_scene_budget(state.scene_gpu_bytes(), future),
+        "a batch overcommitted the 512MiB retained-scene budget"
+    );
+    state.transaction_pinned.clear();
+    assert_eq!(state.scene_gpu_bytes(), before);
+    assert!(
+        scene::fits_scene_budget(state.scene_gpu_bytes(), future),
+        "after old transaction leases retire, a valid replacement must fit"
+    );
+    // Progress also requires the GPU to accept new pixels, not merely a
+    // successful arithmetic budget check.
+    let placement = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 0x201,
+        frame: DirectFrame::from_frame(&appkit::view::Frame {
+            x: 16,
+            y: 14,
+            width: 32,
+            height: 24,
+            ..whole
+        }),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
+            revision: 1,
+            dmabuf: None,
+        }),
+    };
+    assert_eq!(stage_native_scene_source(&mut state, &placement), Ok(true));
+    assert_eq!(
+        state
+            .scene_layers
+            .iter()
+            .find(|s| s.id == placement.id)
+            .unwrap()
+            .native_revision,
+        Some(1)
+    );
+    state.idle();
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 /// A native UI layer appearing after a static *direct WSI* Metal frame must
 /// force a retained snapshot of that direct source before uploading the UI.
 #[test]

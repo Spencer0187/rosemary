@@ -10,7 +10,7 @@ pub(super) struct SceneLayer {
     pub(super) id: usize,
     frame: DirectFrame,
     pub(super) snapshot: Arc<BackingImageLease>,
-    spare: Vec<Arc<BackingImageLease>>,
+    pub(super) spare: Vec<Arc<BackingImageLease>>,
     opacity: f32,
     opaque: bool,
     clip: Option<DirectFrame>,
@@ -704,6 +704,9 @@ impl Swapchain {
             for spare in &layer.spare {
                 count(spare);
             }
+        }
+        for pinned in &self.transaction_pinned {
+            count(pinned);
         }
         for frame in &self.frames {
             if let Some(lease) = &frame.backing {

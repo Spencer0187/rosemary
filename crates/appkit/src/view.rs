@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::c_void;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use foundation::geometry::{CGFloat, NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -110,6 +113,39 @@ pub struct MetalSceneLayer {
     pub native_pixels: Option<std::sync::Arc<Vec<u8>>>,
     pub native_dmabuf: Option<std::sync::Arc<crate::backing::Dmabuf>>,
     pub native_revision: u64,
+    /// Original NSView pointer that owns an independent CPU/DMA image. A
+    /// large view can publish multiple tiles with distinct GPU layer IDs.
+    pub native_owner: usize,
+}
+
+static NATIVE_TILE_IDS: std::sync::LazyLock<Mutex<HashMap<(usize, u32), usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static NATIVE_NEXT_TILE: AtomicUsize = AtomicUsize::new(1);
+
+fn native_tile_id(view: Id, index: u32) -> usize {
+    if index == 0 {
+        return view as usize | (1usize << (usize::BITS - 1));
+    }
+    let mut ids = NATIVE_TILE_IDS.lock().expect("native tile IDs");
+    *ids.entry((view as usize, index)).or_insert_with(|| {
+        (3usize << (usize::BITS - 2)) | NATIVE_NEXT_TILE.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+pub(crate) fn forget_native_tile_ids(view: Id) {
+    NATIVE_TILE_IDS
+        .lock()
+        .expect("native tile IDs")
+        .retain(|(owner, _), _| *owner != view as usize);
+}
+
+fn native_tile_owner(scene_layer: usize) -> usize {
+    NATIVE_TILE_IDS
+        .lock()
+        .expect("native tile IDs")
+        .iter()
+        .find_map(|((owner, _), &layer)| (layer == scene_layer).then_some(*owner))
+        .unwrap_or(scene_layer & !(1usize << (usize::BITS - 1)))
 }
 
 // SAFETY: a snapshot owns only integer layer identities and a copied SDL
@@ -157,15 +193,15 @@ pub fn request_native_cpu_fallback(window: sdl3::Window, scene_layer: usize) {
     invalidate_metal_scene_for_window(window);
 }
 
-fn find_scene_native_view(root: Id, scene_layer: usize, depth: usize) -> Option<Id> {
+fn find_scene_native_view(root: Id, owner: usize, depth: usize) -> Option<Id> {
     if root.is_null() || depth >= 64 || !is_view(root) {
         return None;
     }
-    if (root as usize | (1usize << (usize::BITS - 1))) == scene_layer {
+    if root as usize == owner {
         return Some(root);
     }
     for child in unsafe { children(root) } {
-        if let Some(found) = find_scene_native_view(child, scene_layer, depth + 1) {
+        if let Some(found) = find_scene_native_view(child, owner, depth + 1) {
             return Some(found);
         }
     }
@@ -183,8 +219,11 @@ fn service_native_cpu_fallbacks() {
         if window.is_null() {
             continue;
         }
-        if let Some(view) = find_scene_native_view(crate::window::content_view_of(window), layer, 0)
-        {
+        if let Some(view) = find_scene_native_view(
+            crate::window::content_view_of(window),
+            native_tile_owner(layer),
+            0,
+        ) {
             crate::backing::needs_display(view);
         }
     }
@@ -268,7 +307,7 @@ pub(crate) fn flush_metal_scenes() {
     }
     service_native_cpu_fallbacks();
     let now = darwin::mach::media_time();
-    let animated_roots = crate::coreanimation::scene_opacity_animating(now);
+    let animated_roots = crate::coreanimation::scene_animation_roots(now);
     let animating = !animated_roots.is_empty();
     let was_animating =
         METAL_SCENE_WAS_ANIMATING.swap(animating, std::sync::atomic::Ordering::AcqRel);
@@ -331,7 +370,10 @@ pub(crate) fn flush_metal_scenes() {
                 matched = true;
             }
         }
-        if !matched {
+        if !matched && roots.contains(&root) {
+            // A newly mutated CA root without a known window still needs a
+            // conservative recapture. An idle detached animation does not:
+            // it must not redraw unrelated windows every video-thread tick.
             unknown = true;
         }
     }
@@ -647,6 +689,7 @@ fn visit_metal_scene(
                     native_pixels: None,
                     native_dmabuf: None,
                     native_revision: 0,
+                    native_owner: 0,
                 });
                 *seen_metal = true;
             }
@@ -672,50 +715,85 @@ fn visit_metal_scene(
                 let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
                     intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
                 });
-                let crop = crate::backing::Rect {
-                    x: i64::from(visible.x) - i64::from(frame.x),
-                    y: i64::from(visible.y) - i64::from(frame.y),
-                    width: i64::from(visible.width),
-                    height: i64::from(visible.height),
-                };
                 let bounded =
                     crate::backing::native_scene_extent_supported(frame.width, frame.height);
-                let cpu = if bounded {
-                    crate::backing::native_scene_pixels(view, frame.width, frame.height)
-                } else {
-                    crate::backing::native_scene_pixels_cropped(
-                        view,
-                        frame.width,
-                        frame.height,
-                        crop,
-                    )
-                };
-                // Source admission must agree with both Vulkan's native-scene
-                // converter and the backing-overlay exclusion decision. An
-                // unsupported extent stays in the original full-window path.
                 let dma =
                     crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
                         .then(|| crate::backing::native_dma_overlay(view))
                         .flatten();
-                if cpu.is_some() || dma.is_some() {
-                    let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
-                        ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
-                    scene.push(MetalSceneLayer {
-                        layer: (view as usize) | (1usize << (usize::BITS - 1)),
-                        frame: if !bounded && cpu.is_some() {
-                            visible
+                // The 64 MiB capture bound applies to one allocation, not an
+                // entire visible NSView. Publish 2048x2048 pixel tiles in the
+                // same paint order, each with an independent GPU lease.
+                let large_visible =
+                    !crate::backing::native_scene_extent_supported(visible.width, visible.height);
+                let tile_edge = if large_visible && dma.is_none() {
+                    2048
+                } else {
+                    u32::MAX
+                };
+                let mut index = 0u32;
+                let mut y = 0u32;
+                while y < visible.height {
+                    let height = (visible.height - y).min(tile_edge);
+                    let mut x = 0u32;
+                    while x < visible.width {
+                        let width = (visible.width - x).min(tile_edge);
+                        let part = Frame {
+                            x: visible.x.saturating_add(x as i32),
+                            y: visible.y.saturating_add(y as i32),
+                            width,
+                            height,
+                            ..visible
+                        };
+                        let cropped = crate::backing::Rect {
+                            x: i64::from(part.x) - i64::from(frame.x),
+                            y: i64::from(part.y) - i64::from(frame.y),
+                            width: i64::from(width),
+                            height: i64::from(height),
+                        };
+                        let cpu = if !large_visible && bounded {
+                            crate::backing::native_scene_pixels(view, frame.width, frame.height)
                         } else {
-                            frame
-                        },
-                        opacity: (effective_alpha(view) as f32) * layer_opacity,
-                        opaque: false,
-                        clip: ca_clip,
-                        rounded: rounded.clone(),
-                        occluded: Vec::new(),
-                        native_pixels: cpu.map(|(pixels, _)| pixels),
-                        native_dmabuf: dma.map(|(picture, _)| picture),
-                        native_revision: revision,
-                    });
+                            crate::backing::native_scene_pixels_cropped(
+                                view,
+                                frame.width,
+                                frame.height,
+                                cropped,
+                            )
+                        };
+                        // A DMA source remains one coherent GPU image. A CPU
+                        // tile never borrows a DMA producer's unrelated frame.
+                        if cpu.is_some() || (index == 0 && dma.is_some()) {
+                            let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
+                                ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
+                            scene.push(MetalSceneLayer {
+                                layer: native_tile_id(view, index),
+                                native_owner: view as usize,
+                                frame: if large_visible && dma.is_none()
+                                    || !bounded && cpu.is_some()
+                                {
+                                    part
+                                } else {
+                                    frame
+                                },
+                                opacity: (effective_alpha(view) as f32) * layer_opacity,
+                                opaque: false,
+                                clip: ca_clip,
+                                rounded: rounded.clone(),
+                                occluded: Vec::new(),
+                                native_pixels: cpu.map(|(pixels, _)| pixels),
+                                native_dmabuf: if index == 0 {
+                                    dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p))
+                                } else {
+                                    None
+                                },
+                                native_revision: revision,
+                            });
+                        }
+                        index += 1;
+                        x += width;
+                    }
+                    y += height;
                 }
             }
         }
@@ -4597,6 +4675,280 @@ mod tests {
             assert_eq!(f(layer, get_masks), 0);
         }
         objc::arc::release(view);
+    }
+
+    #[test]
+    fn animated_ca_ancestor_position_and_bounds_republish_static_metal_clipping() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 120.0, 90.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 120.0, 90.0));
+        let metal_view = view(rect(0.0, 0.0, 120.0, 90.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let root = unsafe { make(ca as *const _ as Id, maker) };
+        let mask = unsafe { make(ca as *const _ as Id, maker) };
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make_metal(metal_cls as *const _ as Id, maker) };
+        let set_rect: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mask_clip: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_layer(content, objc::sel::get("setLayer:"), root);
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            set_rect(
+                mask,
+                objc::sel::get("setFrame:"),
+                rect(12.0, 8.0, 42.0, 30.0),
+            );
+            set_content(root, objc::sel::get("addSublayer:"), mask);
+            set_content(mask, objc::sel::get("addSublayer:"), metal);
+            mask_clip(mask, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        flush_metal_scenes();
+        let clip = || {
+            metal_scene(sdl)
+                .unwrap()
+                .into_iter()
+                .find(|source| source.layer == metal as usize)
+                .and_then(|source| source.clip)
+                .expect("animated middle CA mask clipped static Metal")
+        };
+        let model = clip();
+        assert!(model.width > 0 && model.height > 0);
+        let anim_cls = objc::class::lookup(c"CABasicAnimation").unwrap();
+        let animate: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_f64: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add_animation: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let number = |value: f64| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(
+                value,
+            )) as Id
+        };
+        let animate_path = |path: &str, from: f64, to: f64| {
+            let key = foundation::string::from_str(path);
+            let anim = unsafe {
+                animate(
+                    anim_cls as *const _ as Id,
+                    objc::sel::get("animationWithKeyPath:"),
+                    key,
+                )
+            };
+            let start = number(from);
+            let end = number(to);
+            unsafe {
+                set_obj(anim, objc::sel::get("setFromValue:"), start);
+                set_obj(anim, objc::sel::get("setToValue:"), end);
+                set_f64(anim, objc::sel::get("setDuration:"), 0.30);
+                set_f64(
+                    anim,
+                    objc::sel::get("setBeginTime:"),
+                    darwin::mach::media_time() - 0.15,
+                );
+                add_animation(mask, objc::sel::get("addAnimation:forKey:"), anim, key);
+            }
+            objc::arc::release(start);
+            objc::arc::release(end);
+            objc::arc::release(key);
+        };
+        animate_path("position.x", 33.0, 69.0);
+        animate_path("bounds.size.width", 32.0, 70.0);
+        assert!(
+            !crate::coreanimation::scene_animation_roots(darwin::mach::media_time()).is_empty()
+        );
+        flush_metal_scenes();
+        let middle = clip();
+        assert!(
+            middle.x != model.x || middle.width != model.width,
+            "static Metal clipping did not reflect interpolated CA position/width"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        flush_metal_scenes();
+        let later = clip();
+        assert!(
+            middle.x != later.x || middle.width != later.width,
+            "static Metal did not receive a subsequent geometry-only CA animation tick"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(165));
+        flush_metal_scenes();
+        let final_clip = clip();
+        assert_eq!(
+            (
+                final_clip.x,
+                final_clip.y,
+                final_clip.width,
+                final_clip.height
+            ),
+            (model.x, model.y, model.width, model.height),
+            "finished position/bounds animation did not restore model clip without new drawable"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn fully_visible_six_k_cpu_foreground_tiles_above_opaque_metal() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        const WIDTH: usize = 6016;
+        const HEIGHT: usize = 3384;
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(
+                window,
+                rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64),
+            )
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64));
+        let metal_view = view(rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64));
+        let above = view(rect(0.0, 0.0, WIDTH as f64, HEIGHT as f64));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(
+                metal_cls
+                    .metaclass()
+                    .method(maker)
+                    .unwrap()
+                    .implementation(),
+            )
+        };
+        let metal = unsafe { make(metal_cls as *const _ as Id, maker) };
+        unsafe {
+            set_layer(metal_view, objc::sel::get("setLayer:"), metal);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), above);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            above,
+            WIDTH as u32,
+            HEIGHT as u32,
+            [0u8, 0, 255, 255].repeat(WIDTH * HEIGHT),
+        );
+        assert!(!crate::backing::native_scene_extent_supported(
+            WIDTH as u32,
+            HEIGHT as u32
+        ));
+        flush_metal_scenes();
+        let published = metal_scene(sdl).expect("Metal/native scene");
+        let tiles: Vec<_> = published
+            .iter()
+            .filter(|p| p.native_owner == above as usize)
+            .collect();
+        assert!(
+            tiles.len() >= 6,
+            "large visible native view is missing its tiled scene: {} tiles",
+            tiles.len()
+        );
+        assert_eq!(published[0].layer, metal as usize);
+        let mut ids = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for tile in &tiles {
+            assert!(ids.insert(tile.layer), "two tiles shared one GPU layer ID");
+            assert!(tile.native_pixels.as_ref().unwrap().len() <= 64 * 1024 * 1024);
+            assert_eq!(
+                tile.native_pixels.as_ref().unwrap().len(),
+                tile.frame.width as usize * tile.frame.height as usize * 4
+            );
+            assert_eq!(
+                &tile.native_pixels.as_ref().unwrap()[..4],
+                &[0, 0, 255, 255]
+            );
+            total += u64::from(tile.frame.width) * u64::from(tile.frame.height);
+        }
+        assert_eq!(
+            total,
+            (WIDTH * HEIGHT) as u64,
+            "tile coverage had a hole or overlap"
+        );
+        assert!(
+            crate::backing::gpu_under_metal_cached(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_none(),
+            "unadmitted large foreground was removed from flattened backup"
+        );
+        let admitted: Vec<_> = tiles.iter().map(|p| (p.layer, p.native_revision)).collect();
+        crate::backing::set_native_gpu_admission(sdl, &admitted[..admitted.len() - 1]);
+        assert!(
+            crate::backing::gpu_under_metal_cached(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_none(),
+            "one accepted tile prematurely excluded the whole native view"
+        );
+        crate::backing::set_native_gpu_admission(sdl, &admitted);
+        let underlay = crate::backing::gpu_under_metal_cached(
+            sdl,
+            &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32),
+        )
+        .expect("all tile revisions were admitted");
+        assert_eq!(underlay.pixels.len(), WIDTH * HEIGHT * 4);
+        let first_capture = crate::backing::native_render_count_for_tests();
+        let old: Vec<_> = tiles
+            .iter()
+            .map(|p| p.native_pixels.as_ref().unwrap().clone())
+            .collect();
+        for _ in 0..3 {
+            invalidate_metal_scene_for_window(sdl);
+            flush_metal_scenes();
+            let current = metal_scene(sdl).unwrap();
+            let actual: Vec<_> = current
+                .iter()
+                .filter(|p| p.native_owner == above as usize)
+                .collect();
+            assert_eq!(actual.len(), old.len());
+            for (tile, pixels) in actual.iter().zip(old.iter()) {
+                assert!(
+                    std::sync::Arc::ptr_eq(tile.native_pixels.as_ref().unwrap(), pixels),
+                    "unchanged 6K tile rerendered instead of using retained Arc"
+                );
+            }
+        }
+        assert_eq!(
+            crate::backing::native_render_count_for_tests(),
+            first_capture
+        );
+        crate::backing::forget(above);
+        objc::arc::release(window);
     }
 
     #[test]
