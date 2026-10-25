@@ -222,7 +222,7 @@ impl Rect {
         pieces
     }
 
-    fn union(&self, other: &Rect) -> Rect {
+    pub(crate) fn union(&self, other: &Rect) -> Rect {
         if self.is_empty() {
             return *other;
         }
@@ -1770,11 +1770,12 @@ fn native_scene_pixels_impl(
     crop: Rect,
     metal_children: bool,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    if crop.x < 0
-        || crop.y < 0
+    if (!metal_children
+        && (crop.x < 0
+            || crop.y < 0
+            || crop.x.checked_add(crop.width)? > i64::from(width)
+            || crop.y.checked_add(crop.height)? > i64::from(height)))
         || crop.is_empty()
-        || crop.x.checked_add(crop.width)? > i64::from(width)
-        || crop.y.checked_add(crop.height)? > i64::from(height)
         || !native_scene_extent_supported(crop.width as u32, crop.height as u32)
     {
         return None;

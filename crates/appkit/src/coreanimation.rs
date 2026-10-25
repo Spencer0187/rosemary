@@ -2701,6 +2701,77 @@ pub(crate) fn has_renderable_sublayers(layer: Id) -> bool {
     })
 }
 
+/// Conservative physical extent of independently rasterized descendants.
+/// A Metal root's children may escape its bounds when masksToBounds is false.
+pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
+    let root = crate::view::layer_of(view);
+    let mapping = Mapping::for_view(view, rect)?;
+    let now = darwin::mach::media_time();
+    let presented = presentation(root, now);
+    if presented.hidden {
+        return None;
+    }
+    let excluded = crate::view::descendant_view_layers(view);
+    let root_clip = presented
+        .masks_to_bounds
+        .then_some(mapping.to_pixels(mapping.view_bounds));
+    let origin = NSPoint {
+        x: mapping.view_bounds.origin.x - presented.bounds_origin.x,
+        y: mapping.view_bounds.origin.y - presented.bounds_origin.y,
+    };
+    fn extent(
+        layer: Id,
+        mapping: &Mapping,
+        origin: NSPoint,
+        clip: Option<Rect>,
+        excluded: &[usize],
+        now: f64,
+        depth: usize,
+    ) -> Option<Rect> {
+        if depth >= 64 || excluded.contains(&(layer as usize)) {
+            return None;
+        }
+        let shown = presentation(layer, now);
+        if shown.hidden {
+            return None;
+        }
+        let frame = shown.frame_at(origin);
+        let pixels = mapping.to_pixels(frame);
+        let clipped = clip.map_or(pixels, |clip| pixels.intersection(&clip));
+        let mut union = (!clipped.is_empty()).then_some(clipped);
+        let child_clip = if shown.masks_to_bounds {
+            Some(clip.map_or(pixels, |clip| clip.intersection(&pixels)))
+        } else {
+            clip
+        };
+        let inner = NSPoint {
+            x: frame.origin.x - shown.bounds_origin.x,
+            y: frame.origin.y - shown.bounds_origin.y,
+        };
+        for child in shown.sublayers {
+            if let Some(part) = extent(
+                child as Id,
+                mapping,
+                inner,
+                child_clip,
+                excluded,
+                now,
+                depth + 1,
+            ) {
+                union = Some(union.map_or(part, |old| old.union(&part)));
+            }
+        }
+        union
+    }
+    let mut union: Option<Rect> = None;
+    for child in presented.sublayers {
+        if let Some(part) = extent(child as Id, &mapping, origin, root_clip, &excluded, now, 0) {
+            union = Some(union.map_or(part, |old| old.union(&part)));
+        }
+    }
+    union
+}
+
 pub(crate) fn render_metal_sublayers(view: Id, store: &mut Store, rect: Rect, clip: Rect) -> bool {
     let root = crate::view::layer_of(view);
     if root.is_null() || !crate::layer::is_metal(root) {

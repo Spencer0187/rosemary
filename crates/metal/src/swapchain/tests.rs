@@ -14295,7 +14295,10 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         .expect("Metal root CA child must be separately composited");
     let old_pixels = overlay_before.native_pixels.as_ref().unwrap();
     let first_red = old_pixels.chunks_exact(4).position(|p| p[3] != 0).unwrap();
-    let old_point = ((first_red % 120) as u32, (first_red / 120) as u32);
+    let old_point = (
+        overlay_before.frame.x as u32 + (first_red % overlay_before.frame.width as usize) as u32,
+        overlay_before.frame.y as u32 + (first_red / overlay_before.frame.width as usize) as u32,
+    );
     let gpu = crate::vulkan::adapters()
         .unwrap()
         .first()
@@ -14427,13 +14430,12 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         .find(|part| part.native_pixels.is_some())
         .unwrap();
     let new_pixels = updated.native_pixels.as_ref().unwrap();
-    let new_red = new_pixels
-        .chunks_exact(4)
-        .enumerate()
-        .find(|(i, p)| p[3] != 0 && old_pixels[i * 4 + 3] == 0)
-        .map(|(i, _)| i)
-        .unwrap();
-    let new_point = ((new_red % 120) as u32, (new_red / 120) as u32);
+    let new_red = new_pixels.chunks_exact(4).position(|p| p[3] != 0).unwrap();
+    let new_point = (
+        updated.frame.x as u32 + (new_red % updated.frame.width as usize) as u32,
+        updated.frame.y as u32 + (new_red / updated.frame.width as usize) as u32,
+    );
+    assert_ne!(old_point, new_point);
     let next = make_scene(changed);
     for native in next.iter().filter(|p| p.native.is_some()) {
         assert_eq!(stage_native_scene_source(&mut state, native), Ok(true));

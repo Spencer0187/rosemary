@@ -745,7 +745,28 @@ fn visit_metal_scene(
             height: frame.window_height,
             ..frame
         };
-        let visible = intersect_scene_clips(frame, viewport);
+        let descendants = crate::coreanimation::metal_sublayers_extent(
+            view,
+            crate::backing::Rect {
+                x: i64::from(frame.x),
+                y: i64::from(frame.y),
+                width: i64::from(frame.width),
+                height: i64::from(frame.height),
+            },
+        );
+        let descendants = descendants.unwrap_or_default();
+        let extent = Frame {
+            x: descendants
+                .x
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            y: descendants
+                .y
+                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+            width: descendants.width.clamp(0, i64::from(u32::MAX)) as u32,
+            height: descendants.height.clamp(0, i64::from(u32::MAX)) as u32,
+            ..frame
+        };
+        let visible = intersect_scene_clips(extent, viewport);
         let visible = ca_clip.map_or(visible, |clip| intersect_scene_clips(visible, clip));
         const TILE_EDGE: u32 = 2048;
         let mut index = 0u32;
@@ -4032,11 +4053,25 @@ mod tests {
         assert_eq!(native.native_owner, metal_view as usize);
         let before = native.native_pixels.as_ref().unwrap();
         assert!(before.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        let full = crate::backing::metal_sublayers_pixels_cropped(
+            metal_view,
+            100,
+            80,
+            crate::backing::Rect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 80,
+            },
+        )
+        .expect("full retained CA raster")
+        .0;
         assert!(
-            before.chunks_exact(4).any(|pixel| pixel[3] == 0),
+            full.chunks_exact(4).any(|pixel| pixel[3] == 0),
             "root Metal background must not be rasterized over its drawable"
         );
         let original_revision = native.native_revision;
+        let original_frame = native.frame;
         let original_pixels = std::sync::Arc::clone(before);
         // Move the non-view child; no new Metal drawable is submitted.
         unsafe {
@@ -4049,10 +4084,14 @@ mod tests {
             .iter()
             .find(|item| item.native_pixels.is_some())
             .unwrap();
-        assert_ne!(changed.native_revision, original_revision);
-        assert_ne!(
-            &**changed.native_pixels.as_ref().unwrap(),
-            &*original_pixels
+        assert!(
+            changed.frame != original_frame,
+            "moving CA child must move scene geometry"
+        );
+        assert_eq!(changed.native_revision, original_revision);
+        assert_eq!(
+            changed.native_pixels.as_ref().unwrap().as_slice(),
+            original_pixels.as_slice()
         );
         assert!(std::sync::Arc::ptr_eq(&original_pixels, before));
         // Root opacity is scene metadata, not pre-applied to sublayer pixels.
@@ -4096,6 +4135,80 @@ mod tests {
                 .filter(|layer| layer.native_pixels.is_some())
                 .count(),
             0
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn unmasked_metal_root_child_extends_beyond_view_and_masks_clip_it() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 100., 80.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0., 0., 100., 80.));
+        let metal_view = view(rect(20., 20., 40., 30.));
+        let class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let child_cls = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let root = unsafe { make(class as *const _ as Id, objc::sel::get("layer")) };
+        let child = unsafe { make(child_cls as *const _ as Id, objc::sel::get("layer")) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_mask: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), root);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set_frame(child, objc::sel::get("setFrame:"), rect(-15., 5., 25., 12.));
+            set(child, objc::sel::get("setBackgroundColor:"), red as Id);
+            set(root, objc::sel::get("addSublayer:"), child);
+        }
+        flush_metal_scenes();
+        let unmasked = metal_scene(sdl).unwrap();
+        let drawable = unmasked
+            .iter()
+            .find(|item| item.layer == root as usize)
+            .unwrap();
+        let unmasked_raster = unmasked
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert!(
+            unmasked_raster.frame.x < drawable.frame.x,
+            "unmasked CA descendant was clipped at the Metal view boundary"
+        );
+        assert!(
+            unmasked_raster
+                .native_pixels
+                .as_ref()
+                .unwrap()
+                .chunks_exact(4)
+                .any(|px| px[3] > 0)
+        );
+        unsafe {
+            set_mask(root, objc::sel::get("setMasksToBounds:"), 1);
+        }
+        flush_metal_scenes();
+        let masked = metal_scene(sdl).unwrap();
+        let masked_raster = masked
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert!(
+            masked_raster.frame.x >= drawable.frame.x,
+            "masksToBounds did not clip the escaped CA child"
         );
         objc::arc::release(window);
     }
