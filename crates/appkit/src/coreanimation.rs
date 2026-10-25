@@ -391,6 +391,31 @@ pub(crate) fn scene_opacity(layer: Id) -> f32 {
 }
 
 #[cfg(test)]
+pub(crate) fn set_underlay_animation_for_test(layer: Id, fraction: Option<f64>) {
+    with_node(layer, |node| {
+        node.background = Some([1.0, 0.0, 0.0, 1.0]);
+        node.animations.clear();
+        if let Some(fraction) = fraction {
+            node.animations.push((
+                "underlay-opacity".into(),
+                Running {
+                    object: 0,
+                    spec: Spec {
+                        key_path: "opacity".into(),
+                        from: Some(0.0),
+                        to: Some(1.0),
+                        duration: 20.0,
+                        ..Spec::default()
+                    },
+                    start: darwin::mach::media_time() - 20.0 * fraction,
+                },
+            ));
+        }
+    });
+    update_opacity_animation_registry(layer);
+}
+
+#[cfg(test)]
 pub(crate) unsafe fn set_opacity_for_test(layer: Id, opacity: f32) {
     unsafe { set_opacity(layer, objc::sel::get("setOpacity:"), opacity) };
 }
@@ -488,6 +513,16 @@ pub(crate) fn native_scene_tree_revision(layer: Id) -> u64 {
 /// descendant, its color or its transform changes the CPU-rendered pixels.
 /// Such images must not be memoized using the unchanged model content epoch.
 pub(crate) fn native_scene_content_animating(layer: Id, now: f64) -> bool {
+    scene_content_animating(layer, now, false)
+}
+
+/// Unlike independently composed native sources, flattened backgrounds have
+/// already applied their root CA opacity to pixels below the Metal drawable.
+pub(crate) fn flattened_underlay_content_animating(layer: Id, now: f64) -> bool {
+    scene_content_animating(layer, now, true)
+}
+
+fn scene_content_animating(layer: Id, now: f64, root_opacity: bool) -> bool {
     if layer.is_null() {
         return false;
     }
@@ -496,6 +531,7 @@ pub(crate) fn native_scene_content_animating(layer: Id, now: f64) -> bool {
             nodes: &HashMap<usize, Node>,
             id: usize,
             root: bool,
+            root_opacity: bool,
             now: f64,
             depth: usize,
         ) -> bool {
@@ -506,14 +542,14 @@ pub(crate) fn native_scene_content_animating(layer: Id, now: f64) -> bool {
                 return false;
             };
             node.animations.iter().any(|(_, running)| {
-                (!root || running.spec.key_path != "opacity")
+                (root_opacity || !root || running.spec.key_path != "opacity")
                     && !progress(&running.spec, running.start, now).1
             }) || node
                 .sublayers
                 .iter()
-                .any(|child| visit(nodes, *child, false, now, depth + 1))
+                .any(|child| visit(nodes, *child, false, root_opacity, now, depth + 1))
         }
-        visit(nodes, layer as usize, true, now, 0)
+        visit(nodes, layer as usize, true, root_opacity, now, 0)
     })
 }
 

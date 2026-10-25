@@ -348,7 +348,12 @@ pub(crate) fn flush_metal_scenes() {
         if !global && !affected.contains(&(sdl as usize)) {
             continue;
         }
-        if damage || !roots.is_empty() && (unknown || affected.contains(&(sdl as usize))) {
+        let underlay_animating =
+            (animating || was_animating) && crate::backing::underlay_animation_tick(sdl, now);
+        if underlay_animating
+            || damage
+            || !roots.is_empty() && (unknown || affected.contains(&(sdl as usize)))
+        {
             #[cfg(test)]
             METAL_SCENE_DAMAGED_WINDOWS
                 .lock()
@@ -4856,6 +4861,190 @@ mod tests {
             crate::backing::remove_overlay(native);
         }
         objc::arc::release(window);
+    }
+
+    #[test]
+    fn flattened_root_ca_opacity_animation_refreshes_underlay_and_final_tick() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 160.0, 120.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 160.0, 120.0));
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+        let back = view(rect(0.0, 0.0, 160.0, 120.0));
+        let middle = view(rect(0.0, 0.0, 160.0, 120.0));
+        let front = view(rect(16.0, 18.0, 48.0, 32.0));
+        let ca = objc::class::lookup(c"CALayer").unwrap();
+        let metal = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(ca.metaclass().method(maker).unwrap().implementation()) };
+        let make_metal: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let back_layer = unsafe { make(ca as *const _ as Id, maker) };
+        crate::layer::set_bounds_of(back_layer, bounds_of(back));
+        unsafe {
+            set_layer(back, objc::sel::get("setLayer:"), back_layer);
+            set_layer(
+                middle,
+                objc::sel::get("setLayer:"),
+                make_metal(metal as *const _ as Id, maker),
+            );
+            add_subview(content, objc::sel::get("addSubview:"), back);
+            add_subview(content, objc::sel::get("addSubview:"), middle);
+            add_subview(content, objc::sel::get("addSubview:"), front);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            front,
+            48,
+            32,
+            [0, 255, 0, 255].repeat(48 * 32),
+        );
+        flush_metal_scenes();
+        let flat = crate::backing::Store::new(160, 120);
+        crate::coreanimation::set_underlay_animation_for_test(back_layer, None);
+        let original = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+        let sample = (64 * original.width as usize + 100) * 4;
+        let initial = &original.pixels[sample..sample + 4];
+        assert_eq!(initial[2], 255);
+        for fraction in [0.2, 0.5, 0.8] {
+            crate::coreanimation::set_underlay_animation_for_test(back_layer, Some(fraction));
+            assert!(crate::coreanimation::flattened_underlay_content_animating(
+                back_layer,
+                darwin::mach::media_time()
+            ));
+            assert!(
+                !crate::coreanimation::native_scene_content_animating(
+                    back_layer,
+                    darwin::mach::media_time()
+                ),
+                "foreground native captures must still exclude root-opacity-only animation"
+            );
+            let redraw_before = crate::backing::gpu_underlay_render_count_for_tests();
+            let updated = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+            assert!(!std::sync::Arc::ptr_eq(&original, &updated));
+            assert!(crate::backing::gpu_underlay_render_count_for_tests() > redraw_before);
+            let red = updated.pixels[sample + 2];
+            assert!(
+                red > 0 && red < 255,
+                "interpolated background opacity missing: {red}"
+            );
+            assert!(crate::backing::underlay_animation_tick(
+                sdl,
+                darwin::mach::media_time()
+            ));
+            flush_metal_scenes();
+        }
+        crate::coreanimation::set_underlay_animation_for_test(back_layer, None);
+        // End-of-animation model opacity is restored, even if the previous
+        // content epoch and the static geometry remain unchanged.
+        assert!(crate::backing::underlay_animation_tick(
+            sdl,
+            darwin::mach::media_time()
+        ));
+        let final_pixels = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
+        assert_eq!(final_pixels.pixels[sample + 2], 255);
+        assert!(!std::sync::Arc::ptr_eq(&original, &final_pixels));
+        assert_eq!(
+            crate::backing::gpu_under_metal_cached(sdl, &flat)
+                .unwrap()
+                .pixels,
+            final_pixels.pixels
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn destroyed_view_only_evicts_its_window_underlay() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let metal = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let maker = objc::sel::get("layer");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id = unsafe {
+            std::mem::transmute(metal.metaclass().method(maker).unwrap().implementation())
+        };
+        let set_content: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let mut windows = Vec::new();
+        let mut sdls = Vec::new();
+        let mut transient = Vec::new();
+        for _ in 0..2 {
+            let window =
+                objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            if !unsafe {
+                crate::window::init_with_content_rect_for_tests(
+                    window,
+                    rect(0.0, 0.0, 160.0, 120.0),
+                )
+            } {
+                for old in windows {
+                    objc::arc::release(old);
+                }
+                return;
+            }
+            let sdl = unsafe { crate::window::sdl_window(window) };
+            let content = view(rect(0.0, 0.0, 160.0, 120.0));
+            unsafe { set_content(window, objc::sel::get("setContentView:"), content) };
+            let beneath = view(rect(5.0, 6.0, 70.0, 40.0));
+            let metal_view = view(rect(0.0, 0.0, 160.0, 120.0));
+            let above = view(rect(10.0, 10.0, 40.0, 30.0));
+            unsafe {
+                set_layer(
+                    metal_view,
+                    objc::sel::get("setLayer:"),
+                    make(metal as *const _ as Id, maker),
+                );
+                add_subview(content, objc::sel::get("addSubview:"), beneath);
+                add_subview(content, objc::sel::get("addSubview:"), metal_view);
+                add_subview(content, objc::sel::get("addSubview:"), above);
+            }
+            crate::backing::set_native_view_pixels_for_tests(
+                above,
+                40,
+                30,
+                [0, 0, 255, 255].repeat(40 * 30),
+            );
+            windows.push(window);
+            sdls.push(sdl);
+            transient.push(beneath);
+        }
+        flush_metal_scenes();
+        let flat = crate::backing::Store::new(160, 120);
+        let first = crate::backing::gpu_under_metal_cached(sdls[0], &flat).unwrap();
+        let second = crate::backing::gpu_under_metal_cached(sdls[1], &flat).unwrap();
+        let before = crate::backing::gpu_underlay_render_count_for_tests();
+        // Simulate the exact deallocation invalidation before Objective-C
+        // recycles an address with the same initial backing generation.
+        crate::backing::forget(transient[0]);
+        let unchanged = crate::backing::gpu_under_metal_cached(sdls[1], &flat).unwrap();
+        assert!(
+            std::sync::Arc::ptr_eq(&second, &unchanged),
+            "destroying window A view evicted window B cached backing"
+        );
+        assert_eq!(
+            crate::backing::gpu_underlay_render_count_for_tests(),
+            before
+        );
+        let recreated = crate::backing::gpu_under_metal_cached(sdls[0], &flat).unwrap();
+        assert!(
+            !std::sync::Arc::ptr_eq(&first, &recreated),
+            "view address reuse must not preserve its former cached underlay"
+        );
+        for window in windows {
+            objc::arc::release(window);
+        }
     }
 
     #[test]

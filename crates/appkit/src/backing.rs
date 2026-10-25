@@ -877,6 +877,10 @@ pub(crate) fn needs_display_in_tree(view: Id, depth: usize) {
 /// a store left behind would be handed to the next window made - at the size the
 /// old one was.
 pub fn forget_window(sdl: sdl3::Window) {
+    UNDERLAY_ANIMATING_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
     GPU_UNDERLAYS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -916,11 +920,14 @@ pub fn layer_drew_on_surface(sdl: sdl3::Window, layer: usize) {
 pub(crate) fn forget(view: Id) {
     // A new view may reuse this address with an identical initial generation.
     // The old underlay is never safe across that lifetime transition.
+    let key = view as usize;
+    // An address may be recycled with generation zero. Evict only underlays
+    // which actually read this NSView while it was alive; unrelated windows
+    // retain their immutable backing images and cached upload identities.
     GPU_UNDERLAYS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clear();
-    let key = view as usize;
+        .retain(|_, entry| !entry.views.contains(&key));
     NATIVE_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1601,8 +1608,18 @@ pub fn native_scene_pixels_cropped(
 /// One immutable underlay per window, keyed only by content below the
 /// first Metal view. Changes to independently composited native foreground
 /// must not force a 4K CPU reconstruction or an unchanged GPU upload.
-static GPU_UNDERLAYS: std::sync::LazyLock<Mutex<HashMap<usize, (u64, std::sync::Arc<Store>)>>> =
+struct GpuUnderlayCache {
+    fingerprint: u64,
+    pixels: std::sync::Arc<Store>,
+    // Only NSViews contributing below the first Metal layer affect this Arc.
+    // Keep identities through detach until the cache is rebuilt, so a later
+    // pointer reuse cannot resurrect an old view's pixels.
+    views: std::collections::HashSet<usize>,
+}
+static GPU_UNDERLAYS: std::sync::LazyLock<Mutex<HashMap<usize, GpuUnderlayCache>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static UNDERLAY_ANIMATING_WINDOWS: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 #[cfg(test)]
 static GPU_UNDERLAY_RENDERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -1643,6 +1660,10 @@ pub fn gpu_under_metal_cached(sdl: sdl3::Window, source: &Store) -> Option<std::
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     let overlays = OVERLAY_REVISIONS.lock().unwrap_or_else(|e| e.into_inner());
     let mut animating = false;
+    let deps: std::collections::HashSet<usize> = placed[..first]
+        .iter()
+        .map(|placed| placed.view as usize)
+        .collect();
     for p in &placed[..first] {
         (p.view as usize, p.rect, p.clip).hash(&mut key);
         p.alpha.to_bits().hash(&mut key);
@@ -1654,20 +1675,30 @@ pub fn gpu_under_metal_cached(sdl: sdl3::Window, source: &Store) -> Option<std::
         overlays.get(&(p.view as usize)).hash(&mut key);
         let layer = crate::view::layer_of(p.view);
         crate::coreanimation::native_scene_tree_revision(layer).hash(&mut key);
-        animating |=
-            crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time());
+        animating |= crate::coreanimation::flattened_underlay_content_animating(
+            layer,
+            darwin::mach::media_time(),
+        );
     }
     drop(overlays);
     drop(views);
     let fingerprint = key.finish();
-    if !animating {
+    if animating {
+        // The same static model revision can describe arbitrarily many
+        // presentation-opacity frames. Do not resurrect pre-animation pixels
+        // once the animation finishes with its original model value.
+        GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(sdl as usize));
+    } else {
         if let Some(hit) = GPU_UNDERLAYS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(sdl as usize))
-            .filter(|(key, _)| *key == fingerprint)
+            .filter(|entry| entry.fingerprint == fingerprint)
         {
-            return Some(std::sync::Arc::clone(&hit.1));
+            return Some(std::sync::Arc::clone(&hit.pixels));
         }
     }
     let result = std::sync::Arc::new(gpu_under_metal(sdl, source)?);
@@ -1675,9 +1706,49 @@ pub fn gpu_under_metal_cached(sdl: sdl3::Window, source: &Store) -> Option<std::
         GPU_UNDERLAYS
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(sdl as usize, (fingerprint, std::sync::Arc::clone(&result)));
+            .insert(
+                sdl as usize,
+                GpuUnderlayCache {
+                    fingerprint,
+                    pixels: std::sync::Arc::clone(&result),
+                    views: deps,
+                },
+            );
     }
     Some(result)
+}
+
+/// A flattened background animation needs fresh CPU backing pixels even if
+/// the Metal scene's own metadata is unchanged. The last tick after animation
+/// expiration must restore the model value once rather than freezing the
+/// final interpolated frame.
+pub(crate) fn underlay_animation_tick(sdl: sdl3::Window, now: f64) -> bool {
+    let window = crate::window::window_for(sdl);
+    let active = if window.is_null() {
+        false
+    } else {
+        let placed = place_tree(window, sdl);
+        let first = placed
+            .iter()
+            .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)));
+        first.is_some_and(|first| {
+            placed[..first].iter().any(|p| {
+                crate::coreanimation::flattened_underlay_content_animating(
+                    crate::view::layer_of(p.view),
+                    now,
+                )
+            })
+        })
+    };
+    let mut running = UNDERLAY_ANIMATING_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let was = if active {
+        running.insert(sdl as usize)
+    } else {
+        running.remove(&(sdl as usize))
+    };
+    active || was
 }
 
 /// A native source belongs outside the bottom store only once its complete
