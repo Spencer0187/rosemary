@@ -25,6 +25,114 @@ pub(super) struct SceneLayer {
     pub(super) ready: bool,
 }
 
+// Previous accepted layers are private rollback data, not a drawable scene.
+// Once a superseded GPU image is escrowed, this manifest owns its metadata
+// and exact host pixels without retaining an alias to the retired image.
+#[derive(Clone)]
+pub(super) struct SavedSceneMetadata {
+    id: usize,
+    frame: DirectFrame,
+    opacity: f32,
+    opaque: bool,
+    clip: Option<DirectFrame>,
+    rounded: Vec<RoundedClip>,
+    regions: Option<Vec<Region>>,
+    native_revision: Option<u64>,
+    native_published_revision: Option<u64>,
+    native_dma_sample: Option<DmaSample>,
+    ready: bool,
+}
+
+impl SavedSceneMetadata {
+    fn from_layer(layer: &SceneLayer) -> Self {
+        Self {
+            id: layer.id,
+            frame: layer.frame,
+            opacity: layer.opacity,
+            opaque: layer.opaque,
+            clip: layer.clip,
+            rounded: layer.rounded.clone(),
+            regions: layer.regions.clone(),
+            native_revision: layer.native_revision,
+            native_published_revision: layer.native_published_revision,
+            native_dma_sample: layer.native_dma_sample,
+            ready: layer.ready,
+        }
+    }
+
+    fn reconstitute(&self, snapshot: Arc<BackingImageLease>) -> SceneLayer {
+        SceneLayer {
+            id: self.id,
+            frame: self.frame,
+            snapshot,
+            spare: Vec::new(),
+            opacity: self.opacity,
+            opaque: self.opaque,
+            clip: self.clip,
+            rounded: self.rounded.clone(),
+            regions: self.regions.clone(),
+            native_revision: self.native_revision,
+            native_published_revision: self.native_published_revision,
+            native_dma_sample: self.native_dma_sample,
+            ready: self.ready,
+        }
+    }
+}
+
+pub(super) enum SceneRollbackLayer {
+    Gpu(SceneLayer),
+    Cpu {
+        metadata: SavedSceneMetadata,
+        pixels: NativeGpuEscrow,
+    },
+}
+
+impl SceneRollbackLayer {
+    pub(super) fn from_gpu(layer: SceneLayer) -> Self {
+        Self::Gpu(layer)
+    }
+
+    pub(super) fn resident(&self) -> Option<&SceneLayer> {
+        match self {
+            Self::Gpu(layer) => Some(layer),
+            Self::Cpu { .. } => None,
+        }
+    }
+
+    pub(super) fn escrow_bytes(&self) -> u64 {
+        match self {
+            Self::Cpu { pixels, .. } => pixels.pixels.len() as u64,
+            Self::Gpu(_) => 0,
+        }
+    }
+
+    // Only a complete, fence-confirmed readback may replace GPU ownership.
+    pub(super) fn replace_with_escrow(&mut self, pixels: NativeGpuEscrow) {
+        let Self::Gpu(layer) = self else {
+            unreachable!("already escrowed rollback source");
+        };
+        let metadata = SavedSceneMetadata::from_layer(layer);
+        // Dropping the old variant retires its final GPU lease, provided no
+        // still-submitted frame owns another reference.
+        *self = Self::Cpu { metadata, pixels };
+    }
+
+    // A failure does not consume CPU data. The transaction may retry safely
+    // once enough physical budget is available to recreate every old image.
+    pub(super) fn materialize(
+        &self,
+        gpu: &'static Gpu,
+        window: usize,
+    ) -> Result<SceneLayer, String> {
+        match self {
+            Self::Gpu(layer) => Ok(layer.clone()),
+            Self::Cpu { metadata, pixels } => {
+                Ok(metadata.reconstitute(pixels.restore(gpu, window)?))
+            }
+        }
+    }
+}
+
 pub(super) struct SceneWork {
     current: usize,
     previous: Option<usize>,

@@ -1,7 +1,7 @@
 mod corners;
 mod present;
 mod scene;
-use scene::{SceneBlender, SceneLayer, ScenePlacement, ScenePrepared};
+use scene::{SceneBlender, SceneLayer, ScenePlacement, ScenePrepared, SceneRollbackLayer};
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
@@ -197,6 +197,9 @@ struct Swapchain {
     /// An incomplete source batch has altered GPU pixels. Never publish its
     /// accumulator until the previously committed scene is recomposed.
     scene_restore_pending: bool,
+    /// Host or GPU copies of the last accepted image generations, pending
+    /// complete reconstruction before another frame can be published.
+    pending_scene_rollback: Option<Vec<SceneRollbackLayer>>,
     #[cfg(test)]
     injected_restore_busy_cycles: u32,
     #[cfg(test)]
@@ -2423,6 +2426,126 @@ fn stage_native_scene_source(
     Ok(true)
 }
 
+enum NativeEscrowProgress {
+    Released,
+    WaitingForReaders,
+    NoCandidate,
+}
+
+// Shed a superseded, fully admitted native GPU generation only after its
+// exact pixels have been copied to a bounded CPU rollback record. No scene
+// publication may occur until this transaction has either committed or its
+// old snapshots have been reconstructed.
+fn escrow_one_retired_native(
+    state: &mut Swapchain,
+    rollback: &mut [SceneRollbackLayer],
+    proposal: &[ScenePlacement],
+) -> Result<NativeEscrowProgress, String> {
+    const MAX_TRANSACTION_ESCROW: u64 = 384 * 1024 * 1024;
+    let mut has_busy_reader = false;
+    let held: u64 = rollback.iter().map(SceneRollbackLayer::escrow_bytes).sum();
+    for prior in rollback {
+        let Some(old) = prior.resident() else {
+            continue;
+        };
+        if !old.ready
+            || old.native_revision.is_none()
+            || old.native_published_revision.is_none()
+            || proposal
+                .iter()
+                .any(|p| native_image_matches_placement(old, p))
+        {
+            continue;
+        }
+        let snapshot = Arc::clone(&old.snapshot);
+        let Ok(bytes) = scene::NativeGpuEscrow::extent(&snapshot.image) else {
+            continue;
+        };
+        if bytes > MAX_TRANSACTION_ESCROW.saturating_sub(held) {
+            continue;
+        }
+        if state
+            .direct
+            .as_ref()
+            .and_then(|d| d.backing.as_ref())
+            .is_some_and(|direct| Arc::ptr_eq(direct, &snapshot))
+        {
+            continue;
+        }
+        let Some(saved) = scene::NativeGpuEscrow::capture(state, &snapshot)? else {
+            has_busy_reader = true;
+            continue;
+        };
+        state
+            .scene_layers
+            .retain(|layer| !Arc::ptr_eq(&layer.snapshot, &snapshot));
+        state
+            .transaction_pinned
+            .retain(|image| !Arc::ptr_eq(image, &snapshot));
+        state.transaction_retiring_bytes = state.transaction_retiring_bytes.saturating_sub(bytes);
+        drop(snapshot);
+        prior.replace_with_escrow(saved);
+        return Ok(NativeEscrowProgress::Released);
+    }
+    Ok(if has_busy_reader {
+        NativeEscrowProgress::WaitingForReaders
+    } else {
+        NativeEscrowProgress::NoCandidate
+    })
+}
+
+// Retry native staging only when the exact previous GPU generation can be
+// retired to authoritative CPU escrow. The ordinary deferred path remains for
+// unrelated fence pressure, and no revision is acknowledged here.
+fn stage_native_transaction_source(
+    state: &mut Swapchain,
+    layer: &ScenePlacement,
+    previous: &mut [SceneRollbackLayer],
+    proposal: &[ScenePlacement],
+) -> Result<bool, String> {
+    loop {
+        let result = stage_native_scene_source(state, layer);
+        let physical_pressure = matches!(result, Ok(false))
+            && layer.native.as_ref().is_some_and(|native| {
+                let pixels = u64::from(layer.frame.width)
+                    .saturating_mul(u64::from(layer.frame.height))
+                    .saturating_mul(4);
+                let sources =
+                    1 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty());
+                !window_gpu_capacity_available(state.window, pixels.saturating_mul(sources))
+            });
+        if physical_pressure
+            || matches!(result.as_ref(), Err(reason)
+            if reason == "native AppKit atomic GPU transition peak exhausted")
+        {
+            match escrow_one_retired_native(state, previous, proposal) {
+                Ok(NativeEscrowProgress::Released) => continue,
+                Ok(NativeEscrowProgress::WaitingForReaders) => return Ok(false),
+                Ok(NativeEscrowProgress::NoCandidate) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        return result;
+    }
+}
+
+// The rollback manifest is the authoritative old scene until every CPU
+// record has been reconstructed. A failed restoration leaves it untouched;
+// WSI cannot publish the partially staged accumulator in the meantime.
+fn restore_native_rollback(state: &mut Swapchain) -> Result<(), String> {
+    state.retire_copied();
+    let Some(rollback) = state.pending_scene_rollback.as_ref() else {
+        return Ok(());
+    };
+    let mut restored = Vec::with_capacity(rollback.len());
+    for old in rollback {
+        restored.push(old.materialize(state.gpu, state.window)?);
+    }
+    state.scene_layers = restored;
+    state.pending_scene_rollback = None;
+    Ok(())
+}
+
 /// A refused native DMA-BUF must not prevent unrelated Metal visibility or
 /// opacity changes from publishing. Retain its previously accepted GPU image
 /// (if any), using the *current* placement; otherwise omit only that native
@@ -2652,6 +2775,21 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     std::thread::park_timeout(Duration::from_millis(1));
                     continue;
                 }
+                if let Err(error) = restore_native_rollback(&mut state) {
+                    let lost = error.contains("ERROR_DEVICE_LOST")
+                        || entry.gpu.lost.load(Ordering::Acquire);
+                    gpu::trace(format!(
+                        "native rollback GPU reconstruction deferred: {error}"
+                    ));
+                    drop(state);
+                    drop(_presenting);
+                    if lost {
+                        record_device_loss(entry.gpu);
+                        return;
+                    }
+                    std::thread::park_timeout(Duration::from_millis(10));
+                    continue;
+                }
                 match state.redisplay_scene(window) {
                     Ok(true) => {
                         state.scene_restore_pending = false;
@@ -2771,19 +2909,23 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 // committed pixels needed for rollback. Never pin them into
                 // an otherwise impossible atomic replacement.
                 state.shed_scene_spares();
-                let previous_layers = state.scene_layers.clone();
-                state.transaction_pinned = previous_layers
+                let mut previous_layers = state
+                    .scene_layers
                     .iter()
-                    .flat_map(|layer| {
-                        std::iter::once(Arc::clone(&layer.snapshot))
-                            .chain(layer.spare.iter().map(Arc::clone))
-                    })
+                    .cloned()
+                    .map(SceneRollbackLayer::from_gpu)
+                    .collect::<Vec<_>>();
+                state.transaction_pinned = state
+                    .scene_layers
+                    .iter()
+                    .map(|layer| Arc::clone(&layer.snapshot))
                     .collect();
                 // The projected scene does not retain old native GPU texels
                 // when a layer is removed *or* the same layer ID publishes a
                 // different image generation. Keep their old leases pinned
                 // for rollback and charged to the 768MiB physical ledger.
-                state.transaction_retiring_bytes = previous_layers
+                state.transaction_retiring_bytes = state
+                    .scene_layers
                     .iter()
                     .filter(|old| {
                         old.native_revision.is_some()
@@ -2822,7 +2964,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         refused.push(layer.id);
                         continue;
                     }
-                    match stage_native_scene_source(&mut state, layer) {
+                    let staged = stage_native_transaction_source(
+                        &mut state,
+                        layer,
+                        &mut previous_layers,
+                        &live,
+                    );
+                    match staged {
                         Ok(true) => {
                             let original = published.get(&layer.id).copied();
                             let revision = layer.native.as_ref().map(|n| n.revision);
@@ -2900,6 +3048,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     }
                 }
                 let effective = preserve_refused_native_sources(&state, live, &refused);
+                let mut rollback_needed = false;
                 if unrepresented {
                     // A new source with neither GPU admission nor readable
                     // fallback cannot be composited. Do not commit a scene
@@ -2907,7 +3056,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     // scene (including retained Metal) and await the AppKit
                     // producer's CPU-replacement publication. Unlike an
                     // ordinary retry, this does not poll every 10 ms.
-                    state.scene_layers = previous_layers;
+                    rollback_needed = true;
                     state.layers = previous_order;
                     state.scene_frames = previous_frames;
                     state.scene_placements = previous_scene;
@@ -2916,7 +3065,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     state.scene_repaint_needed = true;
                     state.scene_restore_pending = true;
                 } else if !native_ready {
-                    state.scene_layers = previous_layers;
+                    rollback_needed = true;
                     state.layers = previous_order;
                     state.scene_frames = previous_frames;
                     state.scene_placements = previous_scene;
@@ -2941,7 +3090,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 // The compositor could defer even after native
                                 // stage submissions altered the accumulator.
                                 // Restore pinned pre-batch image generations.
-                                state.scene_layers = previous_layers.clone();
+                                rollback_needed = true;
                                 state.layers = previous_order.clone();
                                 state.scene_frames = previous_frames.clone();
                                 state.scene_placements = previous_scene.clone();
@@ -2954,7 +3103,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 gpu::trace(format!(
                                     "recomposing changed layer tree failed: {error}"
                                 ));
-                                state.scene_layers = previous_layers.clone();
+                                rollback_needed = true;
                                 state.layers = previous_order.clone();
                                 state.scene_frames = previous_frames.clone();
                                 state.scene_placements = previous_scene.clone();
@@ -2983,8 +3132,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         admitted_update = Some(confirmed);
                     }
                 }
-                // Once the batch has committed or restored its previous
-                // layers, these leases become ordinary scene/frame ownership.
+                // Failure leaves the previous scene authoritative in a
+                // rollback manifest. Do not republish the partially staged
+                // accumulator before every escrowed image is reconstructed.
+                if rollback_needed {
+                    state.scene_layers.clear();
+                    state.pending_scene_rollback = Some(previous_layers);
+                }
                 state.transaction_pinned.clear();
                 state.transaction_retiring_bytes = 0;
             }
@@ -3899,6 +4053,7 @@ impl Swapchain {
             scene_frames: Vec::new(),
             scene_repaint_needed: false,
             scene_restore_pending: false,
+            pending_scene_rollback: None,
             #[cfg(test)]
             injected_restore_busy_cycles: 0,
             #[cfg(test)]

@@ -12127,3 +12127,444 @@ fn compositor_preparation_device_loss_wakes_other_window_workers() {
     gpu.destroy_image(first_source);
     gpu.destroy_image(second_source);
 }
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_scene_rollback_metadata_survives_gpu_escrow() {
+    if isolate_vulkan_graphical_test("native_scene_rollback_metadata_survives_gpu_escrow") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 8,
+        height: 8,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let old = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    gpu.one_shot(|d, cb| unsafe {
+        d.cmd_clear_color_image(
+            cb,
+            old.image.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let id = (1usize << (usize::BITS - 1)) | 0xec01;
+    state.seed_accepted_native_for_budget_test(id, DirectFrame::from_frame(&whole), old);
+    let layer = state.scene_layers.pop().unwrap();
+    let old_revision = layer.native_revision;
+    let saved = scene::NativeGpuEscrow::capture(&mut state, &layer.snapshot)
+        .unwrap()
+        .unwrap();
+    let original_budget = Arc::clone(&layer.snapshot._charge.as_ref().unwrap().budget);
+    let used = || original_budget.held.load(Ordering::Acquire);
+    let before = used();
+    let mut backup = scene::SceneRollbackLayer::from_gpu(layer);
+    backup.replace_with_escrow(saved);
+    assert_eq!(
+        before - used(),
+        8 * 8 * 4,
+        "the original GPU allocation must retire"
+    );
+    assert_eq!(backup.escrow_bytes(), 8 * 8 * 4);
+    assert!(backup.resident().is_none());
+    let restored = backup.materialize(gpu, window as usize).unwrap();
+    assert_eq!(restored.id, id);
+    assert_eq!(restored.native_revision, old_revision);
+    assert_eq!(
+        read_scene_pixel(gpu, restored.snapshot.image.image, 8, 8, 4, 4),
+        [0, 255, 0, 255]
+    );
+    drop(restored);
+    drop(backup);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Physical old+new scene leases exceed 768MiB but final accepted scene fits
+/// under 512MiB. Escrowing obsolete accepted GPU generations must really
+/// retire their charges, and the inverse transaction must recover their pixels.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn atomic_768mib_native_rollback_escrow_reclaims_real_gpu_images() {
+    if isolate_vulkan_graphical_test(
+        "atomic_768mib_native_rollback_escrow_reclaims_real_gpu_images",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for n in 0..28usize {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.seed_accepted_native_for_budget_test(
+            (1usize << (usize::BITS - 1)) | 0xfb00 | n,
+            DirectFrame::from_frame(&whole),
+            lease,
+        );
+    }
+    let old_images: Vec<_> = state
+        .scene_layers
+        .iter()
+        .map(|layer| layer.snapshot.image.image)
+        .collect();
+    gpu.one_shot(|device, cb| unsafe {
+        for &source in &old_images {
+            device.cmd_clear_color_image(
+                cb,
+                source,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [1.0, 0.0, 0.0, 1.0],
+                },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        }
+    })
+    .unwrap();
+    let mut prior: Vec<_> = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect();
+    state.transaction_pinned = state
+        .scene_layers
+        .iter()
+        .map(|layer| Arc::clone(&layer.snapshot))
+        .collect();
+    let mut proposal = state.scene_placements.clone();
+    for (index, proposed) in proposal.iter_mut().enumerate().take(19) {
+        proposed.native.as_mut().unwrap().revision = 2;
+        let replacement =
+            BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.scene_layers[index].snapshot = replacement;
+        state.scene_layers[index].native_revision = Some(2);
+    }
+    state.transaction_retiring_bytes = 19 * 16 * 1024 * 1024;
+    let scratch = 4 * 16 * 1024 * 1024u64;
+    assert_eq!(state.atomic_transition_gpu_floor(), 47 * 16 * 1024 * 1024);
+    assert!(!window_gpu_capacity_available(window as usize, scratch));
+    for _ in 0..4 {
+        assert!(matches!(
+            escrow_one_retired_native(&mut state, &mut prior, &proposal).unwrap(),
+            NativeEscrowProgress::Released
+        ));
+    }
+    assert!(window_gpu_capacity_available(window as usize, scratch));
+    assert_eq!(
+        prior
+            .iter()
+            .map(scene::SceneRollbackLayer::escrow_bytes)
+            .sum::<u64>(),
+        scratch
+    );
+    state.scene_layers.clear();
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    state.pending_scene_rollback = Some(prior);
+    // Rebuilding an old image needs both a charged image and a charged upload
+    // buffer. Exhaustion after partial progress cannot publish a partial old
+    // scene or consume the authoritative CPU rollback pixels.
+    let blocker = GpuCharge::reserve(window as usize, 350 * 1024 * 1024).unwrap();
+    assert!(restore_native_rollback(&mut state).is_err());
+    assert!(state.scene_layers.is_empty());
+    assert!(state.pending_scene_rollback.is_some());
+    drop(blocker);
+    restore_native_rollback(&mut state).expect("restore all old accepted generations");
+    assert_eq!(state.scene_layers.len(), 28);
+    for index in 0..4 {
+        assert_eq!(state.scene_layers[index].native_revision, Some(1));
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.scene_layers[index].snapshot.image.image,
+                2048,
+                2048,
+                16,
+                16
+            ),
+            [0, 0, 255, 255]
+        );
+    }
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_atomic_escrow_defers_busy_scene_reader_without_refusal() {
+    if isolate_vulkan_graphical_test(
+        "native_atomic_escrow_defers_busy_scene_reader_without_refusal",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 8,
+        height: 8,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let accepted = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    let id = (1usize << (usize::BITS - 1)) | 0xab01;
+    state.seed_accepted_native_for_budget_test(id, DirectFrame::from_frame(&whole), accepted);
+    let mut rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    state
+        .transaction_pinned
+        .push(Arc::clone(&state.scene_layers[0].snapshot));
+    state.transaction_retiring_bytes = 8 * 8 * 4;
+    let mut proposal = state.scene_placements.clone();
+    proposal[0].native.as_mut().unwrap().revision = 2;
+    state.idle();
+    unsafe { gpu.device.reset_fences(&[state.frames[0].done]) }.unwrap();
+    state.frames[0]
+        .scene_reads
+        .push(Arc::clone(&state.scene_layers[0].snapshot));
+    state.frames[0].submitted = true;
+    assert!(matches!(
+        escrow_one_retired_native(&mut state, &mut rollback, &proposal).unwrap(),
+        NativeEscrowProgress::WaitingForReaders
+    ));
+    assert!(rollback[0].resident().is_some());
+    assert_eq!(state.scene_layers.len(), 1);
+    state.frames[0].submitted = false;
+    state.frames[0].scene_reads.clear();
+    assert!(matches!(
+        escrow_one_retired_native(&mut state, &mut rollback, &proposal).unwrap(),
+        NativeEscrowProgress::Released
+    ));
+    assert!(rollback[0].resident().is_none());
+    state.transaction_pinned.clear();
+    state.pending_scene_rollback = Some(rollback);
+    restore_native_rollback(&mut state).unwrap();
+    assert_eq!(state.scene_layers.len(), 1);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Native same-ID replacement must *finish* a real retained Vulkan scene,
+/// not merely free synthetic budget leases in an isolated accounting test.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
+    if isolate_vulkan_graphical_test("atomic_native_replacement_commits_after_768mib_gpu_peak") {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"native atomic 768MB commit", 2048, 2048, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: 2048,
+            height: 2048,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let full = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 2048,
+        height: 2048,
+        window_width: 2048,
+        window_height: 2048,
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for index in 0..28usize {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.seed_accepted_native_for_budget_test(
+            (1usize << (usize::BITS - 1)) | 0xfe00 | index,
+            DirectFrame::from_frame(&full),
+            lease,
+        );
+    }
+    let original = state.scene_placements.clone();
+    let images: Vec<_> = state
+        .scene_layers
+        .iter()
+        .map(|l| l.snapshot.image.image)
+        .collect();
+    gpu.one_shot(|d, cb| unsafe {
+        for &image in &images {
+            d.cmd_clear_color_image(
+                cb,
+                image,
+                vk::ImageLayout::GENERAL,
+                &vk::ClearColorValue {
+                    float32: [1.0, 0.0, 0.0, 1.0],
+                },
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                }],
+            );
+        }
+    })
+    .unwrap();
+    state.synchronize_scene(window as usize, &original);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let old_pixel = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        2048,
+        2048,
+        60,
+        40,
+    );
+    assert_eq!(old_pixel, [255, 0, 0, 255]);
+    let mut rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    state.transaction_pinned = state
+        .scene_layers
+        .iter()
+        .map(|l| Arc::clone(&l.snapshot))
+        .collect();
+    state.transaction_retiring_bytes = 19 * 16 * 1024 * 1024;
+    let mut proposed = original;
+    let new_bytes = Arc::new([255u8, 0, 0, 255].repeat(2048 * 2048));
+    for entry in proposed.iter_mut().skip(9) {
+        let native = entry.native.as_mut().unwrap();
+        native.revision = 2;
+        native.bytes = Arc::clone(&new_bytes);
+    }
+    for layer in &proposed {
+        let result = stage_native_transaction_source(&mut state, layer, &mut rollback, &proposed);
+        assert_eq!(
+            result,
+            Ok(true),
+            "native image id={} scene={} floor={} retiring={} physical_free={} gpu_held={}",
+            layer.id,
+            state.scene_gpu_bytes(),
+            state.atomic_transition_gpu_floor(),
+            state.transaction_retiring_bytes,
+            window_gpu_capacity_available(window as usize, 2 * 16 * 1024 * 1024),
+            state.scene_gpu_bytes()
+        );
+    }
+    let escrowed: u64 = rollback
+        .iter()
+        .map(scene::SceneRollbackLayer::escrow_bytes)
+        .sum();
+    assert!(
+        escrowed > 0,
+        "fixture never exercised CPU rollback under peak pressure"
+    );
+    state.synchronize_scene(window as usize, &proposed);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    state
+        .flush_composite(window)
+        .expect("committed native scene WSI present");
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            2048,
+            2048,
+            60,
+            40
+        ),
+        [0, 0, 255, 255]
+    );
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(rollback);
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+    drop(state);
+    sdl3::video::destroy_window(window);
+}
