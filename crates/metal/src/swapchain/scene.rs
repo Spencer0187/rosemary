@@ -491,6 +491,57 @@ fn intersection_for_scene(a: &appkit::view::Frame, b: &appkit::view::Frame) -> a
 }
 
 impl Swapchain {
+    /// A native CPU upload or DMA blend already produced a completed GPU
+    /// image. Retain that exact allocation directly: an extra GPU blit into
+    /// a second scene snapshot is unnecessary, and a full image transaction
+    /// now requires one scene recompose after every native source is accepted.
+    /// Prior GPU generations stay pinned in the worker's transaction record
+    /// and by in-flight frame fences until rollback or successful commit.
+    pub(super) fn accept_native_gpu_snapshot(
+        &mut self,
+        placement: &ScenePlacement,
+        source: Arc<BackingImageLease>,
+    ) {
+        let native = placement.native.as_ref().expect("native source only");
+        let id = placement.id;
+        let frame = placement.frame;
+        if !self.layers.contains(&id) {
+            self.layers.push(id);
+        }
+        if let Some(accepted) = self.scene_layers.iter_mut().find(|s| s.id == id) {
+            accepted.snapshot = source;
+            accepted.spare.clear();
+            accepted.frame = frame;
+            accepted.opacity = placement.opacity;
+            accepted.opaque = placement.opaque;
+            accepted.clip = placement.clip;
+            accepted.rounded = placement.rounded.clone();
+            accepted.regions = None;
+            accepted.native_revision = Some(native.revision);
+            accepted.native_published_revision = None;
+            accepted.native_dma_sample = native.dma_sample;
+            accepted.ready = true;
+        } else {
+            self.scene_layers.push(SceneLayer {
+                id,
+                frame,
+                snapshot: source,
+                spare: Vec::new(),
+                opacity: placement.opacity,
+                opaque: placement.opaque,
+                clip: placement.clip,
+                rounded: placement.rounded.clone(),
+                regions: None,
+                native_revision: Some(native.revision),
+                native_published_revision: None,
+                native_dma_sample: native.dma_sample,
+                ready: true,
+            });
+        }
+        self.note_scene_frame(id, &frame.frame());
+        self.scene_repaint_needed = true;
+    }
+
     #[cfg(test)]
     pub(super) fn seed_accepted_native_for_budget_test(
         &mut self,
@@ -1462,12 +1513,25 @@ impl Swapchain {
 
     /// Materialize a source image from FIFO's last opaque one-layer result
     /// only if a CA-only scene change needs to blend it with opacity.
-    fn capture_single_scene_from_composite(&mut self) -> Result<(), String> {
+    pub(super) fn capture_single_scene_from_composite(&mut self) -> Result<(), String> {
         let id = self.layers[0];
         let accumulated = self
             .composite
             .as_ref()
             .ok_or("single-layer accumulator absent")?;
+        // Materializing the previously flattened Metal image is an actual
+        // second retained allocation. It must obey the same soft scene budget
+        // and hard per-window physical ledger as every other source capture.
+        let bytes = scene_image_bytes(PresentSource::from(accumulated));
+        if !fits_scene_budget(self.budgeted_scene_bytes(), bytes) {
+            self.shed_scene_spares();
+            if !fits_scene_budget(self.budgeted_scene_bytes(), bytes) {
+                return Err(
+                    "retained scene GPU budget exhausted capturing flattened source".into(),
+                );
+            }
+        }
+        let accumulated = self.composite.as_ref().expect("validated above");
         let snapshot = scene_image(self.gpu, self.window, PresentSource::from(accumulated))?;
         let src = accumulated.image;
         let dst = snapshot.image.image;

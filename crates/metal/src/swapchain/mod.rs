@@ -2207,8 +2207,11 @@ fn stage_native_scene_source(
     let image_bytes = u64::from(frame.width)
         .saturating_mul(u64::from(frame.height))
         .saturating_mul(4);
+    // One retained native source (the completed CPU base or DMA blend
+    // result), one optional DMA output and one optional full CPU upload.
+    // No second retained-scene blit allocation is necessary.
     let scratch_count: u64 =
-        2 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty());
+        1 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty());
     if !scene::fits_scene_budget(
         state.budgeted_scene_bytes(),
         image_bytes.saturating_mul(scratch_count),
@@ -2298,7 +2301,7 @@ fn stage_native_scene_source(
         } else {
             let _staging_charge =
                 GpuCharge::reserve(frame.window as usize, native.bytes.len() as u64)?;
-            let staging = gpu.create_buffer(native.bytes.len() as u64)?;
+            let staging = gpu.create_staging_buffer(native.bytes.len() as u64)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     native.bytes.as_ptr(),
@@ -2365,7 +2368,7 @@ fn stage_native_scene_source(
                 frame.window as usize,
                 native.bytes.len() as u64,
             )?);
-            let staging = gpu.create_buffer(native.bytes.len() as u64)?;
+            let staging = gpu.create_staging_buffer(native.bytes.len() as u64)?;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     native.bytes.as_ptr(),
@@ -2408,30 +2411,15 @@ fn stage_native_scene_source(
     } else {
         None
     };
-    let source = blended.as_ref().unwrap_or(&lease);
-    let joined = !state.layers.contains(&layer.id);
-    if joined {
-        state.layers.push(layer.id);
+    let source = blended.unwrap_or(lease);
+    // The CPU upload or completed DMA blend is already a GPU-owned native
+    // snapshot. Retain it without allocating/copying a second per-tile image.
+    // A previously flattened single Metal layer must be captured first or its
+    // static background disappears when the first native foreground joins.
+    if state.layers.len() == 1 && state.scene_layers.is_empty() && state.layers[0] != layer.id {
+        state.capture_single_scene_from_composite()?;
     }
-    let mut owner = SourceOwner(None);
-    let staged =
-        state.stage_composite_layer(layer.id, &frame, &source.image, None, &mut owner, true);
-    if !matches!(staged, Ok(Some(true))) {
-        if joined {
-            state.layers.retain(|&id| id != layer.id);
-        }
-        return staged.map(|_| false);
-    }
-    let slot = state.frame.wrapping_sub(1) % state.frames.len();
-    debug_assert!(state.frames[slot].backing.is_none());
-    state.frames[slot].backing = Some(blended.unwrap_or(lease));
-    if let Some(scene) = state.scene_layers.iter_mut().find(|s| s.id == layer.id) {
-        scene.native_revision = Some(native.revision);
-        scene.native_dma_sample = native.dma_sample;
-        // Staging is not a committed original AppKit publication.
-        scene.native_published_revision = None;
-    }
-    state.note_scene_frame(layer.id, &frame);
+    state.accept_native_gpu_snapshot(layer, source);
     Ok(true)
 }
 

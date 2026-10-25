@@ -4858,6 +4858,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         Ok(Some(true))
     );
     let mut scene = vec![bottom.clone()];
+    let before_native = state.frame;
     let admission_start = std::time::Instant::now();
     let mut count = 0usize;
     for y in (0..HEIGHT).step_by(2048) {
@@ -4901,6 +4902,10 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         }
     }
     assert_eq!(count, 6);
+    assert_eq!(
+        state.frame, before_native,
+        "six native tiles unexpectedly submitted six independent retained-scene snapshots"
+    );
     let first_six_tiles_ms = admission_start.elapsed().as_secs_f64() * 1000.0;
     state.synchronize_scene(window as usize, &scene);
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
