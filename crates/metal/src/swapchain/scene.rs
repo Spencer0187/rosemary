@@ -49,6 +49,237 @@ pub(super) enum ScenePrepared {
 // (transparent base, blend output, retained layer, and window accumulator).
 const SCENE_IMAGE_BUDGET: u64 = 512 * 1024 * 1024;
 
+// An exact, host-owned copy of an acknowledged native GPU generation.
+// This is deliberately limited to the 32-bit native surface format: a
+// nonmatching source is not safe to reconstruct through a lossy conversion.
+// CPU escrow is not an admission acknowledgement or a visible scene image.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) struct NativeGpuEscrow {
+    width: u32,
+    height: u32,
+    format: vk::Format,
+    pub(super) pixels: Vec<u8>,
+}
+
+impl NativeGpuEscrow {
+    const MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+    pub(super) fn extent(image: &GpuImage) -> Result<u64, String> {
+        if image.format != vk::Format::B8G8R8A8_UNORM
+            || image.depth != 1
+            || image.levels != 1
+            || image.layers != 1
+            || image.width == 0
+            || image.height == 0
+        {
+            return Err("unsupported native GPU escrow image format or extent".into());
+        }
+        let bytes = u64::from(image.width)
+            .checked_mul(u64::from(image.height))
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or("native GPU escrow byte size overflow")?;
+        if bytes > Self::MAX_BYTES {
+            return Err("native GPU escrow exceeds the bounded image limit".into());
+        }
+        Ok(bytes)
+    }
+
+    /// The scene's presentation mutex prevents new window command recordings,
+    /// but existing in-flight readers have their own command-buffer fences.
+    /// Return None while any such reader could still access this generation.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn capture(
+        state: &mut Swapchain,
+        snapshot: &Arc<BackingImageLease>,
+    ) -> Result<Option<Self>, String> {
+        let gpu = state.gpu;
+        if gpu.lost.load(Ordering::Acquire) {
+            return Err("cannot capture native image on a lost GPU".into());
+        }
+        let bytes = Self::extent(&snapshot.image)?;
+        state.retire_copied();
+        for frame in &state.frames {
+            if !frame.submitted {
+                continue;
+            }
+            let reads = frame
+                .backing
+                .as_ref()
+                .is_some_and(|image| Arc::ptr_eq(image, snapshot))
+                || frame
+                    .scene_reads
+                    .iter()
+                    .any(|image| Arc::ptr_eq(image, snapshot));
+            if reads && !gpu.fence_signaled(frame.done)? {
+                return Ok(None);
+            }
+        }
+        let _charge = GpuCharge::reserve(state.window, bytes)?;
+        let buffer = gpu.create_staging_buffer(bytes)?;
+        let source = snapshot.image.image;
+        let (width, height, format) = (
+            snapshot.image.width,
+            snapshot.image.height,
+            snapshot.image.format,
+        );
+        let read = gpu.one_shot(|device, command_buffer| unsafe {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(source)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::ALL_COMMANDS,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            device.cmd_copy_image_to_buffer(
+                command_buffer,
+                source,
+                vk::ImageLayout::GENERAL,
+                buffer.buffer,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    })],
+            );
+        });
+        if let Err(error) = read {
+            // A failed wait may leave a transfer reading this buffer. A
+            // confirmed device idle is the only safe immediate cleanup;
+            // otherwise keep its allocation charged on the failed device.
+            if unsafe { gpu.device.device_wait_idle() }.is_ok() {
+                gpu.destroy_buffer(buffer);
+            } else {
+                std::mem::forget(buffer);
+                std::mem::forget(_charge);
+            }
+            return Err(error);
+        }
+        let mut pixels = Vec::new();
+        if let Err(error) = pixels.try_reserve_exact(bytes as usize) {
+            gpu.destroy_buffer(buffer);
+            return Err(format!("native CPU rollback reservation failed: {error}"));
+        }
+        // SAFETY: one_shot finished its fence, the buffer is mapped and the
+        // entire tightly packed image was transferred, including transparent
+        // texels. No reinterpretation, color conversion or alpha changes.
+        unsafe {
+            pixels.set_len(bytes as usize);
+            std::ptr::copy_nonoverlapping(buffer.contents, pixels.as_mut_ptr(), bytes as usize);
+        }
+        gpu.destroy_buffer(buffer);
+        Ok(Some(Self {
+            width,
+            height,
+            format,
+            pixels,
+        }))
+    }
+
+    /// Restore an *independent* charged image; caller must retain the escrow
+    /// until scene publication succeeds and rebuild the old scene on failure.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn restore(
+        &self,
+        gpu: &'static Gpu,
+        window: usize,
+    ) -> Result<Arc<BackingImageLease>, String> {
+        if gpu.lost.load(Ordering::Acquire) {
+            return Err("cannot restore native image on a lost GPU".into());
+        }
+        if self.format != vk::Format::B8G8R8A8_UNORM
+            || u64::from(self.width) * u64::from(self.height) * 4 != self.pixels.len() as u64
+        {
+            return Err("invalid native GPU escrow restoration extent".into());
+        }
+        let size = self.pixels.len() as u64;
+        let image = BackingImageLease::create_for_window(
+            gpu,
+            window,
+            &ImageDescription {
+                image_type: vk::ImageType::TYPE_2D,
+                view_type: vk::ImageViewType::TYPE_2D,
+                format: self.format,
+                width: self.width,
+                height: self.height,
+                depth: 1,
+                levels: 1,
+                layers: 1,
+                samples: 1,
+                usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                cube: false,
+                components: vk::ComponentMapping::default(),
+            },
+        )?;
+        let _charge = GpuCharge::reserve(window, size)?;
+        let staging = gpu.create_staging_buffer(size)?;
+        // SAFETY: the entire buffer is overwritten before its transfer.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.pixels.as_ptr(),
+                staging.contents,
+                self.pixels.len(),
+            );
+        }
+        let copied = gpu.one_shot(|device, cb| unsafe {
+            device.cmd_copy_buffer_to_image(
+                cb,
+                staging.buffer,
+                image.image.image,
+                vk::ImageLayout::GENERAL,
+                &[vk::BufferImageCopy::default()
+                    .image_subresource(vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+                    .image_extent(vk::Extent3D {
+                        width: self.width,
+                        height: self.height,
+                        depth: 1,
+                    })],
+            );
+        });
+        if let Err(error) = copied {
+            if unsafe { gpu.device.device_wait_idle() }.is_ok() {
+                gpu.destroy_buffer(staging);
+            } else {
+                std::mem::forget(staging);
+                std::mem::forget(_charge);
+                std::mem::forget(image);
+                return Err(error);
+            }
+            return Err(error);
+        }
+        gpu.destroy_buffer(staging);
+        Ok(image)
+    }
+}
+
 pub(super) fn fits_scene_budget(held: u64, incoming: u64) -> bool {
     incoming <= SCENE_IMAGE_BUDGET && held <= SCENE_IMAGE_BUDGET - incoming
 }

@@ -2747,6 +2747,116 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
     gpu.destroy_image(source);
 }
 
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_gpu_escrow_restores_exact_bytes() {
+    if isolate_vulkan_graphical_test("native_gpu_escrow_restores_exact_bytes") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, _)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let old = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            old.image.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [1.0, 0.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let escrow = scene::NativeGpuEscrow::capture(&mut state, &old)
+        .unwrap()
+        .unwrap();
+    assert_eq!(escrow.pixels.len(), 2048 * 2048 * 4);
+    assert_eq!(&escrow.pixels[..4], &[0, 0, 255, 255]);
+    drop(old);
+    let recovered = escrow.restore(gpu, window as usize).unwrap();
+    assert_eq!(
+        read_scene_pixel(gpu, recovered.image.image, 2048, 2048, 100, 120),
+        [0, 0, 255, 255]
+    );
+    drop(recovered);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn native_gpu_escrow_never_reads_busy_frame_or_unsupported_format() {
+    if isolate_vulkan_graphical_test(
+        "native_gpu_escrow_never_reads_busy_frame_or_unsupported_format",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, _)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 8,
+        height: 8,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let snapshot = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    state.idle();
+    unsafe { gpu.device.reset_fences(&[state.frames[0].done]) }.unwrap();
+    state.frames[0].scene_reads.push(Arc::clone(&snapshot));
+    state.frames[0].submitted = true;
+    assert!(
+        scene::NativeGpuEscrow::capture(&mut state, &snapshot)
+            .unwrap()
+            .is_none()
+    );
+    state.frames[0].submitted = false;
+    state.frames[0].scene_reads.clear();
+    let non_native = gpu
+        .create_image(&ImageDescription {
+            format: vk::Format::R16G16B16A16_SFLOAT,
+            ..desc
+        })
+        .unwrap();
+    assert!(scene::NativeGpuEscrow::extent(&non_native).is_err());
+    gpu.destroy_image(non_native);
+    drop(snapshot);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 /// Read a window accumulator only after the staging queue has completed.
 /// This inspects raw RGBA8 compositor texels, not a WSI screenshot.
 #[cfg(not(target_os = "macos"))]
