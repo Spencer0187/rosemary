@@ -367,11 +367,20 @@ pub(super) struct RoundedClip {
     pub radius: f32,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct DmaSample {
+    pub full_width: u32,
+    pub full_height: u32,
+    pub crop_x: u32,
+    pub crop_y: u32,
+}
+
 #[derive(Clone)]
 pub(super) struct NativeCpuSceneSource {
     pub bytes: Arc<Vec<u8>>,
     pub revision: u64,
     pub dmabuf: Option<Arc<appkit::backing::Dmabuf>>,
+    pub dma_sample: Option<DmaSample>,
 }
 
 #[derive(Clone)]

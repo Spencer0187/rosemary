@@ -228,6 +228,7 @@ struct NativeCapture {
     revision: u64,
 }
 type CaptureKey = (usize, i64, i64, u32, u32);
+const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
@@ -1621,13 +1622,13 @@ pub fn native_scene_pixels_cropped(
                 revision,
             },
         );
-        // Bound cached pixel payload across all views to 128 MiB, retaining
+        // Bound cached pixel payload across all views to 256 MiB, retaining
         // the current capture. In-progress GPU users own their own Arc.
         let mut used: usize = captures.values().map(|entry| entry.pixels.len()).sum();
-        if used > 128 * 1024 * 1024 {
+        if used > NATIVE_CAPTURE_CACHE_LIMIT {
             let keys: Vec<_> = captures.keys().copied().filter(|id| *id != key).collect();
             for id in keys {
-                if used <= 128 * 1024 * 1024 {
+                if used <= NATIVE_CAPTURE_CACHE_LIMIT {
                     break;
                 }
                 if let Some(entry) = captures.remove(&id) {
@@ -2331,6 +2332,81 @@ fn metadata_only_4k_native_capture_reuses_immutable_pixels() {
     );
     forget(view);
     objc::arc::release(view);
+}
+
+/// Measures multiple 6K native sources when unrelated scene changes
+/// repeatedly resnapshot them. Opt in to avoid high allocations in CI;
+/// the emitted cache hit rate and video-thread capture time are diagnostics.
+#[test]
+fn two_large_native_views_capture_cache_pressure_benchmark() {
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_MULTI_6K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    const W: u32 = 6016;
+    const H: u32 = 3384;
+    let views: Vec<Id> = (0..2)
+        .map(|n| {
+            let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            set_native_view_pixels_for_tests(
+                view,
+                W,
+                H,
+                [32u8, 64, 128 + n as u8, 255].repeat(W as usize * H as usize),
+            );
+            view
+        })
+        .collect();
+    let mut tiles = Vec::new();
+    for y in (0..H).step_by(2048) {
+        for x in (0..W).step_by(2048) {
+            tiles.push(Rect {
+                x: i64::from(x),
+                y: i64::from(y),
+                width: i64::from((W - x).min(2048)),
+                height: i64::from((H - y).min(2048)),
+            });
+        }
+    }
+    assert_eq!(tiles.len(), 6);
+    let before = native_render_count_for_tests();
+    let first = std::time::Instant::now();
+    for view in &views {
+        for crop in &tiles {
+            assert!(native_scene_pixels_cropped(*view, W, H, *crop).is_some());
+        }
+    }
+    let warm_ms = first.elapsed().as_secs_f64() * 1000.0;
+    let after_warm = native_render_count_for_tests();
+    let loops = 4usize;
+    let refresh = std::time::Instant::now();
+    for _ in 0..loops {
+        for view in &views {
+            for crop in &tiles {
+                assert!(native_scene_pixels_cropped(*view, W, H, *crop).is_some());
+            }
+        }
+    }
+    let repeat_ms = refresh.elapsed().as_secs_f64() * 1000.0 / loops as f64;
+    let again = native_render_count_for_tests();
+    let misses = (again - after_warm) as usize;
+    let total = loops * views.len() * tiles.len();
+    let hits = total.saturating_sub(misses);
+    let cache_bytes: usize = NATIVE_CAPTURES
+        .lock()
+        .unwrap()
+        .values()
+        .map(|v| v.pixels.len())
+        .sum();
+    eprintln!(
+        "6K multi-view native capture warm_ms={warm_ms:.3} repeat_mean_ms={repeat_ms:.3} repeat_hits={hits}/{total} rerecaptures={misses} cache_bytes={cache_bytes} new_renders={}",
+        again - before
+    );
+    assert!(cache_bytes <= NATIVE_CAPTURE_CACHE_LIMIT);
+    for view in views {
+        forget(view);
+        objc::arc::release(view)
+    }
 }
 
 #[cfg(test)]

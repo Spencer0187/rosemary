@@ -645,6 +645,22 @@ pub(crate) fn blend<'a>(
             );
             for (at, (overlay, _, _)) in placed.iter().enumerate() {
                 let rect = overlay.rect;
+                // The imported DMA allocation keeps its original dimensions
+                // and UV transform. Dispatch only the intersection with the
+                // destination: an offscreen 6K producer over a 160x120 window
+                // must not dispatch millions of out-of-bounds invocations.
+                let left = rect.x.max(0).min(i64::from(width));
+                let top = rect.y.max(0).min(i64::from(height));
+                let right = rect
+                    .x
+                    .saturating_add(rect.width)
+                    .max(left)
+                    .min(i64::from(width));
+                let bottom = rect
+                    .y
+                    .saturating_add(rect.height)
+                    .max(top)
+                    .min(i64::from(height));
                 let placement = Placement {
                     x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
                     y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
@@ -652,17 +668,17 @@ pub(crate) fn blend<'a>(
                     height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
                     target_width: width,
                     target_height: height,
-                    clip_x: rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    clip_y: rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-                    clip_width: rect.width.clamp(0, i64::from(u32::MAX)) as u32,
-                    clip_height: rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                    clip_x: left as i32,
+                    clip_y: top as i32,
+                    clip_width: (right - left) as u32,
+                    clip_height: (bottom - top) as u32,
                     opacity: 1.0,
                     clear: false,
                     round_start: 0,
                     round_count: 0,
                     sampled_srgb: 0,
                 };
-                if placement.width == 0 || placement.height == 0 {
+                if placement.clip_width == 0 || placement.clip_height == 0 {
                     continue;
                 }
                 device.cmd_bind_descriptor_sets(
@@ -682,8 +698,8 @@ pub(crate) fn blend<'a>(
                 );
                 device.cmd_dispatch(
                     command_buffer,
-                    placement.width.div_ceil(GROUP),
-                    placement.height.div_ceil(GROUP),
+                    placement.clip_width.div_ceil(GROUP),
+                    placement.clip_height.div_ceil(GROUP),
                     1,
                 );
                 // Overlapping overlays blend in order.

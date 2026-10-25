@@ -507,6 +507,7 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
                 layer.native_revision,
                 layer.frame.width,
                 layer.frame.height,
+                layer.native_dma_sample,
             ),
         })
         .collect();
@@ -1508,6 +1509,7 @@ fn present_impl(
                     item.native_revision,
                     item.frame.width,
                     item.frame.height,
+                    item.native_dma_sample,
                 ),
             })
             .collect::<Vec<_>>()
@@ -1851,6 +1853,7 @@ fn native_scene_source(
     revision: u64,
     width: u32,
     height: u32,
+    dma_sample: Option<(u32, u32, u32, u32)>,
 ) -> Option<scene::NativeCpuSceneSource> {
     let supported = if pixels.is_some() {
         appkit::backing::native_scene_extent_supported(width, height)
@@ -1861,6 +1864,15 @@ fn native_scene_source(
     };
     if !supported {
         return None;
+    }
+    if let Some((full_width, full_height, crop_x, crop_y)) = dma_sample {
+        if dmabuf.is_none()
+            || !appkit::backing::native_scene_dma_extent_supported(full_width, full_height)
+            || crop_x.checked_add(width).is_none_or(|x| x > full_width)
+            || crop_y.checked_add(height).is_none_or(|y| y > full_height)
+        {
+            return None;
+        }
     }
     let bytes = u64::from(width) * u64::from(height) * 4;
     let pixels = match (pixels, dmabuf.as_ref()) {
@@ -1875,6 +1887,14 @@ fn native_scene_source(
         bytes: pixels,
         revision,
         dmabuf,
+        dma_sample: dma_sample.map(
+            |(full_width, full_height, crop_x, crop_y)| scene::DmaSample {
+                full_width,
+                full_height,
+                crop_x,
+                crop_y,
+            },
+        ),
     })
 }
 
@@ -1898,10 +1918,16 @@ fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> 
     let native = layer.native.as_ref()?;
     let picture = native.dmabuf.as_ref()?;
     let frame = layer.frame;
+    let sample = native.dma_sample.unwrap_or(scene::DmaSample {
+        full_width: frame.width,
+        full_height: frame.height,
+        crop_x: 0,
+        crop_y: 0,
+    });
     if picture.modifier != 0
         || picture.planes.len() != 1
-        || picture.width != frame.width
-        || picture.height != frame.height
+        || picture.width != sample.full_width
+        || picture.height != sample.full_height
     {
         return None;
     }
@@ -1914,11 +1940,13 @@ fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> 
         return None;
     }
     let stride = u64::from(picture.planes[0].stride);
-    let source_bytes = u64::from(frame.width).checked_mul(4)?;
+    let source_bytes = u64::from(sample.full_width).checked_mul(4)?;
     if stride < source_bytes {
         return None;
     }
-    let full_bytes = source_bytes.checked_mul(u64::from(frame.height))?;
+    let full_bytes = u64::from(frame.width)
+        .checked_mul(4)?
+        .checked_mul(u64::from(frame.height))?;
     if !native.bytes.is_empty() && native.bytes.len() as u64 != full_bytes {
         return None;
     }
@@ -1945,9 +1973,10 @@ fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> 
     if !appkit::backing::native_scene_extent_supported(width, height) {
         return None;
     }
-    let x = usize::try_from(left - i64::from(frame.x)).ok()?;
-    let y = usize::try_from(top - i64::from(frame.y)).ok()?;
-    let source_width = usize::try_from(frame.width).ok()?;
+    let local_x = usize::try_from(left - i64::from(frame.x)).ok()?;
+    let local_y = usize::try_from(top - i64::from(frame.y)).ok()?;
+    let x = usize::try_from(sample.crop_x).ok()?.checked_add(local_x)?;
+    let y = usize::try_from(sample.crop_y).ok()?.checked_add(local_y)?;
     let width_usize = width as usize;
     let height_usize = height as usize;
     let fd = picture.planes[0].fd.as_raw_fd();
@@ -2003,9 +2032,9 @@ fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> 
         native.bytes.len()
     };
     if base_count != 0 {
-        let last_source = (y + height_usize - 1)
-            .checked_mul(source_width)?
-            .checked_add(x)?
+        let last_source = (local_y + height_usize - 1)
+            .checked_mul(usize::try_from(frame.width).ok()?)?
+            .checked_add(local_x)?
             .checked_add(width_usize)?
             .checked_mul(4)?;
         if last_source > base_count {
@@ -2059,7 +2088,8 @@ fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> 
             let result = &mut pixels[dst..dst + 4];
             result.copy_from_slice(&[b, g, r, alpha]);
             if !native.bytes.is_empty() && alpha < 255 {
-                let original = ((y + row) * source_width + x + col) * 4;
+                let original =
+                    ((local_y + row) * usize::try_from(frame.width).ok()? + local_x + col) * 4;
                 let beneath = &native.bytes[original..original + 4];
                 let keep = u32::from(255 - alpha);
                 for component in 0..4 {
@@ -2093,6 +2123,7 @@ fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> 
     replacement_source.bytes = Arc::new(pixels);
     replacement_source.revision = hash.finish();
     replacement_source.dmabuf = None;
+    replacement_source.dma_sample = None;
     Some(replacement)
 }
 
@@ -2277,10 +2308,18 @@ fn stage_native_scene_source(
             picture: Arc::clone(picture),
             view: layer.id & !(1usize << (usize::BITS - 1)),
             rect: appkit::backing::Rect {
-                x: 0,
-                y: 0,
-                width: i64::from(frame.width),
-                height: i64::from(frame.height),
+                x: -i64::from(native.dma_sample.map_or(0, |sample| sample.crop_x)),
+                y: -i64::from(native.dma_sample.map_or(0, |sample| sample.crop_y)),
+                width: i64::from(
+                    native
+                        .dma_sample
+                        .map_or(frame.width, |sample| sample.full_width),
+                ),
+                height: i64::from(
+                    native
+                        .dma_sample
+                        .map_or(frame.height, |sample| sample.full_height),
+                ),
             },
         }];
         if !crate::overlay::blend(gpu, &lease.image, &output.image, &overlay)?.is_empty() {
@@ -2364,12 +2403,14 @@ fn preserve_refused_native_sources(
 /// hard GPU budget despite each drawing only a small foreground rectangle.
 fn crop_native_to_window(mut placement: ScenePlacement) -> Option<ScenePlacement> {
     let native = placement.native.as_ref()?;
-    if native.dmabuf.is_some() || native.bytes.is_empty() {
+    if native.dmabuf.is_none() && native.bytes.is_empty() {
         return Some(placement);
     }
     let full = placement.frame;
     let stride = u64::from(full.width).checked_mul(4)?;
-    if stride.checked_mul(u64::from(full.height))? != native.bytes.len() as u64 {
+    if !native.bytes.is_empty()
+        && stride.checked_mul(u64::from(full.height))? != native.bytes.len() as u64
+    {
         return Some(placement); // Native validation produces the diagnostic.
     }
     let left = i64::from(full.x).max(0);
@@ -2407,22 +2448,38 @@ fn crop_native_to_window(mut placement: ScenePlacement) -> Option<ScenePlacement
     if !appkit::backing::native_scene_extent_supported(width as u32, height as u32) {
         return Some(placement);
     }
-    let mut cropped = Vec::with_capacity(output_bytes);
-    for row in y..y + height {
-        let start = row
-            .checked_mul(source_width)?
-            .checked_add(x)?
-            .checked_mul(4)?;
-        cropped.extend_from_slice(native.bytes.get(start..start + line_bytes)?);
-    }
+    let cropped = if native.bytes.is_empty() {
+        Arc::new(Vec::new())
+    } else {
+        let mut cropped = Vec::with_capacity(output_bytes);
+        for row in y..y + height {
+            let start = row
+                .checked_mul(source_width)?
+                .checked_add(x)?
+                .checked_mul(4)?;
+            cropped.extend_from_slice(native.bytes.get(start..start + line_bytes)?);
+        }
+        Arc::new(cropped)
+    };
     use std::hash::{Hash, Hasher};
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     native.revision.hash(&mut hash);
     (left, top, width, height, full.width, full.height).hash(&mut hash);
     let revision = hash.finish();
     let native = placement.native.as_mut().expect("validated above");
-    native.bytes = Arc::new(cropped);
+    native.bytes = cropped;
     native.revision = revision;
+    if native.dmabuf.is_some() {
+        let mut sample = native.dma_sample.unwrap_or(scene::DmaSample {
+            full_width: full.width,
+            full_height: full.height,
+            crop_x: 0,
+            crop_y: 0,
+        });
+        sample.crop_x = sample.crop_x.checked_add(x as u32)?;
+        sample.crop_y = sample.crop_y.checked_add(y as u32)?;
+        native.dma_sample = Some(sample);
+    }
     placement.frame.x = left as i32;
     placement.frame.y = top as i32;
     placement.frame.width = width as u32;

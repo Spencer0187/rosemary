@@ -113,6 +113,10 @@ pub struct MetalSceneLayer {
     pub native_pixels: Option<std::sync::Arc<Vec<u8>>>,
     pub native_dmabuf: Option<std::sync::Arc<crate::backing::Dmabuf>>,
     pub native_revision: u64,
+    /// Full native frame and origin of this tile in the DMA source's scaled
+    /// image space. Unlike cropped CPU bytes, the DMA allocation is imported
+    /// without cloning or changing its underlying extent.
+    pub native_dma_sample: Option<(u32, u32, u32, u32)>,
     /// Original NSView pointer that owns an independent CPU/DMA image. A
     /// large view can publish multiple tiles with distinct GPU layer IDs.
     pub native_owner: usize,
@@ -689,6 +693,7 @@ fn visit_metal_scene(
                     native_pixels: None,
                     native_dmabuf: None,
                     native_revision: 0,
+                    native_dma_sample: None,
                     native_owner: 0,
                 });
                 *seen_metal = true;
@@ -726,11 +731,7 @@ fn visit_metal_scene(
                 // same paint order, each with an independent GPU lease.
                 let large_visible =
                     !crate::backing::native_scene_extent_supported(visible.width, visible.height);
-                let tile_edge = if large_visible && dma.is_none() {
-                    2048
-                } else {
-                    u32::MAX
-                };
+                let tile_edge = if large_visible { 2048 } else { u32::MAX };
                 let mut index = 0u32;
                 let mut y = 0u32;
                 while y < visible.height {
@@ -751,7 +752,12 @@ fn visit_metal_scene(
                             width: i64::from(width),
                             height: i64::from(height),
                         };
-                        let cpu = if !large_visible && bounded {
+                        let cpu = if bounded
+                            && part.x == frame.x
+                            && part.y == frame.y
+                            && part.width == frame.width
+                            && part.height == frame.height
+                        {
                             crate::backing::native_scene_pixels(view, frame.width, frame.height)
                         } else {
                             crate::backing::native_scene_pixels_cropped(
@@ -763,30 +769,28 @@ fn visit_metal_scene(
                         };
                         // A DMA source remains one coherent GPU image. A CPU
                         // tile never borrows a DMA producer's unrelated frame.
-                        if cpu.is_some() || (index == 0 && dma.is_some()) {
+                        if cpu.is_some() || dma.is_some() {
                             let revision = cpu.as_ref().map_or(0, |(_, rev)| *rev)
                                 ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19));
                             scene.push(MetalSceneLayer {
                                 layer: native_tile_id(view, index),
                                 native_owner: view as usize,
-                                frame: if large_visible && dma.is_none()
-                                    || !bounded && cpu.is_some()
-                                {
-                                    part
-                                } else {
-                                    frame
-                                },
+                                frame: part,
                                 opacity: (effective_alpha(view) as f32) * layer_opacity,
                                 opaque: false,
                                 clip: ca_clip,
                                 rounded: rounded.clone(),
                                 occluded: Vec::new(),
                                 native_pixels: cpu.map(|(pixels, _)| pixels),
-                                native_dmabuf: if index == 0 {
-                                    dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p))
-                                } else {
-                                    None
-                                },
+                                native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
+                                native_dma_sample: dma.as_ref().map(|_| {
+                                    (
+                                        frame.width,
+                                        frame.height,
+                                        cropped.x as u32,
+                                        cropped.y as u32,
+                                    )
+                                }),
                                 native_revision: revision,
                             });
                         }
@@ -4947,6 +4951,75 @@ mod tests {
             crate::backing::native_render_count_for_tests(),
             first_capture
         );
+        // A DMA-BUF overlay is layered over, not substituted for, the 6K
+        // CPU view. No GPU admission may erase CPU content until all six
+        // *mixed* source revisions have been accepted, not a DMA-only tile.
+        crate::backing::set_overlay(
+            above,
+            crate::backing::Overlay {
+                width: WIDTH as u32,
+                height: HEIGHT as u32,
+                picture: crate::backing::Picture::Dmabuf(std::sync::Arc::new(
+                    crate::backing::Dmabuf {
+                        width: WIDTH as u32,
+                        height: HEIGHT as u32,
+                        fourcc: 0,
+                        modifier: 0,
+                        planes: vec![],
+                    },
+                )),
+            },
+        );
+        flush_metal_scenes();
+        let mixed_scene = metal_scene(sdl).unwrap();
+        let mixed: Vec<_> = mixed_scene
+            .iter()
+            .filter(|source| source.native_owner == above as usize)
+            .collect();
+        assert_eq!(
+            mixed.len(),
+            6,
+            "mixed CPU/DMA foreground lost bounded tiles"
+        );
+        let original = unsafe { presentation_frame(above) }.unwrap();
+        for tile in &mixed {
+            assert!(
+                tile.native_pixels.is_some(),
+                "DMA wrongly replaced CPU background"
+            );
+            assert!(tile.native_dmabuf.is_some());
+            let (fw, fh, x, y) = tile
+                .native_dma_sample
+                .expect("tile producer sampling transform");
+            assert_eq!((fw, fh), (WIDTH as u32, HEIGHT as u32));
+            assert_eq!(
+                (x as i64, y as i64),
+                (
+                    i64::from(tile.frame.x) - i64::from(original.x),
+                    i64::from(tile.frame.y) - i64::from(original.y)
+                )
+            );
+        }
+        let accepted: Vec<_> = mixed.iter().map(|s| (s.layer, s.native_revision)).collect();
+        crate::backing::set_native_gpu_admission(sdl, &accepted[..5]);
+        assert!(
+            crate::backing::gpu_under_metal(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_none(),
+            "partial GPU acceptance removed mixed CPU backing below opaque Metal"
+        );
+        crate::backing::set_native_gpu_admission(sdl, &accepted);
+        assert!(
+            crate::backing::gpu_under_metal_cached(
+                sdl,
+                &crate::backing::Store::new(WIDTH as u32, HEIGHT as u32)
+            )
+            .is_some(),
+            "all mixed native source tiles were admitted but no underlay was produced"
+        );
+        crate::backing::remove_overlay(above);
         crate::backing::forget(above);
         objc::arc::release(window);
     }

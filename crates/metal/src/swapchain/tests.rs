@@ -3471,6 +3471,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         bytes: Arc::new(red),
         revision: 1,
         dmabuf: None,
+        dma_sample: None,
     };
     let metal_placement = ScenePlacement {
         id: metal_id,
@@ -3584,6 +3585,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
             ),
             revision: 1,
             dmabuf: None,
+            dma_sample: None,
         }),
         ..native_placement
     };
@@ -4066,6 +4068,7 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
                     bytes: Arc::new([0u8, 0, 128, 128].repeat(tw as usize * th as usize)),
                     revision: 91 + tile_no as u64,
                     dmabuf: None,
+                    dma_sample: None,
                 }),
             };
             assert!(tile.native.as_ref().unwrap().bytes.len() <= 64 * 1024 * 1024);
@@ -4193,6 +4196,7 @@ fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
                 bytes: Arc::new([0u8, 0, 255, 255].repeat(20 * 18)),
                 revision: 1,
                 dmabuf: None,
+                dma_sample: None,
             }),
         };
         assert_eq!(stage_native_scene_source(&mut state, &red), Ok(true));
@@ -4335,6 +4339,7 @@ fn twelve_transaction_pinned_gpu_generations_count_toward_scene_budget() {
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 1,
             dmabuf: None,
+            dma_sample: None,
         }),
     };
     assert_eq!(stage_native_scene_source(&mut state, &placement), Ok(true));
@@ -4428,6 +4433,7 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
             ),
             revision: 1,
             dmabuf: None,
+            dma_sample: None,
         }),
     };
     state.synchronize_scene(window as usize, &[metal_placement, native.clone()]);
@@ -4524,6 +4530,7 @@ fn rounded_native_opaque_overlay_preserves_metal_corners() {
             bytes: Arc::new([0u8, 0, 255, 255].repeat((whole.width * whole.height) as usize)),
             revision: 1,
             dmabuf: None,
+            dma_sample: None,
         }),
     };
     state.layers.push(metal_layer);
@@ -4569,26 +4576,20 @@ fn large_native_dma_source_requires_no_event_thread_pixel_allocation() {
         modifier: 0,
         planes: vec![],
     });
-    let admitted = native_scene_source(None, Some(Arc::clone(&picture)), 7, 6016, 3384)
+    let admitted = native_scene_source(None, Some(Arc::clone(&picture)), 7, 6016, 3384, None)
         .expect("6K DMA-BUF-only sources must bypass the 64 MiB CPU cap");
     assert!(admitted.bytes.is_empty());
     assert!(Arc::ptr_eq(admitted.dmabuf.as_ref().unwrap(), &picture));
     assert_eq!(admitted.revision, 7);
-    assert!(native_scene_source(None, Some(picture), 7, 9000, 9000).is_none());
+    assert!(native_scene_source(None, Some(picture), 7, 9000, 9000, None).is_none());
 }
 
-/// Exercise the complete 6K external producer -> DMA import -> retained
-/// native scene -> window composite -> GPU pixel readback. A real DMA-BUF
-/// exporter is opt-in because not every CI host has GBM or enough GPU memory.
-#[test]
 #[cfg(target_os = "linux")]
-fn oversized_external_dma_buff_composes_actual_source_pixels() {
-    if isolate_vulkan_graphical_test("oversized_external_dma_buff_composes_actual_source_pixels") {
-        return;
-    }
-    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
-        return;
-    }
+fn real_gbm_picture_with_pixels(
+    width: u32,
+    height: u32,
+    color: impl Fn(u32, u32) -> [u8; 4],
+) -> Arc<appkit::backing::Dmabuf> {
     let Some(importer) = crate::overlay::importer() else {
         panic!("the Vulkan adapter cannot import DMA-BUFs");
     };
@@ -4600,16 +4601,6 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
         .into_iter()
         .find(|path| std::fs::metadata(path).is_ok_and(|meta| meta.rdev() == importer.device))
         .expect("no matching DRM render node for the Vulkan importer");
-    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
-        panic!("could not create real Vulkan WSI fixture for DMA-BUF pixels");
-    };
-    let (width, height) = (6016u32, 3384u32);
-    assert!(!appkit::backing::native_scene_extent_supported(
-        width, height
-    ));
-    assert!(appkit::backing::native_scene_dma_extent_supported(
-        width, height
-    ));
     // Resolve GBM dynamically to keep portable builds independent of the
     // distribution's libgbm development package.
     unsafe {
@@ -4669,9 +4660,9 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
             "GBM 6K buffer not CPU mappable"
         );
         let bytes = std::slice::from_raw_parts_mut(pixels, stride as usize * height as usize);
-        for row in bytes.chunks_exact_mut(stride as usize) {
-            for pixel in row.chunks_exact_mut(4).take(width as usize) {
-                pixel.copy_from_slice(&[0, 0, 255, 255]); // opaque red, BGRA
+        for (y, row) in bytes.chunks_exact_mut(stride as usize).enumerate() {
+            for (x, pixel) in row.chunks_exact_mut(4).take(width as usize).enumerate() {
+                pixel.copy_from_slice(&color(x as u32, y as u32));
             }
         }
         bo_unmap(bo, cookie);
@@ -4693,7 +4684,319 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
                 stride,
             }],
         });
-        let native_source = native_scene_source(None, Some(picture), 1, width, height)
+        picture
+    }
+}
+
+/// Six fully visible CPU-backed tiles and a translucent 6K real DMA-BUF
+/// must composite in source order. Transparent producer texels reveal CPU,
+/// never the opaque Metal image behind that native foreground.
+#[test]
+#[cfg(target_os = "linux")]
+fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
+    if isolate_vulkan_graphical_test(
+        "six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    const WIDTH: u32 = 6016;
+    const HEIGHT: u32 = 3384;
+    let picture = real_gbm_picture_with_pixels(WIDTH, HEIGHT, |x, _| {
+        if x < WIDTH / 2 {
+            [0, 0, 128, 128]
+        } else {
+            [0, 0, 0, 0]
+        }
+    });
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window =
+        sdl3::video::create_window(c"6K mixed CPU DMA", WIDTH as i32, HEIGHT as i32, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let source = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: WIDTH,
+            height: HEIGHT,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            source.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        )
+    })
+    .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: WIDTH,
+        height: HEIGHT,
+        window_width: WIDTH,
+        window_height: HEIGHT,
+    };
+    let bottom = ScenePlacement {
+        id: 0x2458,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.push(bottom.id);
+    state.synchronize_scene(window as usize, &[bottom.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            bottom.id,
+            &whole,
+            PresentSource::from(&source),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    let mut scene = vec![bottom.clone()];
+    let mut count = 0usize;
+    for y in (0..HEIGHT).step_by(2048) {
+        for x in (0..WIDTH).step_by(2048) {
+            let tw = (WIDTH - x).min(2048);
+            let th = (HEIGHT - y).min(2048);
+            let tile = ScenePlacement {
+                id: (3usize << (usize::BITS - 2)) | (count + 1),
+                frame: DirectFrame::from_frame(&appkit::view::Frame {
+                    x: x as i32,
+                    y: y as i32,
+                    width: tw,
+                    height: th,
+                    ..whole
+                }),
+                opacity: 1.0,
+                opaque: false,
+                clip: None,
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: Some(scene::NativeCpuSceneSource {
+                    bytes: Arc::new([255, 0, 0, 255].repeat(tw as usize * th as usize)),
+                    revision: 7 + count as u64,
+                    dmabuf: Some(Arc::clone(&picture)),
+                    dma_sample: Some(scene::DmaSample {
+                        full_width: WIDTH,
+                        full_height: HEIGHT,
+                        crop_x: x,
+                        crop_y: y,
+                    }),
+                }),
+            };
+            assert!(tile.native.as_ref().unwrap().bytes.len() <= 64 * 1024 * 1024);
+            assert_eq!(
+                stage_native_scene_source(&mut state, &tile),
+                Ok(true),
+                "mixed tile failed import or scene staging"
+            );
+            scene.push(tile);
+            count += 1;
+        }
+    }
+    assert_eq!(count, 6);
+    state.synchronize_scene(window as usize, &scene);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    // DMA: premultiplied half-red over opaque CPU blue => purple. Fully
+    // transparent texels preserve CPU blue rather than exposing Metal green.
+    for (x, y, expected) in [
+        (5, 5, [128, 0, 127, 255]),
+        (2047, 2047, [128, 0, 127, 255]),
+        (2048, 2048, [128, 0, 127, 255]),
+        (3007, 3383, [128, 0, 127, 255]),
+        (3008, 0, [0, 0, 255, 255]),
+        (4096, 2048, [0, 0, 255, 255]),
+        (6015, 3383, [0, 0, 255, 255]),
+    ] {
+        let pixel = read_scene_pixel(gpu, image, WIDTH, HEIGHT, x, y);
+        for channel in 0..4 {
+            assert!(
+                (i32::from(pixel[channel]) - i32::from(expected[channel])).abs() <= 2,
+                "mixed DMA/native/Metal sampling at ({x},{y}) pixel={pixel:?} expected={expected:?}"
+            );
+        }
+    }
+    let removed = scene.pop().unwrap();
+    assert_eq!(removed.frame.x, 4096);
+    state.synchronize_scene(window as usize, &scene);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, WIDTH, HEIGHT, 5200, 3000),
+        [0, 255, 0, 255],
+        "removed mixed tile failed to reveal retained static Metal"
+    );
+    drop(state);
+    gpu.destroy_image(source);
+    sdl3::video::destroy_window(window);
+}
+
+/// Several mostly-offscreen 6K producer DMA-BUFs must allocate only clipped
+/// destination images; UVs sample their original producer offset correctly.
+#[test]
+#[cfg(target_os = "linux")]
+fn many_offscreen_six_k_dma_views_stage_in_bounded_visible_gpu_budget() {
+    if isolate_vulkan_graphical_test(
+        "many_offscreen_six_k_dma_views_stage_in_bounded_visible_gpu_budget",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let picture = real_gbm_picture_with_pixels(6016, 3384, |x, y| {
+        if x >= 5800 && y >= 3200 {
+            [0, 0, 255, 255]
+        } else {
+            [255, 0, 0, 255]
+        }
+    });
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        panic!("no WSI");
+    };
+    let full = appkit::view::Frame {
+        x: -5800,
+        y: -3280,
+        width: 6016,
+        height: 3384,
+        ..whole
+    };
+    let mut plans = Vec::new();
+    for n in 0..12usize {
+        let placement = ScenePlacement {
+            id: (1usize << (usize::BITS - 1)) | (n + 0x6010),
+            frame: DirectFrame::from_frame(&full),
+            opacity: 1.0,
+            opaque: false,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: Some(scene::NativeCpuSceneSource {
+                bytes: Arc::new(Vec::new()),
+                revision: n as u64 + 1,
+                dmabuf: Some(Arc::clone(&picture)),
+                dma_sample: None,
+            }),
+        };
+        let cropped = crop_native_to_window(placement).expect("6K DMA visibility");
+        assert_eq!((cropped.frame.width, cropped.frame.height), (160, 104));
+        assert_eq!((cropped.frame.x, cropped.frame.y), (0, 0));
+        let sample = cropped.native.as_ref().unwrap().dma_sample.unwrap();
+        assert_eq!(
+            (
+                sample.crop_x,
+                sample.crop_y,
+                sample.full_width,
+                sample.full_height
+            ),
+            (5800, 3280, 6016, 3384)
+        );
+        plans.push(cropped);
+    }
+    let before = state.scene_gpu_bytes();
+    for proposal in &plans {
+        assert_eq!(
+            stage_native_scene_source(&mut state, proposal),
+            Ok(true),
+            "one of 12 otherwise representable tiny DMA viewports exhausted GPU budget"
+        );
+    }
+    let bytes = state.scene_gpu_bytes().saturating_sub(before);
+    assert!(
+        bytes < 32 * 1024 * 1024,
+        "12 clipped DMA sources retained {bytes} GPU bytes"
+    );
+    state.synchronize_scene(window as usize, &plans);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 55, 42),
+        [255, 0, 0, 255],
+        "cropped DMA mapped the wrong far-right/bottom producer texel"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Exercise the complete 6K external producer -> DMA import -> retained
+/// native scene -> window composite -> GPU pixel readback. A real DMA-BUF
+/// exporter is opt-in because not every CI host has GBM or enough GPU memory.
+#[test]
+#[cfg(target_os = "linux")]
+fn oversized_external_dma_buff_composes_actual_source_pixels() {
+    if isolate_vulkan_graphical_test("oversized_external_dma_buff_composes_actual_source_pixels") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        panic!("could not create real Vulkan WSI fixture for DMA-BUF pixels");
+    };
+    let (width, height) = (6016u32, 3384u32);
+    assert!(!appkit::backing::native_scene_extent_supported(
+        width, height
+    ));
+    assert!(appkit::backing::native_scene_dma_extent_supported(
+        width, height
+    ));
+    let picture = real_gbm_picture_with_pixels(width, height, |_, _| [0, 0, 255, 255]);
+    unsafe {
+        let native_source = native_scene_source(None, Some(picture), 1, width, height, None)
             .expect("a 6K DMA-only layer must enter retained composition");
         assert!(native_source.bytes.is_empty());
         gpu.one_shot(|device, cb| {
@@ -4855,6 +5158,7 @@ fn linear_dma_fallback_maps_only_far_visible_rows_and_keeps_texel_offsets() {
                     stride: 4096,
                 }],
             })),
+            dma_sample: None,
         }),
     };
     let mapped = linear_dmabuf_cpu_fallback(&scene).expect("bounded nonzero-map-offset source");
@@ -4872,6 +5176,33 @@ fn linear_dma_fallback_maps_only_far_visible_rows_and_keeps_texel_offsets() {
     assert_eq!(&out.bytes[..4], &red);
     assert_eq!(&out.bytes[(32 + 1) * 4..(32 + 2) * 4], &blue);
     assert!(out.dmabuf.is_none());
+    // The real mixed-source path already cropped the CPU base to 32x32.
+    // An importer failure must sample the far-offset original DMA producer,
+    // then blend its premultiplied alpha over the cropped CPU background.
+    let mut cropped = scene.clone();
+    cropped.frame.x = 0;
+    cropped.frame.y = 0;
+    cropped.frame.width = 32;
+    cropped.frame.height = 32;
+    let source = cropped.native.as_mut().unwrap();
+    source.bytes = Arc::new([0u8, 255, 0, 255].repeat(32 * 32));
+    source.dma_sample = Some(scene::DmaSample {
+        full_width: 1024,
+        full_height: 1024,
+        crop_x: 512,
+        crop_y: 512,
+    });
+    let recovered = linear_dmabuf_cpu_fallback(&cropped)
+        .expect("cropped source with producer's original far-offset DMA image");
+    let pixels = &recovered.native.as_ref().unwrap().bytes;
+    assert_eq!(&pixels[..4], &red);
+    assert_eq!(&pixels[(32 + 1) * 4..(32 + 2) * 4], &blue);
+    assert_eq!(
+        &pixels[(32 * 2 + 2) * 4..(32 * 2 + 3) * 4],
+        &[0, 255, 0, 255],
+        "transparent producer pixel erased CPU content below it"
+    );
+    assert!(recovered.native.as_ref().unwrap().dmabuf.is_none());
     let mut unsupported = scene;
     let clone = unsupported.native.as_mut().unwrap();
     let original = clone.dmabuf.take().unwrap();
@@ -4970,6 +5301,7 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
             bytes: Arc::new(Vec::new()),
             revision: 1,
             dmabuf: Some(picture),
+            dma_sample: None,
         }),
     };
     let bottom = ScenePlacement {
@@ -5131,6 +5463,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
                 modifier: 0,
                 planes: vec![],
             })),
+            dma_sample: None,
         }),
     };
     // Mirror the worker's transactional order: do not mutate scene
@@ -5220,6 +5553,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
             bytes: Arc::new([0u8, 0, 128, 128].repeat(30 * 25)),
             revision: 12,
             dmabuf: None,
+            dma_sample: None,
         }),
         ..invalid
     };
@@ -5232,6 +5566,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
             bytes: Arc::new(Vec::new()),
             revision: 13,
             dmabuf: invalid.native.as_ref().unwrap().dmabuf.clone(),
+            dma_sample: None,
         }),
         ..cpu.clone()
     };
@@ -5468,6 +5803,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
                 modifier: u64::MAX,
                 planes: vec![],
             })),
+            dma_sample: None,
         }),
     };
     let mut proposal = vec![bottom.clone()];
@@ -5484,6 +5820,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
                 bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
                 revision: 72,
                 dmabuf: None,
+                dma_sample: None,
             }),
             ..missing.clone()
         });
@@ -5728,6 +6065,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
                 modifier: u64::MAX,
                 planes: vec![],
             })),
+            dma_sample: None,
         }),
     };
     // A has already been displayed at revision 9. Stage its revision 10
@@ -5746,6 +6084,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 9,
             dmabuf: None,
+            dma_sample: None,
         }),
         ..unknown.clone()
     };
@@ -5787,6 +6126,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
             revision: 10,
             dmabuf: None,
+            dma_sample: None,
         }),
         ..previously_accepted_a.clone()
     };
@@ -5895,6 +6235,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 12,
             dmabuf: None,
+            dma_sample: None,
         }),
         ..unknown
     };
@@ -5974,6 +6315,7 @@ fn temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal() {
             bytes: Arc::new([0, 0, 255, 255].repeat((48 * 44) as usize)),
             revision: 1,
             dmabuf: None,
+            dma_sample: None,
         }),
     };
     let before = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
@@ -6116,6 +6458,7 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
                 bytes: Arc::new([index as u8, 0, 255, 255].repeat(4096 * 4096)),
                 revision: index as u64 + 1,
                 dmabuf: None,
+                dma_sample: None,
             }),
         });
     }
@@ -6442,6 +6785,7 @@ fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
             bytes: capture.0,
             revision: capture.1,
             dmabuf: None,
+            dma_sample: None,
         }),
     };
     let native = foreground(first);
@@ -6563,6 +6907,7 @@ fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
         bytes: Arc::new([0u8, 0, 255, 255].repeat((frame.width * frame.height) as usize)),
         revision: 1,
         dmabuf: None,
+        dma_sample: None,
     };
     let native = |clip| ScenePlacement {
         id: native_id,
