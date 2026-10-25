@@ -5030,7 +5030,13 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
             "6K mixed real GPU mode={:?} initial_six_tiles_ms={first_six_tiles_ms:.3} first_wsi_ms={initial_wsi_ms:.3}",
             state.present_mode
         );
-        for n in 0..3 {
+        let repetitions = std::env::var("ROSEMARY_BENCH_NATIVE_MIXED_6K_REVISIONS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(3)
+            .clamp(3, 64);
+        let mut stage_times = Vec::with_capacity(repetitions);
+        for n in 0..repetitions {
             let animation_start = std::time::Instant::now();
             // Worker discards expendable scene snapshot spares before every
             // transaction; immutable CPU backing caches must survive.
@@ -5040,13 +5046,19 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
                 assert_eq!(stage_native_scene_source(&mut state, tile), Ok(true));
             }
             let six_tiles_ms = animation_start.elapsed().as_secs_f64() * 1000.0;
+            stage_times.push(six_tiles_ms);
             state.synchronize_scene(window as usize, &scene);
             assert_eq!(state.redisplay_scene(window as usize), Ok(true));
             state.idle();
             let wsi_start = std::time::Instant::now();
-            state
-                .flush_composite(window)
-                .expect("animated mixed 6K WSI publication");
+            // Diagnostic: omit repeated FIFO presentations to isolate native
+            // staging from a full present queue. Never treat that timing as
+            // end-to-end WSI latency or a guest frame-rate measurement.
+            if std::env::var_os("ROSEMARY_BENCH_NATIVE_MIXED_6K_SKIP_WSI").is_none() {
+                state
+                    .flush_composite(window)
+                    .expect("animated mixed 6K WSI publication");
+            }
             let wsi_ms = wsi_start.elapsed().as_secs_f64() * 1000.0;
             eprintln!(
                 "6K mixed real GPU mode={:?} revision={} six_tiles_ms={six_tiles_ms:.3} first_wsi_ms={wsi_ms:.3} total_ms={:.3}",
@@ -5055,6 +5067,15 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
                 animation_start.elapsed().as_secs_f64() * 1000.0
             );
         }
+        stage_times.sort_by(f64::total_cmp);
+        let p95 = stage_times[(stage_times.len() * 95 / 100).min(stage_times.len() - 1)];
+        let avg = stage_times.iter().sum::<f64>() / stage_times.len() as f64;
+        eprintln!(
+            "6K mixed real GPU mode={:?} revisions={} staging_mean_ms={avg:.3} staging_p95_ms={p95:.3} staging_max_ms={:.3}",
+            state.present_mode,
+            repetitions,
+            stage_times.last().unwrap()
+        );
     }
     let image = state.composite.as_ref().unwrap().image;
     // DMA: premultiplied half-red over opaque CPU blue => purple. Fully
