@@ -5032,6 +5032,9 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         );
         for n in 0..3 {
             let animation_start = std::time::Instant::now();
+            // Worker discards expendable scene snapshot spares before every
+            // transaction; immutable CPU backing caches must survive.
+            state.shed_scene_snapshot_spares();
             for tile in &mut scene[1..] {
                 tile.native.as_mut().unwrap().revision += 1;
                 assert_eq!(stage_native_scene_source(&mut state, tile), Ok(true));
@@ -5073,9 +5076,79 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
             );
         }
     }
+    // A new CPU Arc has different authoritative contents even when the
+    // DMA producer and layer id are unchanged. Do not reuse its old cached
+    // GPU base; transparent DMA texels must reveal the new exact CPU color.
+    let last_id = scene.last().unwrap().id;
+    assert_eq!(
+        state.native_cpu_bases.len(),
+        6,
+        "normal scene spare cleanup wrongly discarded immutable CPU bases"
+    );
+    let old_base = state
+        .native_cpu_bases
+        .iter()
+        .find(|base| base.id == last_id)
+        .map(|base| Arc::clone(&base.image));
+    let last = scene.last_mut().unwrap();
+    last.native.as_mut().unwrap().bytes =
+        Arc::new([0u8, 255, 0, 255].repeat((last.frame.width * last.frame.height) as usize));
+    last.native.as_mut().unwrap().revision += 1;
+    // Force the existing physical-budget eviction path without actually
+    // allocating hundreds of MiB. A stale cached base is optional; all
+    // accepted scene/producer images and their real charges remain intact.
+    let existing = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let held = existing.held.load(Ordering::Acquire);
+    let headroom = 10 * 1024 * 1024u64;
+    assert!(WINDOW_GPU_PAYLOAD_BUDGET > held + headroom);
+    let pressure =
+        GpuCharge::reserve(window as usize, WINDOW_GPU_PAYLOAD_BUDGET - held - headroom).unwrap();
+    assert!(!window_gpu_capacity_available(
+        window as usize,
+        3 * u64::from(last.frame.width) * u64::from(last.frame.height) * 4
+    ));
+    assert_eq!(stage_native_scene_source(&mut state, last), Ok(true));
+    drop(pressure);
+    assert!(
+        state.native_cpu_bases.len() < 6,
+        "native CPU base cache must shed optional images on physical pressure"
+    );
+    if let (Some(previous), Some(new)) = (
+        old_base.as_ref(),
+        state
+            .native_cpu_bases
+            .iter()
+            .find(|base| base.id == last_id),
+    ) {
+        assert!(
+            !Arc::ptr_eq(previous, &new.image),
+            "new immutable CPU source incorrectly reused the old GPU base"
+        );
+    }
+    state.synchronize_scene(window as usize, &scene);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(gpu, image, WIDTH, HEIGHT, 5200, 3000),
+        [0, 255, 0, 255],
+        "changed native CPU pixels failed to invalidate base cache"
+    );
+    drop(old_base);
     let removed = scene.pop().unwrap();
     assert_eq!(removed.frame.x, 4096);
     state.synchronize_scene(window as usize, &scene);
+    assert!(
+        state
+            .native_cpu_bases
+            .iter()
+            .all(|base| base.id != removed.id),
+        "removed native layer left an obsolete GPU CPU-base cache entry"
+    );
     assert_eq!(state.redisplay_scene(window as usize), Ok(true));
     state.idle();
     assert_eq!(

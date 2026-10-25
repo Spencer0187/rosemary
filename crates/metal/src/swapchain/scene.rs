@@ -1042,6 +1042,8 @@ impl Swapchain {
         }
         self.scene_layers
             .retain(|layer| self.layers.contains(&layer.id));
+        self.native_cpu_bases
+            .retain(|base| self.layers.contains(&base.id));
         self.scene_frames.retain(|(id, _)| self.layers.contains(id));
         for placement in live {
             if let Some(direct) = self
@@ -1186,6 +1188,9 @@ impl Swapchain {
                 count(spare);
             }
         }
+        for base in &self.native_cpu_bases {
+            count(&base.image);
+        }
         for pinned in &self.transaction_pinned {
             count(pinned);
         }
@@ -1272,10 +1277,17 @@ impl Swapchain {
     /// Spares are only an optimization. Drop them on budget pressure; Arc
     /// leases held by unfinished GPU commands remain alive and stay charged
     /// through Frame::scene_reads until their completion fences retire.
-    pub(super) fn shed_scene_spares(&mut self) {
+    pub(super) fn shed_scene_snapshot_spares(&mut self) {
         for layer in &mut self.scene_layers {
             layer.spare.clear();
         }
+    }
+
+    // Optional CPU bases count toward scene and physical budgets, so evict
+    // them on actual allocation pressure, not at every worker transaction.
+    pub(super) fn shed_scene_spares(&mut self) {
+        self.native_cpu_bases.clear();
+        self.shed_scene_snapshot_spares();
     }
 
     /// Create/rotate a snapshot allocation before a command references it.
