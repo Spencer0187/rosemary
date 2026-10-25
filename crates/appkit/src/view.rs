@@ -332,12 +332,59 @@ pub(crate) fn invalidate_metal_scene_for_view(view: Id) {
 
 /// Called by the video-thread event pump after dispatching guest input.
 /// An invalidation racing a capture stays dirty for the following turn.
+/// IOSurface writers need not call setContents: again. Poll only the CA
+/// descendants which belong to a Metal-backed view, on AppKit's event thread.
+fn poll_metal_surface_publications() {
+    if !crate::coreanimation::has_surface_publications() {
+        return;
+    }
+    fn visit(view: Id, depth: usize) {
+        if depth >= 64 || !is_view(view) {
+            return;
+        }
+        let layer = view_of(view).layer;
+        if !layer.is_null()
+            && crate::layer::is_metal(layer)
+            && let Some(frame) = unsafe { presentation_frame(view) }
+        {
+            let rect = crate::backing::Rect {
+                x: i64::from(frame.x),
+                y: i64::from(frame.y),
+                width: i64::from(frame.width),
+                height: i64::from(frame.height),
+            };
+            let viewport = crate::backing::Rect {
+                x: 0,
+                y: 0,
+                width: i64::from(frame.window_width),
+                height: i64::from(frame.window_height),
+            };
+            if crate::coreanimation::metal_surface_publication_changed(view, rect, viewport) {
+                crate::coreanimation::changed(layer);
+            }
+        }
+        let children = view_of(view).subviews;
+        if let Some(children) =
+            unsafe { corefoundation::collections::array(children as *const c_void) }
+        {
+            for &child in &children.values {
+                visit(child as Id, depth + 1);
+            }
+        }
+    }
+    for window in crate::window::all() {
+        let root = crate::window::content_view_of(window);
+        visit(root, 0);
+    }
+}
+
 /// Animation frames intentionally publish without waiting for new drawables.
 pub(crate) fn flush_metal_scenes() {
     if !sdl3::video::is_video_thread() {
         return;
     }
     service_native_cpu_fallbacks();
+    poll_metal_surface_publications();
     let now = darwin::mach::media_time();
     let animated_roots = crate::coreanimation::scene_animation_roots(now);
     let animating = !animated_roots.is_empty();
@@ -628,6 +675,98 @@ fn capture_metal_scene(
     Some((result, roots))
 }
 
+#[allow(clippy::too_many_arguments)]
+fn capture_metal_subtree_segment(
+    view: Id,
+    frame: Frame,
+    selected: &[usize],
+    ca_clip: Option<Frame>,
+    rounded: &[RoundedSceneClip],
+    opacity: f32,
+    tile: &mut u32,
+    scene: &mut Vec<MetalSceneLayer>,
+) {
+    let viewport = Frame {
+        x: 0,
+        y: 0,
+        width: frame.window_width,
+        height: frame.window_height,
+        ..frame
+    };
+    let descendants = crate::coreanimation::metal_sublayers_extent_selected(
+        view,
+        crate::backing::Rect {
+            x: i64::from(frame.x),
+            y: i64::from(frame.y),
+            width: i64::from(frame.width),
+            height: i64::from(frame.height),
+        },
+        selected,
+    )
+    .unwrap_or_default();
+    let extent = Frame {
+        x: descendants
+            .x
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        y: descendants
+            .y
+            .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+        width: descendants.width.clamp(0, i64::from(u32::MAX)) as u32,
+        height: descendants.height.clamp(0, i64::from(u32::MAX)) as u32,
+        ..frame
+    };
+    let visible = intersect_scene_clips(extent, viewport);
+    let visible = ca_clip.map_or(visible, |clip| intersect_scene_clips(visible, clip));
+    const TILE_EDGE: u32 = 2048;
+    let mut y = 0u32;
+    while y < visible.height {
+        let h = (visible.height - y).min(TILE_EDGE);
+        let mut x = 0u32;
+        while x < visible.width {
+            let w = (visible.width - x).min(TILE_EDGE);
+            let part = Frame {
+                x: visible.x.saturating_add(x as i32),
+                y: visible.y.saturating_add(y as i32),
+                width: w,
+                height: h,
+                ..visible
+            };
+            let crop = crate::backing::Rect {
+                x: i64::from(part.x) - i64::from(frame.x),
+                y: i64::from(part.y) - i64::from(frame.y),
+                width: i64::from(w),
+                height: i64::from(h),
+            };
+            if let Some((pixels, revision)) = crate::backing::metal_sublayers_segment_pixels_cropped(
+                view,
+                frame.width,
+                frame.height,
+                crop,
+                selected,
+            ) {
+                scene.push(MetalSceneLayer {
+                    layer: native_tile_id(view, *tile),
+                    native_owner: view as usize,
+                    frame: part,
+                    opacity,
+                    opaque: false,
+                    clip: ca_clip,
+                    rounded: rounded.to_vec(),
+                    occluded: Vec::new(),
+                    native_cpu_capture: None,
+                    native_pixels: Some(pixels),
+                    native_dmabuf: None,
+                    native_revision: revision,
+                    native_dma_sample: None,
+                });
+            }
+            *tile = tile.saturating_add(1);
+            x += w;
+        }
+        y += h;
+    }
+}
+
 fn visit_metal_scene(
     view: Id,
     window: sdl3::Window,
@@ -729,94 +868,70 @@ fn visit_metal_scene(
             }
         }
     }
-    // Non-view CALayer children of a CAMetalLayer draw ABOVE its drawable.
-    // Capture them as a separately retained CPU source; the drawable can be
-    // static while a child's contents or presentation animation changes.
+    let child_clip = if current_masks {
+        own_frame.map(|frame| ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
+    } else {
+        ca_clip
+    };
+    // The effective CA hierarchy, not the NSView child list alone, owns the
+    // stacking order when ordinary layers interleave with backed views.
+    let children = view_of(view).subviews;
+    let child_views: Vec<Id> =
+        unsafe { corefoundation::collections::array(children as *const c_void) }
+            .map_or_else(Vec::new, |array| {
+                array.values.iter().map(|child| *child as Id).collect()
+            });
+    let mut ca_visited = std::collections::HashSet::new();
     if !layer.is_null()
         && crate::layer::is_metal(layer)
-        && crate::coreanimation::has_renderable_sublayers(layer)
         && let Some(frame) = unsafe { presentation_frame(view) }
         && frame.window == window
     {
-        let viewport = Frame {
-            x: 0,
-            y: 0,
-            width: frame.window_width,
-            height: frame.window_height,
-            ..frame
-        };
-        let descendants = crate::coreanimation::metal_sublayers_extent(
-            view,
-            crate::backing::Rect {
-                x: i64::from(frame.x),
-                y: i64::from(frame.y),
-                width: i64::from(frame.width),
-                height: i64::from(frame.height),
-            },
-        );
-        let descendants = descendants.unwrap_or_default();
-        let extent = Frame {
-            x: descendants
-                .x
-                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            y: descendants
-                .y
-                .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
-            width: descendants.width.clamp(0, i64::from(u32::MAX)) as u32,
-            height: descendants.height.clamp(0, i64::from(u32::MAX)) as u32,
-            ..frame
-        };
-        let visible = intersect_scene_clips(extent, viewport);
-        let visible = ca_clip.map_or(visible, |clip| intersect_scene_clips(visible, clip));
-        const TILE_EDGE: u32 = 2048;
-        let mut index = 0u32;
-        let mut y = 0u32;
-        while y < visible.height {
-            let height = (visible.height - y).min(TILE_EDGE);
-            let mut x = 0u32;
-            while x < visible.width {
-                let width = (visible.width - x).min(TILE_EDGE);
-                let part = Frame {
-                    x: visible.x.saturating_add(x as i32),
-                    y: visible.y.saturating_add(y as i32),
-                    width,
-                    height,
-                    ..visible
-                };
-                let crop = crate::backing::Rect {
-                    x: i64::from(part.x) - i64::from(frame.x),
-                    y: i64::from(part.y) - i64::from(frame.y),
-                    width: i64::from(width),
-                    height: i64::from(height),
-                };
-                if let Some((pixels, revision)) = crate::backing::metal_sublayers_pixels_cropped(
-                    view,
-                    frame.width,
-                    frame.height,
-                    crop,
-                ) {
-                    // Use an exclusive ID namespace for a root Metal view's
-                    // rasterized descendants; its GPU drawable keeps `layer`.
-                    scene.push(MetalSceneLayer {
-                        layer: native_tile_id(view, index),
-                        native_owner: view as usize,
-                        frame: part,
-                        opacity: (effective_alpha(view) as f32) * layer_opacity,
-                        opaque: false,
-                        clip: ca_clip,
-                        rounded: rounded.clone(),
-                        occluded: Vec::new(),
-                        native_cpu_capture: None,
-                        native_pixels: Some(pixels),
-                        native_dmabuf: None,
-                        native_revision: revision,
-                        native_dma_sample: None,
-                    });
+        let backed: Vec<(usize, Id)> = child_views
+            .iter()
+            .copied()
+            .filter_map(|child| {
+                let backing = crate::view::layer_of(child);
+                (!backing.is_null()).then_some((backing as usize, child))
+            })
+            .collect();
+        let layer_ids = backed.iter().map(|entry| entry.0).collect::<Vec<_>>();
+        let paint = crate::coreanimation::metal_paint_steps(layer, &layer_ids);
+        let mut tile = 0u32;
+        for step in paint {
+            match step {
+                crate::coreanimation::MetalPaintStep::Native(selected) => {
+                    capture_metal_subtree_segment(
+                        view,
+                        frame,
+                        &selected,
+                        ca_clip,
+                        &rounded,
+                        (effective_alpha(view) as f32) * layer_opacity,
+                        &mut tile,
+                        scene,
+                    );
                 }
-                index += 1;
-                x += width;
+                crate::coreanimation::MetalPaintStep::View(id) => {
+                    if let Some((_, child)) = backed.iter().find(|entry| entry.0 == id) {
+                        ca_visited.insert(*child as usize);
+                        visit_metal_scene(
+                            *child,
+                            window,
+                            scene,
+                            roots,
+                            seen_metal,
+                            child_clip,
+                            layer_opacity,
+                            layer,
+                            view,
+                            &rounded,
+                            now,
+                            depth + 1,
+                        );
+                    }
+                }
             }
-            y += height;
         }
     }
     // Per-view native content needs its own source above the preceding
@@ -940,17 +1055,10 @@ fn visit_metal_scene(
             }
         }
     }
-    let child_clip = if current_masks {
-        own_frame.map(|frame| ca_clip.map_or(frame, |clip| intersect_scene_clips(frame, clip)))
-    } else {
-        ca_clip
-    };
-    let children = view_of(view).subviews;
-    if let Some(children) = unsafe { corefoundation::collections::array(children as *const c_void) }
-    {
-        for &child in &children.values {
+    for child in child_views {
+        if !ca_visited.contains(&(child as usize)) {
             visit_metal_scene(
-                child as Id,
+                child,
                 window,
                 scene,
                 roots,
@@ -4209,6 +4317,143 @@ mod tests {
         assert!(
             masked_raster.frame.x >= drawable.frame.x,
             "masksToBounds did not clip the escaped CA child"
+        );
+        // The CA-ordered NSView-backed path must inherit the Metal root clip,
+        // just like the ordinary CALayer raster path above.
+        let backed_view = view(rect(-15., 0., 25., 12.));
+        let backed_layer = unsafe { make(child_cls as *const _ as Id, objc::sel::get("layer")) };
+        unsafe {
+            set(backed_view, objc::sel::get("setLayer:"), backed_layer);
+            set(metal_view, objc::sel::get("addSubview:"), backed_view);
+            set_frame(
+                backed_layer,
+                objc::sel::get("setFrame:"),
+                rect(-15., 0., 25., 12.),
+            );
+            set(
+                backed_layer,
+                objc::sel::get("setBackgroundColor:"),
+                red as Id,
+            );
+            set(root, objc::sel::get("addSublayer:"), backed_layer);
+        }
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        let backed = scene
+            .iter()
+            .find(|item| item.native_owner == backed_view as usize)
+            .expect("view-backed CA child missing from ordered scene");
+        let clip = backed.clip.expect("Metal root masksToBounds clip missing");
+        assert!(clip.x >= drawable.frame.x && clip.width <= drawable.frame.width);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn metal_ca_sublayers_interleave_view_backings_in_effective_order() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 100., 80.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0., 0., 100., 80.));
+        let metal_view = view(rect(0., 0., 100., 80.));
+        let blue_view = view(rect(10., 10., 20., 20.));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ca_class = objc::class::lookup(c"CALayer").unwrap();
+        let create: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { create(metal_class as *const _ as Id, objc::sel::get("layer")) };
+        let a = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let b = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let c = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let color = |r, g, bl| unsafe { crate::cgcontext::CGColorCreateGenericRGB(r, g, bl, 1.) };
+        let (red, blue, green) = (color(1., 0., 0.), color(0., 0., 1.), color(0., 1., 0.));
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), metal);
+            set(blue_view, objc::sel::get("setLayer:"), b);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set(metal_view, objc::sel::get("addSubview:"), blue_view);
+            set_frame(a, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            set_frame(b, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            set_frame(c, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            set(a, objc::sel::get("setBackgroundColor:"), red as Id);
+            set(b, objc::sel::get("setBackgroundColor:"), blue as Id);
+            set(c, objc::sel::get("setBackgroundColor:"), green as Id);
+            set(metal, objc::sel::get("addSublayer:"), a);
+            set(metal, objc::sel::get("addSublayer:"), b);
+            set(metal, objc::sel::get("addSublayer:"), c);
+        }
+        let verify = |expected: &[usize]| {
+            flush_metal_scenes();
+            let scene = metal_scene(sdl).unwrap();
+            assert_eq!(scene[0].layer, metal as usize);
+            let owners = scene
+                .iter()
+                .skip(1)
+                .filter(|item| item.native_pixels.is_some())
+                .map(|item| item.native_owner)
+                .collect::<Vec<_>>();
+            assert_eq!(owners, expected);
+            let colors = scene
+                .iter()
+                .skip(1)
+                .filter_map(|item| item.native_pixels.as_ref())
+                .map(|data| {
+                    data.chunks_exact(4)
+                        .find(|p| p[3] == 255)
+                        .map(|pixel| pixel.to_vec())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            colors
+        };
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize, metal_view as usize]),
+            vec![
+                vec![0, 0, 255, 255],
+                vec![255, 0, 0, 255],
+                vec![0, 255, 0, 255]
+            ]
+        );
+        // Changing the CA tree order must change GPU paint order, even though
+        // the NSView hierarchy itself and all content bytes remain unchanged.
+        let insert: unsafe extern "C" fn(Id, objc::sel::Sel, Id, u32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            insert(metal, objc::sel::get("insertSublayer:atIndex:"), c, 0);
+        }
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize]),
+            vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
+        );
+        let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            hidden(c, objc::sel::get("setHidden:"), 1);
+        }
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize]),
+            vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
+        );
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            remove(c, objc::sel::get("removeFromSuperlayer"));
+        }
+        assert_eq!(
+            verify(&[metal_view as usize, blue_view as usize]),
+            vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
         );
         objc::arc::release(window);
     }

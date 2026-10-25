@@ -1078,6 +1078,53 @@ pub(crate) fn surface_contents_damage(view: Id, rect: Rect, clip: Rect) -> Vec<R
     damage
 }
 
+pub(crate) fn metal_surface_publication_changed(view: Id, rect: Rect, clip: Rect) -> bool {
+    if SURFACE_LAYERS.load(Ordering::Relaxed) == 0 || clip.is_empty() {
+        return false;
+    }
+    let root = crate::view::layer_of(view);
+    if root.is_null() || !crate::layer::is_metal(root) {
+        return false;
+    }
+    let Some(mapping) = Mapping::for_view(view, rect) else {
+        return false;
+    };
+    let now = darwin::mach::media_time();
+    let presented = presentation(root, now);
+    if presented.hidden || presented.opacity <= 0.0 {
+        return false;
+    }
+    let excluded = crate::view::descendant_view_layers(view);
+    let clip = if presented.masks_to_bounds {
+        clip.intersection(&mapping.to_pixels(mapping.view_bounds))
+    } else {
+        clip
+    };
+    let origin = NSPoint {
+        x: mapping.view_bounds.origin.x - presented.bounds_origin.x,
+        y: mapping.view_bounds.origin.y - presented.bounds_origin.y,
+    };
+    let mut damage = Vec::new();
+    for child in presented.sublayers {
+        scan_surface_layer_filtered(
+            child as Id,
+            &mapping,
+            origin,
+            clip,
+            1.0,
+            now,
+            0,
+            &mut damage,
+            &excluded,
+        );
+    }
+    !damage.is_empty()
+}
+
+pub(crate) fn has_surface_publications() -> bool {
+    SURFACE_LAYERS.load(Ordering::Relaxed) > 0
+}
+
 #[cfg(test)]
 fn surface_contents_changed(view: Id, rect: Rect, clip: Rect) -> bool {
     !surface_contents_damage(view, rect, clip).is_empty()
@@ -1172,7 +1219,32 @@ fn scan_surface_layer(
     depth: usize,
     damage: &mut Vec<Rect>,
 ) {
-    if layer.is_null() || depth > 64 || clip.is_empty() {
+    scan_surface_layer_filtered(
+        layer,
+        mapping,
+        origin,
+        clip,
+        opacity,
+        now,
+        depth,
+        damage,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_surface_layer_filtered(
+    layer: Id,
+    mapping: &Mapping,
+    origin: NSPoint,
+    clip: Rect,
+    opacity: f64,
+    now: f64,
+    depth: usize,
+    damage: &mut Vec<Rect>,
+    excluded: &[usize],
+) {
+    if layer.is_null() || depth > 64 || clip.is_empty() || excluded.contains(&(layer as usize)) {
         return;
     }
     let presented = presentation(layer, now);
@@ -1183,7 +1255,6 @@ fn scan_surface_layer(
     let pixels = mapping.to_pixels(frame);
     let opacity = opacity * presented.opacity;
     if opacity > 0.0
-        && !pixels.is_empty()
         && let Some(area) = surface_publication_damage(layer, |contents| {
             contents_damage(
                 contents,
@@ -1207,7 +1278,7 @@ fn scan_surface_layer(
         y: frame.origin.y - presented.bounds_origin.y,
     };
     for child in presented.sublayers {
-        scan_surface_layer(
+        scan_surface_layer_filtered(
             child as Id,
             mapping,
             inner,
@@ -1216,6 +1287,7 @@ fn scan_surface_layer(
             now,
             depth + 1,
             damage,
+            excluded,
         );
     }
 }
@@ -2628,6 +2700,7 @@ fn draw_layer(
         now,
         depth,
         &[],
+        &[],
     )
 }
 
@@ -2642,6 +2715,7 @@ fn draw_layer_filtered(
     now: f64,
     depth: usize,
     excluded: &[usize],
+    selected: &[usize],
 ) -> bool {
     if excluded.contains(&(layer as usize)) {
         return false;
@@ -2657,18 +2731,20 @@ fn draw_layer_filtered(
     let frame = presented.frame_at(origin);
     let pixels = mapping.to_pixels(frame);
     let opacity = opacity * presented.opacity;
-    if let Some(color) = presented.background {
-        let radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
-        fill_rounded(store, pixels, clip, color, opacity, radius);
+    if selected.is_empty() || selected.contains(&(layer as usize)) {
+        if let Some(color) = presented.background {
+            let radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
+            fill_rounded(store, pixels, clip, color, opacity, radius);
+        }
+        draw_contents(
+            store,
+            layer,
+            pixels,
+            (mapping.scale_x, mapping.scale_y),
+            clip,
+            opacity,
+        );
     }
-    draw_contents(
-        store,
-        layer,
-        pixels,
-        (mapping.scale_x, mapping.scale_y),
-        clip,
-        opacity,
-    );
     let clip = match presented.masks_to_bounds {
         true => clip.intersection(&pixels),
         false => clip,
@@ -2688,6 +2764,7 @@ fn draw_layer_filtered(
             now,
             depth + 1,
             excluded,
+            selected,
         );
     }
     animating
@@ -2701,9 +2778,65 @@ pub(crate) fn has_renderable_sublayers(layer: Id) -> bool {
     })
 }
 
+/// The paint order of a Metal root may interleave ordinary CALayers with
+/// NSView-owned CALayers. Each native run must be represented independently.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum MetalPaintStep {
+    Native(Vec<usize>),
+    View(usize),
+}
+
+pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize]) -> Vec<MetalPaintStep> {
+    read_all_nodes(|nodes| {
+        fn walk(
+            nodes: &HashMap<usize, Node>,
+            at: usize,
+            view_layers: &[usize],
+            depth: usize,
+            out: &mut Vec<MetalPaintStep>,
+        ) {
+            if depth >= 64 {
+                return;
+            }
+            if view_layers.contains(&at) {
+                out.push(MetalPaintStep::View(at));
+                return;
+            }
+            let Some(node) = nodes.get(&at) else {
+                return;
+            };
+            if node.background.is_some_and(|color| color[3] > 0.0) || node.contents != 0 {
+                match out.last_mut() {
+                    Some(MetalPaintStep::Native(run)) => run.push(at),
+                    _ => out.push(MetalPaintStep::Native(vec![at])),
+                }
+            }
+            for &child in &node.sublayers {
+                walk(nodes, child, view_layers, depth + 1, out);
+            }
+        }
+        let mut steps = Vec::new();
+        if let Some(root) = nodes.get(&(root as usize)) {
+            for &child in &root.sublayers {
+                walk(nodes, child, view_layers, 0, &mut steps);
+            }
+        }
+        steps
+    })
+}
+
 /// Conservative physical extent of independently rasterized descendants.
 /// A Metal root's children may escape its bounds when masksToBounds is false.
+#[cfg(test)]
 pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
+    metal_sublayers_extent_selected(view, rect, &[])
+}
+
+pub(crate) fn metal_sublayers_extent_selected(
+    view: Id,
+    rect: Rect,
+    selected: &[usize],
+) -> Option<Rect> {
     let root = crate::view::layer_of(view);
     let mapping = Mapping::for_view(view, rect)?;
     let now = darwin::mach::media_time();
@@ -2725,6 +2858,7 @@ pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
         origin: NSPoint,
         clip: Option<Rect>,
         excluded: &[usize],
+        selected: &[usize],
         now: f64,
         depth: usize,
     ) -> Option<Rect> {
@@ -2737,8 +2871,44 @@ pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
         }
         let frame = shown.frame_at(origin);
         let pixels = mapping.to_pixels(frame);
-        let clipped = clip.map_or(pixels, |clip| pixels.intersection(&clip));
-        let mut union = (!clipped.is_empty()).then_some(clipped);
+        // Empty CA containers contribute no source pixels themselves. Child
+        // contents may, independently, exceed this frame under CA gravity.
+        let (has_background, contents) = read_node(layer, |node| {
+            node.map_or((false, 0), |node| {
+                (node.background.is_some_and(|c| c[3] > 0.0), node.contents)
+            })
+        });
+        let own = if shown.opacity <= 0.0
+            || (!selected.is_empty() && !selected.contains(&(layer as usize)))
+        {
+            None
+        } else {
+            let mut own = has_background.then_some(pixels);
+            if contents != 0 {
+                let scale = crate::layer::contents_scale_of(layer);
+                let source = if let Some(source) = iosurface::pixels(contents as CFTypeRef) {
+                    Some((source.width, source.height))
+                } else {
+                    with_contents(layer, |source| (source.width, source.height))
+                };
+                let coverage = source
+                    .and_then(|(w, h)| {
+                        source_area(place(
+                            shown.gravity,
+                            pixels,
+                            w as f64 / scale * mapping.scale_x,
+                            h as f64 / scale * mapping.scale_y,
+                        ))
+                    })
+                    .or(Some(pixels));
+                if let Some(coverage) = coverage {
+                    own = Some(own.map_or(coverage, |area| area.union(&coverage)));
+                }
+            }
+            own.map(|area| clip.map_or(area, |clip| area.intersection(&clip)))
+                .filter(|area| !area.is_empty())
+        };
+        let mut union = own;
         let child_clip = if shown.masks_to_bounds {
             Some(clip.map_or(pixels, |clip| clip.intersection(&pixels)))
         } else {
@@ -2755,6 +2925,7 @@ pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
                 inner,
                 child_clip,
                 excluded,
+                selected,
                 now,
                 depth + 1,
             ) {
@@ -2765,14 +2936,29 @@ pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
     }
     let mut union: Option<Rect> = None;
     for child in presented.sublayers {
-        if let Some(part) = extent(child as Id, &mapping, origin, root_clip, &excluded, now, 0) {
+        if let Some(part) = extent(
+            child as Id,
+            &mapping,
+            origin,
+            root_clip,
+            &excluded,
+            selected,
+            now,
+            0,
+        ) {
             union = Some(union.map_or(part, |old| old.union(&part)));
         }
     }
     union
 }
 
-pub(crate) fn render_metal_sublayers(view: Id, store: &mut Store, rect: Rect, clip: Rect) -> bool {
+pub(crate) fn render_metal_sublayers_selected(
+    view: Id,
+    store: &mut Store,
+    rect: Rect,
+    clip: Rect,
+    selected: &[usize],
+) -> bool {
     let root = crate::view::layer_of(view);
     if root.is_null() || !crate::layer::is_metal(root) {
         return false;
@@ -2810,6 +2996,7 @@ pub(crate) fn render_metal_sublayers(view: Id, store: &mut Store, rect: Rect, cl
             now,
             0,
             &excluded,
+            selected,
         );
     }
     animating
@@ -4031,6 +4218,176 @@ mod tests {
         assert!(!surface_contents_changed(view, whole, whole));
         assert_eq!(layer_image(child), [2; 8]);
         unsafe { corefoundation::api::CFRelease(surface) };
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn metal_ca_iosurface_in_place_publication_invalidates_cached_pixels() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let pool = objc::arc::pool_push();
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 64., 48.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let view = |width, height| {
+            let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            send::<NSRect, Id>(object, "initWithFrame:", rect(0., 0., width, height))
+        };
+        let content = view(64., 48.);
+        let metal_view = view(64., 48.);
+        let class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ordinary = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal: Id = send(class, "layer", ());
+        let child: Id = send(ordinary, "layer", ());
+        send::<Id, ()>(window, "setContentView:", content);
+        send::<Id, ()>(metal_view, "setLayer:", metal);
+        send::<Id, ()>(content, "addSubview:", metal_view);
+        send::<NSRect, ()>(child, "setFrame:", rect(6., 7., 2., 1.));
+        send::<Id, ()>(metal, "addSublayer:", child);
+        let surface = surface();
+        publish(surface, [4, 8, 12, 255, 4, 8, 12, 255]);
+        replace_contents(child, surface as Id);
+        crate::view::flush_metal_scenes();
+        let initial = crate::view::metal_scene(sdl).unwrap();
+        let native = initial
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        let pixels = std::sync::Arc::clone(native.native_pixels.as_ref().unwrap());
+        let revision = native.native_revision;
+        assert_eq!(&pixels[..4], &[4, 8, 12, 255]);
+        // The exact same IOSurface object and CALayer contents pointer are kept.
+        publish(surface, [14, 28, 42, 255, 14, 28, 42, 255]);
+        crate::view::flush_metal_scenes();
+        let updated = crate::view::metal_scene(sdl).unwrap();
+        let next = updated
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert_ne!(next.native_revision, revision);
+        assert_eq!(
+            &next.native_pixels.as_ref().unwrap()[..4],
+            &[14, 28, 42, 255]
+        );
+        assert_eq!(&pixels[..4], &[4, 8, 12, 255]);
+        crate::view::flush_metal_scenes();
+        let stable = crate::view::metal_scene(sdl).unwrap();
+        assert_eq!(
+            stable
+                .iter()
+                .find(|i| i.native_pixels.is_some())
+                .unwrap()
+                .native_revision,
+            next.native_revision
+        );
+        unsafe { corefoundation::api::CFRelease(surface) };
+        objc::arc::release(window);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn metal_extent_includes_gravity_overhang_from_offscreen_layer() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(view, "initWithFrame:", rect(0., 0., 8., 8.));
+        let metal = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ordinary = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let root: Id = send(metal, "layer", ());
+        let child: Id = send(ordinary, "layer", ());
+        send::<Id, ()>(view, "setLayer:", root);
+        send::<NSRect, ()>(child, "setFrame:", rect(8., 1., 1., 1.));
+        send::<Id, ()>(root, "addSublayer:", child);
+        let surface = surface();
+        publish(surface, [255; 8]);
+        replace_contents(child, surface as Id);
+        set_gravity(child, Gravity::Right);
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let extent = metal_sublayers_extent(view, frame).unwrap();
+        assert_eq!(
+            extent,
+            Rect {
+                x: 7,
+                y: 6,
+                width: 2,
+                height: 1
+            }
+        );
+        let cropped = crate::backing::metal_sublayers_pixels_cropped(
+            view,
+            8,
+            8,
+            Rect {
+                x: 7,
+                y: 6,
+                width: 1,
+                height: 1,
+            },
+        )
+        .expect("overhanging foreground missing");
+        assert_ne!(&cropped.0[..4], &[0u8; 4]);
+        set_gravity(child, Gravity::Resize);
+        assert_eq!(
+            metal_sublayers_extent(view, frame).unwrap(),
+            Rect {
+                x: 8,
+                y: 6,
+                width: 1,
+                height: 1
+            }
+        );
+        unsafe { corefoundation::api::CFRelease(surface) };
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn empty_ca_container_does_not_expand_metal_raster_extent() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(view, "initWithFrame:", rect(0., 0., 1600., 1200.));
+        let metal = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ordinary = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let root: Id = send(metal, "layer", ());
+        let container: Id = send(ordinary, "layer", ());
+        let child: Id = send(ordinary, "layer", ());
+        send::<Id, ()>(view, "setLayer:", root);
+        send::<NSRect, ()>(container, "setFrame:", rect(0., 0., 1600., 1200.));
+        send::<NSRect, ()>(child, "setFrame:", rect(10., 20., 4., 3.));
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        send::<CFTypeRef, ()>(child, "setBackgroundColor:", red);
+        send::<Id, ()>(root, "addSublayer:", container);
+        send::<Id, ()>(container, "addSublayer:", child);
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 1200,
+        };
+        let full = metal_sublayers_extent(view, frame).unwrap();
+        assert_eq!(
+            full,
+            Rect {
+                x: 10,
+                y: 1177,
+                width: 4,
+                height: 3
+            }
+        );
+        send::<NSRect, ()>(container, "setFrame:", rect(0., 0., 15., 30.));
+        let tight = metal_sublayers_extent(view, frame).unwrap();
+        assert_eq!((tight.width, tight.height), (4, 3));
         objc::arc::pool_pop(pool);
     }
 

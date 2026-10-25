@@ -294,7 +294,7 @@ struct NativeCapture {
     revision: u64,
     damage: Option<NativeCpuDamage>,
 }
-type CaptureKey = (usize, i64, i64, u32, u32, bool);
+type CaptureKey = (usize, i64, i64, u32, u32, bool, u64);
 const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1131,7 +1131,7 @@ pub(crate) fn forget(view: Id) {
     NATIVE_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|(owner, _, _, _, _, _), _| *owner != key);
+        .retain(|(owner, _, _, _, _, _, _), _| *owner != key);
     crate::view::forget_native_tile_ids(view);
     NEEDS_DISPLAY
         .lock()
@@ -1733,6 +1733,7 @@ pub(crate) fn native_scene_pixels_cropped_with_damage(
         crop.width as u32,
         crop.height as u32,
         false,
+        0,
     );
     let damage = NATIVE_CAPTURES
         .lock()
@@ -1751,16 +1752,27 @@ pub fn native_scene_pixels_cropped(
     height: u32,
     crop: Rect,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    native_scene_pixels_impl(view, width, height, crop, false)
+    native_scene_pixels_impl(view, width, height, crop, false, &[])
 }
 
+#[cfg(test)]
 pub(crate) fn metal_sublayers_pixels_cropped(
     view: Id,
     width: u32,
     height: u32,
     crop: Rect,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    native_scene_pixels_impl(view, width, height, crop, true)
+    native_scene_pixels_impl(view, width, height, crop, true, &[])
+}
+
+pub(crate) fn metal_sublayers_segment_pixels_cropped(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+    selected: &[usize],
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_impl(view, width, height, crop, true, selected)
 }
 
 fn native_scene_pixels_impl(
@@ -1769,6 +1781,7 @@ fn native_scene_pixels_impl(
     height: u32,
     crop: Rect,
     metal_children: bool,
+    selected: &[usize],
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
     if (!metal_children
         && (crop.x < 0
@@ -1780,6 +1793,14 @@ fn native_scene_pixels_impl(
     {
         return None;
     }
+    use std::hash::{Hash, Hasher};
+    let selection_hash = if metal_children {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        selected.hash(&mut hash);
+        hash.finish()
+    } else {
+        0
+    };
     let key = (
         view as usize,
         crop.x,
@@ -1787,6 +1808,7 @@ fn native_scene_pixels_impl(
         crop.width as u32,
         crop.height as u32,
         metal_children,
+        selection_hash,
     );
     let layer = crate::view::layer_of(view);
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
@@ -1961,7 +1983,13 @@ fn native_scene_pixels_impl(
             );
         }
         if metal_children {
-            crate::coreanimation::render_metal_sublayers(view, &mut output, logical, whole);
+            crate::coreanimation::render_metal_sublayers_selected(
+                view,
+                &mut output,
+                logical,
+                whole,
+                selected,
+            );
         } else {
             render_with_root_opacity(
                 view,
@@ -1987,7 +2015,6 @@ fn native_scene_pixels_impl(
             .remove(&key);
         return None;
     }
-    use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     output.pixels.hash(&mut hasher);
     let revision = hasher.finish();

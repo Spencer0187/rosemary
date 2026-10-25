@@ -14539,6 +14539,180 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         [255, 0, 0, 255],
         "CALayer-only foreground was not composited above Metal"
     );
+    // Interleave an NSView-backed blue CALayer between two ordinary CA
+    // descendants. All three overlap over a static Metal drawable.
+    let blue_view = make_view();
+    let b = make_layer("CALayer");
+    let c = make_layer("CALayer");
+    let blue = unsafe { appkit::cgcontext::CGColorCreateGenericRGB(0., 0., 1., 1.) };
+    let green = unsafe { appkit::cgcontext::CGColorCreateGenericRGB(0., 1., 0., 1.) };
+    unsafe {
+        set(blue_view, objc::sel::get("setLayer:"), b);
+        set(metal_view, objc::sel::get("addSubview:"), blue_view);
+        set_frame(b, objc::sel::get("setFrame:"), rect(0., 0., 120., 90.));
+        set_frame(c, objc::sel::get("setFrame:"), rect(64., 40., 24., 20.));
+        set(b, objc::sel::get("setBackgroundColor:"), blue as Id);
+        set(c, objc::sel::get("setBackgroundColor:"), green as Id);
+        set(metal_layer, objc::sel::get("addSublayer:"), b);
+        set(metal_layer, objc::sel::get("addSublayer:"), c);
+    }
+    let repaint = |state: &mut Swapchain| {
+        appkit::event::pump(std::ptr::null_mut());
+        let current = make_scene(appkit::view::metal_scene(sdl).unwrap());
+        for native in current.iter().filter(|p| p.native.is_some()) {
+            assert_eq!(stage_native_scene_source(state, native), Ok(true));
+        }
+        state.synchronize_scene(sdl as usize, &current);
+        assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+        state.idle();
+    };
+    repaint(&mut state);
+    let sample = |state: &Swapchain| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            120,
+            90,
+            new_point.0,
+            new_point.1,
+        )
+    };
+    assert_eq!(
+        sample(&state),
+        [0, 255, 0, 255],
+        "ordinary CALayer above NSView-backed layer was not topmost"
+    );
+    let insert: unsafe extern "C" fn(Id, objc::sel::Sel, Id, u32) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        insert(metal_layer, objc::sel::get("insertSublayer:atIndex:"), c, 0);
+    }
+    repaint(&mut state);
+    assert_eq!(
+        sample(&state),
+        [0, 0, 255, 255],
+        "view-backed layer must paint after coalesced ordinary CA segment"
+    );
+    let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        hidden(b, objc::sel::get("setHidden:"), 1);
+    }
+    repaint(&mut state);
+    assert_eq!(
+        sample(&state),
+        [255, 0, 0, 255],
+        "hiding the view-backed layer must reveal ordinary CA pixels"
+    );
+    let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        remove(child, objc::sel::get("removeFromSuperlayer"));
+    }
+    repaint(&mut state);
+    assert_eq!(
+        sample(&state),
+        [0, 255, 0, 255],
+        "removed foreground source remained in the Vulkan scene"
+    );
+    // A producer can update the pixels of a child IOSurface in place, without
+    // setContents: or another drawable. The AppKit poll must invalidate the
+    // native source and the real Vulkan compositor must show the new texels.
+    unsafe {
+        remove(c, objc::sel::get("removeFromSuperlayer"));
+    }
+    let surface_child = make_layer("CALayer");
+    let number = |value: i64| {
+        corefoundation::collections::new_number(corefoundation::collections::Number::Integer(value))
+    };
+    let key = |name: &str| {
+        corefoundation::base::interned_name(name) as usize as corefoundation::base::CFTypeRef
+    };
+    let properties = corefoundation::collections::new_dictionary(
+        &[
+            (key("IOSurfaceWidth"), number(2)),
+            (key("IOSurfaceHeight"), number(1)),
+            (key("IOSurfaceBytesPerElement"), number(4)),
+            (
+                key("IOSurfacePixelFormat"),
+                number(i64::from(iosurface::PIXEL_FORMAT_BGRA)),
+            ),
+        ],
+        corefoundation::callbacks::Policy::from_key_callbacks(),
+        corefoundation::callbacks::Policy::from_type_callbacks(),
+        false,
+    );
+    let iosurface = unsafe { iosurface::IOSurfaceCreate(properties) };
+    assert!(!iosurface.is_null());
+    let publish_surface = |pixels: [u8; 8]| unsafe {
+        assert_eq!(
+            iosurface::IOSurfaceLock(iosurface, 0, std::ptr::null_mut()),
+            0
+        );
+        std::ptr::copy_nonoverlapping(
+            pixels.as_ptr(),
+            iosurface::IOSurfaceGetBaseAddress(iosurface) as *mut u8,
+            8,
+        );
+        assert_eq!(
+            iosurface::IOSurfaceUnlock(iosurface, 0, std::ptr::null_mut()),
+            0
+        );
+    };
+    publish_surface([255, 0, 0, 255, 255, 0, 0, 255]);
+    unsafe {
+        set_frame(
+            surface_child,
+            objc::sel::get("setFrame:"),
+            rect(64., 40., 2., 1.),
+        );
+        set(
+            surface_child,
+            objc::sel::get("setContents:"),
+            iosurface as Id,
+        );
+        set(metal_layer, objc::sel::get("addSublayer:"), surface_child);
+    }
+    repaint(&mut state);
+    let published = appkit::view::metal_scene(sdl).unwrap();
+    let image = published
+        .iter()
+        .find(|s| s.native_pixels.is_some())
+        .unwrap();
+    let surface_point = (image.frame.x as u32, image.frame.y as u32);
+    let revision = image.native_revision;
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            120,
+            90,
+            surface_point.0,
+            surface_point.1
+        ),
+        [0, 0, 255, 255]
+    );
+    publish_surface([0, 0, 255, 255, 0, 0, 255, 255]);
+    repaint(&mut state);
+    let republished = appkit::view::metal_scene(sdl).unwrap();
+    let image2 = republished
+        .iter()
+        .find(|s| s.native_pixels.is_some())
+        .unwrap();
+    assert_ne!(image2.native_revision, revision);
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            120,
+            90,
+            surface_point.0,
+            surface_point.1
+        ),
+        [255, 0, 0, 255],
+        "in-place IOSurface publication under a static CAMetalLayer remained stale"
+    );
+    unsafe { corefoundation::api::CFRelease(iosurface) };
     drop(state);
     gpu.destroy_image(source);
     objc::arc::release(window);
