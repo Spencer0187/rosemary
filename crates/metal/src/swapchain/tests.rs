@@ -5045,6 +5045,8 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         let cadence_start = std::time::Instant::now();
         let mut missed_deadlines = 0usize;
         let mut stage_times = Vec::with_capacity(repetitions);
+        let mut cpu_rebuild_times = Vec::with_capacity(repetitions);
+        let mut native_source_times = Vec::with_capacity(repetitions);
         let mut complete_times = Vec::with_capacity(repetitions);
         for n in 0..repetitions {
             if let Some(interval) = pace {
@@ -5060,7 +5062,10 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
             // Worker discards expendable scene snapshot spares before every
             // transaction; immutable CPU backing caches must survive.
             state.shed_scene_snapshot_spares();
+            let mut cpu_ms = 0.;
+            let mut native_ms = 0.;
             for tile in &mut scene[1..] {
+                let cpu_start = std::time::Instant::now();
                 let native = tile.native.as_mut().unwrap();
                 native.revision += 1;
                 if change_cpu {
@@ -5073,10 +5078,15 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
                     pixels[at] = (n as u8) ^ 1;
                     native.bytes = Arc::new(pixels);
                 }
+                cpu_ms += cpu_start.elapsed().as_secs_f64() * 1000.0;
+                let native_start = std::time::Instant::now();
                 assert_eq!(stage_native_scene_source(&mut state, tile), Ok(true));
+                native_ms += native_start.elapsed().as_secs_f64() * 1000.0;
             }
             let six_tiles_ms = animation_start.elapsed().as_secs_f64() * 1000.0;
             stage_times.push(six_tiles_ms);
+            cpu_rebuild_times.push(cpu_ms);
+            native_source_times.push(native_ms);
             state.synchronize_scene(window as usize, &scene);
             assert_eq!(state.redisplay_scene(window as usize), Ok(true));
             state.idle();
@@ -5101,11 +5111,17 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         stage_times.sort_by(f64::total_cmp);
         let p95 = stage_times[(stage_times.len() * 95 / 100).min(stage_times.len() - 1)];
         let avg = stage_times.iter().sum::<f64>() / stage_times.len() as f64;
+        cpu_rebuild_times.sort_by(f64::total_cmp);
+        native_source_times.sort_by(f64::total_cmp);
+        let cpu_mean = cpu_rebuild_times.iter().sum::<f64>() / repetitions as f64;
+        let native_mean = native_source_times.iter().sum::<f64>() / repetitions as f64;
+        let cpu_p95 = cpu_rebuild_times[(repetitions * 95 / 100).min(repetitions - 1)];
+        let native_p95 = native_source_times[(repetitions * 95 / 100).min(repetitions - 1)];
         complete_times.sort_by(f64::total_cmp);
         let end_to_end_p95 =
             complete_times[(complete_times.len() * 95 / 100).min(complete_times.len() - 1)];
         eprintln!(
-            "6K mixed real GPU mode={:?} revisions={} paced={} cpu_changed={} missed_deadlines={} staging_mean_ms={avg:.3} staging_p95_ms={p95:.3} staging_max_ms={:.3} stage_compose_wsi_p95_ms={end_to_end_p95:.3}",
+            "6K mixed real GPU mode={:?} revisions={} paced={} cpu_changed={} missed_deadlines={} staging_mean_ms={avg:.3} staging_p95_ms={p95:.3} staging_max_ms={:.3} stage_compose_wsi_p95_ms={end_to_end_p95:.3} cpu_source_mean_ms={cpu_mean:.3} cpu_source_p95_ms={cpu_p95:.3} native_stage_mean_ms={native_mean:.3} native_stage_p95_ms={native_p95:.3}",
             state.present_mode,
             repetitions,
             pace.is_some(),
