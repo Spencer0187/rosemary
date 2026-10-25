@@ -877,6 +877,14 @@ pub(crate) fn needs_display_in_tree(view: Id, depth: usize) {
 /// a store left behind would be handed to the next window made - at the size the
 /// old one was.
 pub fn forget_window(sdl: sdl3::Window) {
+    GPU_ADMISSION_DAMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
+    GPU_ADMITTED_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
     UNDERLAY_ANIMATING_WINDOWS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1044,6 +1052,27 @@ fn send(receiver: Id, name: &str) {
 
 /// Draw everything marked for display and present every window that changed.
 pub fn pump() {
+    for window in std::mem::take(
+        &mut *GPU_ADMISSION_DAMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    ) {
+        let sdl = window as sdl3::Window;
+        if crate::window::window_for(sdl).is_null() {
+            continue;
+        }
+        if let Some((width, height)) = sdl3::video::window_size_in_pixels(sdl) {
+            damage(
+                sdl,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: i64::from(width.max(0)),
+                    height: i64::from(height.max(0)),
+                },
+            );
+        }
+    }
     crate::decor::pump();
     crate::layout::prepare();
     for window in crate::window::all() {
@@ -1605,6 +1634,68 @@ pub fn native_scene_pixels_cropped(
     Some((pixels, revision))
 }
 
+/// The AppKit event thread only publishes proposed native sources. Metal
+/// acknowledges the exact original source revision after it has committed the
+/// corresponding GPU scene. A proposed image is never proof of admission.
+static GPU_ADMITTED_NATIVE: std::sync::LazyLock<Mutex<HashMap<usize, HashMap<usize, u64>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Worker-to-AppKit notification. SDL video queries and new CPU backing
+/// damage are performed by the owner pump, never under a Vulkan state lock.
+static GPU_ADMISSION_DAMAGE: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+pub fn set_native_gpu_admission(window: sdl3::Window, admitted: &[(usize, u64)]) {
+    if window.is_null() {
+        return;
+    }
+    let current: HashMap<usize, u64> = admitted.iter().copied().collect();
+    let mut registry = GPU_ADMITTED_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let same_membership = registry.get(&(window as usize)).is_none_or(|old| {
+        old.len() == current.len() && old.keys().all(|id| current.contains_key(id))
+    });
+    registry.insert(window as usize, current);
+    drop(registry);
+    if same_membership {
+        return;
+    }
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(window as usize));
+    // The owner thread will re-snapshot the now-admitted independent scene
+    // and recompute the backing source without changing the guest's store.
+    GPU_ADMISSION_DAMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(window as usize);
+    crate::view::invalidate_metal_scene_for_window(window);
+}
+
+fn admitted_native_in_published_scene(
+    sdl: sdl3::Window,
+    dma_only: bool,
+) -> std::collections::HashSet<usize> {
+    let admitted = GPU_ADMITTED_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let accepted = admitted.get(&(sdl as usize));
+    let live = crate::view::metal_scene(sdl).unwrap_or_default();
+    live.into_iter()
+        .filter(|layer| {
+            let has_pixels = layer.native_pixels.is_some() || layer.native_dmabuf.is_some();
+            let relevant = if dma_only {
+                layer.native_dmabuf.is_some()
+            } else {
+                has_pixels
+            };
+            relevant && accepted.is_some_and(|a| a.contains_key(&layer.layer))
+        })
+        .map(|layer| layer.layer)
+        .collect()
+}
+
 /// One immutable underlay per window, keyed only by content below the
 /// first Metal view. Changes to independently composited native foreground
 /// must not force a 4K CPU reconstruction or an unchanged GPU upload.
@@ -1760,12 +1851,7 @@ fn can_separate_native(sdl: sdl3::Window, placed: &[Placed], first: usize) -> bo
     // visible native view above the first Metal drawable. Oversized or not-
     // yet-ready native sources must remain visible, even if ordering cannot
     // be fully resolved during that transitional frame.
-    let captured: std::collections::HashSet<_> = crate::view::metal_scene(sdl)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|layer| layer.native_pixels.is_some() || layer.native_dmabuf.is_some())
-        .map(|layer| layer.layer)
-        .collect();
+    let captured = admitted_native_in_published_scene(sdl, false);
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     let mut any = false;
@@ -2520,12 +2606,7 @@ pub fn native_dma_above_metal(sdl: sdl3::Window) -> Vec<usize> {
     else {
         return Vec::new();
     };
-    let native: std::collections::HashSet<_> = crate::view::metal_scene(sdl)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|layer| layer.native_dmabuf.is_some())
-        .map(|layer| layer.layer)
-        .collect();
+    let native = admitted_native_in_published_scene(sdl, true);
     let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     placed[first + 1..]
         .iter()

@@ -2751,6 +2751,28 @@ mod drawable_pool_tests {
             appkit::event::pump(std::ptr::null_mut());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        // This fixture has no guest Metal drawable submission, so the
+        // test intentionally acknowledges the native scene as if GPU staging
+        // completed. The test checks CPU-underlay cache reuse, not admission.
+        let admitted = appkit::view::metal_scene(sdl)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.native_pixels.is_some() || p.native_dmabuf.is_some())
+            .map(|p| (p.layer, p.native_revision))
+            .collect::<Vec<_>>();
+        assert!(!admitted.is_empty());
+        appkit::backing::set_native_gpu_admission(sdl, &admitted);
+        for _ in 0..16 {
+            appkit::event::pump(std::ptr::null_mut());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Allow the first acknowledged foreground update to settle the
+        // initial underlay admission transition before the steady-state count.
+        set_overlay(1);
+        for _ in 0..16 {
+            appkit::event::pump(std::ptr::null_mut());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let initial = backing_upload_submissions_for_test();
         assert!(
             appkit::view::metal_scene(sdl)
@@ -2759,7 +2781,7 @@ mod drawable_pool_tests {
                 .any(|source| source.native_pixels.is_some()),
             "native overlay never entered the retained scene"
         );
-        for step in 1..20u8 {
+        for step in 2..20u8 {
             set_overlay(step);
             for _ in 0..3 {
                 appkit::event::pump(std::ptr::null_mut());

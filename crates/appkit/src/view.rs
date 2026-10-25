@@ -3028,6 +3028,18 @@ pub(crate) fn install() {
 mod tests {
     use super::*;
 
+    /// AppKit unit fixtures have no Vulkan worker. Model a completed GPU
+    /// commit explicitly; publication alone must not grant admission.
+    fn accept_published_native_for_tests(sdl: sdl3::Window) {
+        let admitted = metal_scene(sdl)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.native_pixels.is_some() || p.native_dmabuf.is_some())
+            .map(|p| (p.layer, p.native_revision))
+            .collect::<Vec<_>>();
+        crate::backing::set_native_gpu_admission(sdl, &admitted);
+    }
+
     fn view(frame: NSRect) -> Id {
         crate::bootstrap();
         let class = objc::class::lookup(c"NSView").expect("NSView");
@@ -3811,6 +3823,17 @@ mod tests {
             [0u8, 0, 128, 128].repeat(30 * 25),
         );
         flush_metal_scenes();
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240),)
+                .is_none(),
+            "publishing AppKit pixels before Vulkan admission must not exclude them"
+        );
+        accept_published_native_for_tests(sdl);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240),)
+                .is_some(),
+            "completed GPU scene admission must enable independent native stacking"
+        );
         let scene = metal_scene(sdl).expect("live AppKit Metal/native scene");
         assert_eq!(scene.len(), 2);
         assert_eq!(scene[0].layer, metal as usize);
@@ -4588,6 +4611,7 @@ mod tests {
             pixels,
         );
         flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
         let scene = metal_scene(sdl).unwrap();
         assert_eq!(scene.len(), 2, "oversize view disappeared beneath Metal");
         assert_eq!(scene[0].layer, metal as usize);
@@ -4787,6 +4811,11 @@ mod tests {
             );
         }
         flush_metal_scenes();
+        assert!(
+            crate::backing::native_dma_above_metal(sdl).is_empty(),
+            "unadmitted DMA source must remain in original backing overlay path"
+        );
+        accept_published_native_for_tests(sdl);
         let scene = metal_scene(sdl).unwrap();
         assert_eq!(
             scene
@@ -4911,6 +4940,7 @@ mod tests {
             [0, 255, 0, 255].repeat(48 * 32),
         );
         flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
         let flat = crate::backing::Store::new(160, 120);
         crate::coreanimation::set_underlay_animation_for_test(back_layer, None);
         let original = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
@@ -5021,6 +5051,9 @@ mod tests {
             transient.push(beneath);
         }
         flush_metal_scenes();
+        for &sdl in &sdls {
+            accept_published_native_for_tests(sdl);
+        }
         let flat = crate::backing::Store::new(160, 120);
         let first = crate::backing::gpu_under_metal_cached(sdls[0], &flat).unwrap();
         let second = crate::backing::gpu_under_metal_cached(sdls[1], &flat).unwrap();
@@ -5094,6 +5127,7 @@ mod tests {
             [0, 0, 255, 255].repeat(30 * 25),
         );
         flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
         let initial =
             crate::backing::gpu_under_metal_cached(sdl, &flat).expect("independent foreground");
         let count = crate::backing::gpu_underlay_render_count_for_tests();

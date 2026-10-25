@@ -1876,6 +1876,219 @@ static NATIVE_IMAGE_UPLOAD_ATTEMPTS: std::sync::atomic::AtomicUsize =
 static NATIVE_HARD_BUDGET_REFUSALS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// When the Vulkan importer refuses a *linear* DRM image, map its actual
+/// producer allocation under the kernel's DMA_BUF_SYNC read protocol. Only
+/// known 32-bit, premultiplied formats with one plane and unscaled extents
+/// qualify. Never replace an unreadable DMA-BUF with transparent pixels.
+#[cfg(target_os = "linux")]
+fn linear_dmabuf_cpu_fallback(layer: &ScenePlacement) -> Option<ScenePlacement> {
+    use std::os::fd::AsRawFd;
+    let native = layer.native.as_ref()?;
+    let picture = native.dmabuf.as_ref()?;
+    let frame = layer.frame;
+    if picture.modifier != 0
+        || picture.planes.len() != 1
+        || picture.width != frame.width
+        || picture.height != frame.height
+    {
+        return None;
+    }
+    let format = picture.fourcc;
+    let ar24 = format == u32::from_le_bytes(*b"AR24");
+    let xr24 = format == u32::from_le_bytes(*b"XR24");
+    let ab24 = format == u32::from_le_bytes(*b"AB24");
+    let xb24 = format == u32::from_le_bytes(*b"XB24");
+    if !(ar24 || xr24 || ab24 || xb24) {
+        return None;
+    }
+    let stride = u64::from(picture.planes[0].stride);
+    let source_bytes = u64::from(frame.width).checked_mul(4)?;
+    if stride < source_bytes {
+        return None;
+    }
+    let full_bytes = source_bytes.checked_mul(u64::from(frame.height))?;
+    if !native.bytes.is_empty() && native.bytes.len() as u64 != full_bytes {
+        return None;
+    }
+    // Restrict the transfer to the actual intersection of this view's frame,
+    // the window and an intermediate rectangular CA mask. No 6K CPU copy is
+    // created when the window only exposes a few hundred pixels.
+    let mut left = i64::from(frame.x).max(0);
+    let mut top = i64::from(frame.y).max(0);
+    let mut right =
+        (i64::from(frame.x) + i64::from(frame.width)).min(i64::from(frame.window_width));
+    let mut bottom =
+        (i64::from(frame.y) + i64::from(frame.height)).min(i64::from(frame.window_height));
+    if let Some(clip) = layer.clip {
+        left = left.max(i64::from(clip.x));
+        top = top.max(i64::from(clip.y));
+        right = right.min(i64::from(clip.x) + i64::from(clip.width));
+        bottom = bottom.min(i64::from(clip.y) + i64::from(clip.height));
+    }
+    if left >= right || top >= bottom {
+        return None;
+    }
+    let width = u32::try_from(right - left).ok()?;
+    let height = u32::try_from(bottom - top).ok()?;
+    if !appkit::backing::native_scene_extent_supported(width, height) {
+        return None;
+    }
+    let x = usize::try_from(left - i64::from(frame.x)).ok()?;
+    let y = usize::try_from(top - i64::from(frame.y)).ok()?;
+    let source_width = usize::try_from(frame.width).ok()?;
+    let width_usize = width as usize;
+    let height_usize = height as usize;
+    let fd = picture.planes[0].fd.as_raw_fd();
+    let offset = u64::from(picture.planes[0].offset);
+    let end = offset
+        .checked_add(stride.checked_mul(u64::try_from(y + height_usize - 1).ok()?)?)?
+        .checked_add(u64::try_from(x.checked_add(width_usize)?.checked_mul(4)?).ok()?)?;
+    let length = usize::try_from(end).ok()?;
+    if length == 0 || length > isize::MAX as usize {
+        return None;
+    }
+    // SAFETY: Fstat validates a descriptor only, not a guest memory pointer.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0
+        || stat.st_size <= 0
+        || u64::try_from(stat.st_size).ok()? < end
+    {
+        return None;
+    }
+    // Compute and bounds-check every row before acquiring a mapping or a
+    // producer read fence. No fallible indexing path may return without
+    // ending DMA_BUF_SYNC or unmapping the descriptor.
+    let offset_usize = usize::try_from(offset).ok()?;
+    let stride_usize = usize::try_from(stride).ok()?;
+    let first_row = y
+        .checked_mul(stride_usize)?
+        .checked_add(offset_usize)?
+        .checked_add(x.checked_mul(4)?)?;
+    let row_size = width_usize.checked_mul(4)?;
+    let output_size = row_size.checked_mul(height_usize)?;
+    let last_end = first_row
+        .checked_add((height_usize - 1).checked_mul(stride_usize)?)?
+        .checked_add(row_size)?;
+    if last_end > length {
+        return None;
+    }
+    // Map only the used rows, not the entire producer allocation from byte
+    // zero. A large offscreen NSView can expose a tiny far-offset viewport.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page <= 0 {
+        return None;
+    }
+    let page = usize::try_from(page).ok()?;
+    let map_start = first_row - first_row % page;
+    let map_size = last_end.checked_sub(map_start)?;
+    if map_size == 0 || map_size > 256 * 1024 * 1024 {
+        return None;
+    }
+    let map_offset = libc::off_t::try_from(map_start).ok()?;
+    let base_count = if native.bytes.is_empty() {
+        0
+    } else {
+        native.bytes.len()
+    };
+    if base_count != 0 {
+        let last_source = (y + height_usize - 1)
+            .checked_mul(source_width)?
+            .checked_add(x)?
+            .checked_add(width_usize)?
+            .checked_mul(4)?;
+        if last_source > base_count {
+            return None;
+        }
+    }
+    // SAFETY: one read-only shared mapping of the same live OwnedFd. The
+    // backing Dmabuf Arc pins the descriptor and fstat bounds every row.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            map_size,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            map_offset,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return None;
+    }
+    // Linux UAPI: DMA_BUF_IOCTL_SYNC = _IOW('b',0,struct dma_buf_sync).
+    const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x4008_6200;
+    let mut sync_start: u64 = 1; // DMA_BUF_SYNC_READ | DMA_BUF_SYNC_START.
+    let started = unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut sync_start) } == 0;
+    // The synthetic fixture uses a sealed memfd. In a real (non-test) build
+    // only DMA_BUF_IOCTL_SYNC-supported producer buffers qualify.
+    #[cfg(test)]
+    let synthetic_memfd = !started && unsafe { libc::fcntl(fd, libc::F_GET_SEALS) } >= 0;
+    #[cfg(not(test))]
+    let synthetic_memfd = false;
+    if !started && !synthetic_memfd {
+        unsafe { libc::munmap(mapping, map_size) };
+        return None;
+    }
+    let mut pixels = vec![0u8; output_size];
+    // SAFETY: prevalidated `first_row..last_end` is inside the mapping.
+    let bytes = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), map_size) };
+    for row in 0..height_usize {
+        let pos = first_row - map_start + row * stride_usize;
+        for col in 0..width_usize {
+            let base = pos + col * 4;
+            let src = &bytes[base..base + 4];
+            let (b, g, r) = if ar24 || xr24 {
+                (src[0], src[1], src[2])
+            } else {
+                (src[2], src[1], src[0])
+            };
+            let alpha = if xr24 || xb24 { 255u8 } else { src[3] };
+            let dst = (row * width_usize + col) * 4;
+            let result = &mut pixels[dst..dst + 4];
+            result.copy_from_slice(&[b, g, r, alpha]);
+            if !native.bytes.is_empty() && alpha < 255 {
+                let original = ((y + row) * source_width + x + col) * 4;
+                let beneath = &native.bytes[original..original + 4];
+                let keep = u32::from(255 - alpha);
+                for component in 0..4 {
+                    result[component] = (u32::from(result[component])
+                        + u32::from(beneath[component]) * keep / 255)
+                        .min(255) as u8;
+                }
+            }
+        }
+    }
+    let ended = if started {
+        let mut sync_end: u64 = 5; // DMA_BUF_SYNC_READ | DMA_BUF_SYNC_END.
+        (unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC, &mut sync_end) }) == 0
+    } else {
+        true
+    };
+    unsafe { libc::munmap(mapping, map_size) };
+    if !ended {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    native.revision.hash(&mut hash);
+    (left, top, width, height, 0x4c494e45u32).hash(&mut hash);
+    let mut replacement = layer.clone();
+    replacement.frame.x = left as i32;
+    replacement.frame.y = top as i32;
+    replacement.frame.width = width;
+    replacement.frame.height = height;
+    let replacement_source = replacement.native.as_mut().expect("present above");
+    replacement_source.bytes = Arc::new(pixels);
+    replacement_source.revision = hash.finish();
+    replacement_source.dmabuf = None;
+    Some(replacement)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linear_dmabuf_cpu_fallback(_layer: &ScenePlacement) -> Option<ScenePlacement> {
+    None
+}
+
 fn stage_native_scene_source(
     state: &mut Swapchain,
     layer: &ScenePlacement,
@@ -1886,8 +2099,12 @@ fn stage_native_scene_source(
     if native.dmabuf.is_some()
         && appkit::backing::dmabuf_import_refused(layer.frame.window as sdl3::Window)
     {
-        // Failure belongs to this window's importer capability, not a fence.
-        // Avoid all CPU/GPU allocation on future snapshots of the same source.
+        // A prior import refusal is permanent for this window, but a linear
+        // producer allocation may still be CPU-mappable. Use its *real* texels
+        // as an ordered source rather than dropping the foreground entirely.
+        if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
+            return stage_native_scene_source(state, &cpu);
+        }
         return Err("native-dmabuf-import-refused".into());
     }
     // A direct WSI source is not a retained scene image. Materialize it
@@ -2056,9 +2273,12 @@ fn stage_native_scene_source(
         }];
         if !crate::overlay::blend(gpu, &lease.image, &output.image, &overlay)?.is_empty() {
             appkit::backing::refuse_dmabufs(frame.window);
-            // Import refusal is permanent for this buffer/format, not a
-            // temporary fence shortage. The producer is now told to use CPU
-            // pixels. Do not schedule a 10-ms GPU reupload of this image.
+            // A producer-backed linear buffer can be mapped with DMA_BUF_SYNC.
+            // If it cannot, request a CPU representation; a transparent
+            // replacement is not an acceptable fallback for unknown pixels.
+            if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
+                return stage_native_scene_source(state, &cpu);
+            }
             return Err("native-dmabuf-import-refused".into());
         }
         Some(output)
@@ -2118,6 +2338,79 @@ fn preserve_refused_native_sources(
         }
     });
     live
+}
+
+/// Native CPU layers can have a much larger logical image than their visible
+/// intersection with a window. Preserve exact source texels and the absolute
+/// CA mask coordinates while retaining only the required GPU pixels. This
+/// prevents a pile of giant offscreen NSViews from exhausting the window's
+/// hard GPU budget despite each drawing only a small foreground rectangle.
+fn crop_native_to_window(mut placement: ScenePlacement) -> Option<ScenePlacement> {
+    let native = placement.native.as_ref()?;
+    if native.dmabuf.is_some() || native.bytes.is_empty() {
+        return Some(placement);
+    }
+    let full = placement.frame;
+    let stride = u64::from(full.width).checked_mul(4)?;
+    if stride.checked_mul(u64::from(full.height))? != native.bytes.len() as u64 {
+        return Some(placement); // Native validation produces the diagnostic.
+    }
+    let left = i64::from(full.x).max(0);
+    let top = i64::from(full.y).max(0);
+    let right = (i64::from(full.x) + i64::from(full.width)).min(i64::from(full.window_width));
+    let bottom = (i64::from(full.y) + i64::from(full.height)).min(i64::from(full.window_height));
+    let (left, top, right, bottom) = if let Some(mask) = placement.clip {
+        (
+            left.max(i64::from(mask.x)),
+            top.max(i64::from(mask.y)),
+            right.min(i64::from(mask.x) + i64::from(mask.width)),
+            bottom.min(i64::from(mask.y) + i64::from(mask.height)),
+        )
+    } else {
+        (left, top, right, bottom)
+    };
+    if left >= right || top >= bottom {
+        return None;
+    }
+    if left == i64::from(full.x)
+        && top == i64::from(full.y)
+        && right - left == i64::from(full.width)
+        && bottom - top == i64::from(full.height)
+    {
+        return Some(placement);
+    }
+    let width = usize::try_from(right - left).ok()?;
+    let height = usize::try_from(bottom - top).ok()?;
+    let source_width = usize::try_from(full.width).ok()?;
+    let x = usize::try_from(left - i64::from(full.x)).ok()?;
+    let y = usize::try_from(top - i64::from(full.y)).ok()?;
+    let line_bytes = width.checked_mul(4)?;
+    let output_bytes = line_bytes.checked_mul(height)?;
+    // Admission remains bounded by the same per-source CPU capture limit.
+    if !appkit::backing::native_scene_extent_supported(width as u32, height as u32) {
+        return Some(placement);
+    }
+    let mut cropped = Vec::with_capacity(output_bytes);
+    for row in y..y + height {
+        let start = row
+            .checked_mul(source_width)?
+            .checked_add(x)?
+            .checked_mul(4)?;
+        cropped.extend_from_slice(native.bytes.get(start..start + line_bytes)?);
+    }
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    native.revision.hash(&mut hash);
+    (left, top, width, height, full.width, full.height).hash(&mut hash);
+    let revision = hash.finish();
+    let native = placement.native.as_mut().expect("validated above");
+    native.bytes = Arc::new(cropped);
+    native.revision = revision;
+    placement.frame.x = left as i32;
+    placement.frame.y = top as i32;
+    placement.frame.width = width as u32;
+    placement.frame.height = height as u32;
+    Some(placement)
 }
 
 fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
@@ -2190,7 +2483,25 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 .take();
             let mut retry_delay = None;
             let mut device_lost = false;
+            let mut admitted_update: Option<Vec<(usize, u64)>> = None;
             if let Some(live) = snapshot {
+                // Remember the AppKit publication identity *before* clipping
+                // CPU sources or mapping a rejected linear DMA-BUF. The GPU
+                // snapshot's own revision may be a crop-derived cache key.
+                let published: HashMap<usize, u64> = live
+                    .iter()
+                    .filter_map(|p| p.native.as_ref().map(|n| (p.id, n.revision)))
+                    .collect();
+                let live: Vec<ScenePlacement> = live
+                    .into_iter()
+                    .filter_map(|placement| {
+                        if placement.native.is_none() {
+                            Some(placement)
+                        } else {
+                            crop_native_to_window(placement)
+                        }
+                    })
+                    .collect();
                 refused_revisions.retain(|id, _| live.iter().any(|p| p.id == *id));
                 let mut state = entry.state.lock().expect("window swapchain");
                 // Stage native sources before committing the proposed view
@@ -2199,8 +2510,11 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 // membership; only a complete import-ready snapshot may
                 // replace the last accepted scene. Scene metadata is applied
                 // in the subsequent synchronize_scene/redisplay_scene pass.
+                let previous_scene = state.scene_placements.clone();
                 let mut native_ready = true;
                 let mut refused = Vec::new();
+                let mut staged_ids = std::collections::HashSet::new();
+                let mut unrepresented = false;
                 for layer in live.iter().filter(|p| p.native.is_some()) {
                     let revision = layer.native.as_ref().expect("filtered").revision;
                     let committed = state.committed_scene_bytes();
@@ -2210,11 +2524,20 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         .get(&layer.id)
                         .is_some_and(|&(old, floor)| old == revision && committed >= floor)
                     {
+                        if !state
+                            .scene_layers
+                            .iter()
+                            .any(|old| old.id == layer.id && old.ready)
+                        {
+                            unrepresented = true;
+                        }
                         refused.push(layer.id);
                         continue;
                     }
                     match stage_native_scene_source(&mut state, layer) {
-                        Ok(true) => {}
+                        Ok(true) => {
+                            staged_ids.insert(layer.id);
+                        }
                         Ok(false) => {
                             native_ready = false;
                             break;
@@ -2245,10 +2568,16 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                     );
                                 }
                             }
+                            if !state
+                                .scene_layers
+                                .iter()
+                                .any(|old| old.id == layer.id && old.ready)
+                            {
+                                // Without an old GPU snapshot, omitting this
+                                // foreground would publish the wrong pixels.
+                                unrepresented = true;
+                            }
                             refused.push(layer.id);
-                            // Continue staging unaffected native sources. The
-                            // rejected one is restored from the last accepted
-                            // GPU snapshot, or omitted when none existed.
                             continue;
                         }
                         Err(reason) => {
@@ -2261,7 +2590,30 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     }
                 }
                 let effective = preserve_refused_native_sources(&state, live, &refused);
-                if !native_ready {
+                if unrepresented {
+                    // A new source with neither GPU admission nor readable
+                    // fallback cannot be composited. Do not commit a scene
+                    // in which it simply vanishes. Restore the last complete
+                    // scene (including retained Metal) and await the AppKit
+                    // producer's CPU-replacement publication. Unlike an
+                    // ordinary retry, this does not poll every 10 ms.
+                    state.synchronize_scene(window, &previous_scene);
+                    if state.scene_repaint_needed {
+                        match state.redisplay_scene(window) {
+                            Ok(true) => state.scene_repaint_needed = false,
+                            Ok(false) => {
+                                retry_delay = Some(Duration::from_millis(1));
+                            }
+                            Err(error) => {
+                                gpu::trace(format!(
+                                    "restoring last complete native scene: {error}"
+                                ));
+                                device_lost = error.contains("ERROR_DEVICE_LOST")
+                                    || entry.gpu.lost.load(Ordering::Acquire);
+                            }
+                        }
+                    }
+                } else if !native_ready {
                     if !device_lost {
                         requeue_scene(&entry.pending_scene, effective);
                         retry_delay = Some(Duration::from_millis(10));
@@ -2299,9 +2651,33 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             }
                         }
                     }
+                    if retry_delay.is_none() && !device_lost {
+                        let confirmed = effective
+                            .iter()
+                            .filter_map(|p| {
+                                let accepted = state
+                                    .scene_layers
+                                    .iter()
+                                    .any(|source| source.id == p.id && source.ready);
+                                if accepted
+                                    && (staged_ids.contains(&p.id) || refused.contains(&p.id))
+                                {
+                                    published.get(&p.id).map(|&revision| (p.id, revision))
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        admitted_update = Some(confirmed);
+                    }
                 }
             }
             drop(_presenting);
+            // Never acquire AppKit backing/scene locks while holding the
+            // Vulkan state or WSI presentation mutex.
+            if let Some(admitted) = admitted_update {
+                appkit::backing::set_native_gpu_admission(window as sdl3::Window, &admitted);
+            }
             if device_lost {
                 record_device_loss(entry.gpu);
                 return;

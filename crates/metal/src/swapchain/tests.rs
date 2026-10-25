@@ -4061,6 +4061,277 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
 /// unfinished WSI fence. Verify a later software replacement can still draw
 /// over the previously successful Metal layer after the failed import.
 #[test]
+#[cfg(target_os = "linux")]
+fn linear_dma_fallback_maps_only_far_visible_rows_and_keeps_texel_offsets() {
+    use std::os::fd::FromRawFd;
+    let fd = unsafe {
+        libc::memfd_create(
+            c"rosemary-linear-crop".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(fd >= 0);
+    let width = 1024usize;
+    let bytes = width * width * 4;
+    assert_eq!(unsafe { libc::ftruncate(fd, bytes as libc::off_t) }, 0);
+    let src = (512 * width + 512) * 4;
+    let red = [0u8, 0, 255, 255];
+    assert_eq!(
+        unsafe { libc::pwrite(fd, red.as_ptr().cast(), 4, src as libc::off_t) },
+        4
+    );
+    let second = (513 * width + 513) * 4;
+    let blue = [255u8, 0, 0, 255];
+    assert_eq!(
+        unsafe { libc::pwrite(fd, blue.as_ptr().cast(), 4, second as libc::off_t) },
+        4
+    );
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                fd,
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+            )
+        },
+        0
+    );
+    let scene = ScenePlacement {
+        id: (1usize << (usize::BITS - 1)) | 123,
+        frame: DirectFrame {
+            window: 1,
+            x: -512,
+            y: -512,
+            width: 1024,
+            height: 1024,
+            window_width: 32,
+            window_height: 32,
+        },
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: None,
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 1,
+            dmabuf: Some(Arc::new(appkit::backing::Dmabuf {
+                width: 1024,
+                height: 1024,
+                fourcc: u32::from_le_bytes(*b"AR24"),
+                modifier: 0,
+                planes: vec![appkit::backing::DmabufPlane {
+                    fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+                    offset: 0,
+                    stride: 4096,
+                }],
+            })),
+        }),
+    };
+    let mapped = linear_dmabuf_cpu_fallback(&scene).expect("bounded nonzero-map-offset source");
+    assert_eq!(
+        (
+            mapped.frame.x,
+            mapped.frame.y,
+            mapped.frame.width,
+            mapped.frame.height
+        ),
+        (0, 0, 32, 32)
+    );
+    let out = mapped.native.as_ref().unwrap();
+    assert_eq!(out.bytes.len(), 32 * 32 * 4);
+    assert_eq!(&out.bytes[..4], &red);
+    assert_eq!(&out.bytes[(32 + 1) * 4..(32 + 2) * 4], &blue);
+    assert!(out.dmabuf.is_none());
+    let mut unsupported = scene;
+    let clone = unsupported.native.as_mut().unwrap();
+    let original = clone.dmabuf.take().unwrap();
+    // An unsupported modifier is not secretly treated as linear.
+    clone.dmabuf = Some(Arc::new(appkit::backing::Dmabuf {
+        width: 1024,
+        height: 1024,
+        fourcc: u32::from_le_bytes(*b"AR24"),
+        modifier: 123,
+        planes: vec![],
+    }));
+    assert!(linear_dmabuf_cpu_fallback(&unsupported).is_none());
+    drop(original);
+}
+
+/// Vulkan import refuses the image, but the *actual* producer allocation is
+/// linear, CPU-mappable AR24. Import refusal must not erase a never-accepted
+/// foreground: copy and synchronize the producer pixels for CPU staging.
+#[test]
+#[cfg(target_os = "linux")]
+fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
+    if isolate_vulkan_graphical_test(
+        "rejected_linear_dma_without_prior_native_image_stays_in_final_pixels",
+    ) {
+        return;
+    }
+    use std::os::fd::FromRawFd;
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    // Synthetic linear-DMA file backing: sealed memfd supports the same
+    // stride/offset pixel contract but intentionally cannot be Vulkan DMA-BUF
+    // imported. Production real DMA buffers require DMA_BUF_IOCTL_SYNC.
+    let fd = unsafe {
+        libc::memfd_create(
+            c"rosemary-linear-dma-fallback".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
+    assert!(fd >= 0);
+    let width = 30u32;
+    let height = 25u32;
+    let stride = width * 4 + 16;
+    let mut image = vec![0u8; (stride * height) as usize];
+    for row in image.chunks_exact_mut(stride as usize) {
+        for texel in row.chunks_exact_mut(4).take(width as usize) {
+            texel.copy_from_slice(&[0, 0, 255, 255]);
+        }
+    }
+    assert_eq!(
+        unsafe { libc::ftruncate(fd, image.len() as libc::off_t) },
+        0
+    );
+    assert_eq!(
+        unsafe { libc::pwrite(fd, image.as_ptr().cast(), image.len(), 0) },
+        image.len() as isize
+    );
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                fd,
+                libc::F_ADD_SEALS,
+                libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE,
+            )
+        },
+        0
+    );
+    let picture = Arc::new(appkit::backing::Dmabuf {
+        width,
+        height,
+        fourcc: u32::from_le_bytes(*b"AR24"),
+        modifier: 0,
+        planes: vec![appkit::backing::DmabufPlane {
+            fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) },
+            offset: 0,
+            stride,
+        }],
+    });
+    let native_frame = appkit::view::Frame {
+        x: 40,
+        y: 35,
+        width,
+        height,
+        ..whole
+    };
+    let id = (1usize << (usize::BITS - 1)) | 0xa017usize;
+    let native = ScenePlacement {
+        id,
+        frame: DirectFrame::from_frame(&native_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 1,
+            dmabuf: Some(picture),
+        }),
+    };
+    let bottom = ScenePlacement {
+        id: 0xa018usize,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    state.layers.push(bottom.id);
+    state.synchronize_scene(window as usize, &[bottom.clone(), native.clone()]);
+    assert_eq!(
+        state.stage_composite_layer(
+            bottom.id,
+            &whole,
+            &metal,
+            None,
+            &mut SourceOwner(None),
+            false
+        ),
+        Ok(Some(true))
+    );
+    state.note_scene_frame(bottom.id, &whole);
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .all(|source| source.id != native.id)
+    );
+    // Force rejection with the same capability latch used by the real
+    // Vulkan importer's invalid-modifier/format/FD path.
+    appkit::backing::refuse_dmabufs(window);
+    let before = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(stage_native_scene_source(&mut state, &native), Ok(true));
+    assert!(NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed) > before);
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|source| source.id == native.id && source.ready)
+    );
+    state.synchronize_scene(window as usize, &[bottom, native]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let pixel = |x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(
+        pixel(48, 42),
+        [255, 0, 0, 255],
+        "unimportable DMA foreground disappeared"
+    );
+    assert_eq!(
+        pixel(10, 10),
+        [0, 255, 0, 255],
+        "fallback overwrote lower Metal outside clip"
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
 #[cfg(not(target_os = "macos"))]
 fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     if isolate_vulkan_graphical_test("refused_native_dma_buff_does_not_block_later_cpu_scene") {
@@ -4278,6 +4549,220 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     sdl3::video::destroy_window(window);
 }
 
+/// A newly published DMA foreground has neither a retained GPU layer nor
+/// readable producer pixels. Its rejection cannot commit a CA scene which
+/// drops it. Retain the previous complete Metal frame, avoid 10-ms retries,
+/// and admit an actual later CPU replacement without another Metal submit.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
+    if isolate_vulkan_graphical_test(
+        "unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement",
+    ) {
+        return;
+    }
+    let _guard = AwaitTestWindowRetirements;
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(c"DMA admission fallback WSI", 160, 120, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let metal = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 160,
+            height: 120,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    let whole = appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width: 160,
+        height: 120,
+        window_width: 160,
+        window_height: 120,
+    };
+    gpu.one_shot(|device, cb| unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            metal.image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue {
+                float32: [0.0, 1.0, 0.0, 1.0],
+            },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    })
+    .unwrap();
+    let metal_id = window as usize;
+    assert_eq!(present(gpu, metal_id, &whole, &metal, &[]), Ok(true));
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&metal_id)
+        .unwrap()
+        .clone();
+    let native_frame = appkit::view::Frame {
+        x: 24,
+        y: 20,
+        width: 32,
+        height: 24,
+        ..whole
+    };
+    let native_id = (1usize << (usize::BITS - 1)) | 0x809123usize;
+    let bottom = ScenePlacement {
+        id: metal_id,
+        frame: DirectFrame::from_frame(&whole),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    let unknown = ScenePlacement {
+        id: native_id,
+        frame: DirectFrame::from_frame(&native_frame),
+        opacity: 1.0,
+        opaque: false,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            revision: 11,
+            dmabuf: Some(Arc::new(appkit::backing::Dmabuf {
+                width: 32,
+                height: 24,
+                fourcc: 0,
+                modifier: u64::MAX,
+                planes: vec![],
+            })),
+        }),
+    };
+    // Stage a valid native source before an unreadable later DMA source.
+    // Rollback must undo its partial scene copy as well as scene metadata.
+    let earlier_id = (1usize << (usize::BITS - 1)) | 0x809124usize;
+    let earlier = ScenePlacement {
+        id: earlier_id,
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
+            revision: 10,
+            dmabuf: None,
+        }),
+        ..unknown.clone()
+    };
+    let prior_placements = entry.state.lock().unwrap().scene_placements.clone();
+    *entry.pending_scene.lock().unwrap() =
+        Some(vec![bottom.clone(), earlier.clone(), unknown.clone()]);
+    ensure_layer_compositor_worker(window as usize, &entry);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let pending = entry.pending_scene.lock().unwrap().is_none();
+        if pending {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker indefinitely retried DMA import refusal"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        entry.pending_scene.lock().unwrap().is_none(),
+        "a permanently unimportable DMA revision was requeued"
+    );
+    {
+        let state = entry.state.lock().unwrap();
+        assert_eq!(
+            state.scene_placements.len(),
+            prior_placements.len(),
+            "worker committed an incomplete replacement scene"
+        );
+        assert!(
+            state
+                .scene_placements
+                .iter()
+                .all(|entry| entry.id != native_id && entry.id != earlier_id)
+        );
+        let source = state
+            .composite
+            .as_ref()
+            .expect("previous Metal accumulator");
+        assert_eq!(
+            read_scene_pixel(gpu, source.image, whole.width, whole.height, 28, 24),
+            [0, 255, 0, 255],
+            "unreadable DMA failure corrupted last complete image"
+        );
+    }
+    assert_eq!(entry.present_failure.load(Ordering::Relaxed), 0);
+    let real = ScenePlacement {
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
+            revision: 12,
+            dmabuf: None,
+        }),
+        ..unknown
+    };
+    *entry.pending_scene.lock().unwrap() = Some(vec![bottom, earlier, real]);
+    wake_compositor_worker(&entry);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let state = entry.state.lock().unwrap();
+        let settled = entry.pending_scene.lock().unwrap().is_none();
+        let accepted = state
+            .scene_layers
+            .iter()
+            .any(|p| p.id == native_id && p.ready);
+        if settled && accepted && !state.composite_dirty {
+            let source = state.composite.as_ref().unwrap();
+            assert_eq!(
+                read_scene_pixel(gpu, source.image, whole.width, whole.height, 28, 24),
+                [255, 0, 0, 255],
+                "actual producer CPU replacement was not shown above Metal"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "producer CPU fallback did not resume compositing"
+        );
+        drop(state);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    forget_window(window);
+    drop(entry);
+    sdl3::video::destroy_window(window);
+    gpu.destroy_image(metal);
+}
+
 /// External backing pool reservations or fence-held leases are not a hard
 /// scene-size impossibility. Deferred native staging must avoid a wasted
 /// Vulkan upload and resume when unrelated GPU image ownership retires.
@@ -4352,15 +4837,14 @@ fn temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal() {
     sdl3::video::destroy_window(window);
 }
 
-/// Real Vulkan/WSI regression: six individually valid 4096² CPU native
-/// sources exceed the aggregate retained-scene budget in combination. The
-/// unstageable sixth revision must neither loop nor starve an existing Metal
-/// layer's scene-only repaint or subsequent WSI publication.
+/// Real Vulkan/WSI regression: six 4096² native CPU images overlap a
+/// 160×120 Metal window. Each retains only its exact visible crop, so no
+/// valid topmost source is dropped by the scene budget, and WSI can repaint.
 #[test]
 #[cfg(not(target_os = "macos"))]
-fn hard_cpu_native_budget_refusal_does_not_spin_or_starve_wsi_worker() {
+fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
     if isolate_vulkan_graphical_test(
-        "hard_cpu_native_budget_refusal_does_not_spin_or_starve_wsi_worker",
+        "large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress",
     ) {
         return;
     }
@@ -4478,23 +4962,33 @@ fn hard_cpu_native_budget_refusal_does_not_spin_or_starve_wsi_worker() {
             .iter()
             .filter(|layer| layer.native_revision.is_some())
             .count();
-        if refused > before_refused && settled && ready >= 4 && !state.composite_dirty {
+        if refused == before_refused && settled && ready == 6 && !state.composite_dirty {
             assert_eq!(entry.present_failure.load(Ordering::Relaxed), 0);
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "WSI worker stalled on a permanently refused CPU source: ready={ready}, refused={refused}, settled={settled}"
+            "WSI worker stalled with window-clipped native sources: ready={ready}, refused={refused}, settled={settled}"
         );
         drop(state);
         std::thread::sleep(Duration::from_millis(10));
     }
     let initial_frame = entry.state.lock().unwrap().frame;
+    let actual = {
+        let state = entry.state.lock().unwrap();
+        let composite = state.composite.as_ref().expect("composed WSI GPU target");
+        read_scene_pixel(gpu, composite.image, whole.width, whole.height, 40, 40)
+    };
+    assert_eq!(
+        actual,
+        [255, 0, 5, 255],
+        "cropped last native foreground must win over earlier sources"
+    );
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(
         NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed),
-        before_refused + 1,
-        "same permanently rejected CPU revision retried without a scene change"
+        before_refused,
+        "fully offscreen native texels should not trigger GPU budget refusal"
     );
     let uploaded = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
     assert!(uploaded > before_upload);
@@ -4530,7 +5024,7 @@ fn hard_cpu_native_budget_refusal_does_not_spin_or_starve_wsi_worker() {
     }
     assert_eq!(
         NATIVE_HARD_BUDGET_REFUSALS.load(Ordering::Relaxed),
-        before_refused + 1
+        before_refused
     );
     assert_eq!(
         NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed),
