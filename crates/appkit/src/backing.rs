@@ -1652,12 +1652,12 @@ pub fn set_native_gpu_admission(window: sdl3::Window, admitted: &[(usize, u64)])
     let mut registry = GPU_ADMITTED_NATIVE
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let same_membership = registry.get(&(window as usize)).is_none_or(|old| {
-        old.len() == current.len() && old.keys().all(|id| current.contains_key(id))
-    });
+    // Missing entry, revised content or changed membership all require a
+    // new underlay: AppKit may only subtract pixels confirmed on the GPU.
+    let unchanged = registry.get(&(window as usize)) == Some(&current);
     registry.insert(window as usize, current);
     drop(registry);
-    if same_membership {
+    if unchanged {
         return;
     }
     GPU_UNDERLAYS
@@ -1690,7 +1690,8 @@ fn admitted_native_in_published_scene(
             } else {
                 has_pixels
             };
-            relevant && accepted.is_some_and(|a| a.contains_key(&layer.layer))
+            relevant
+                && accepted.is_some_and(|a| a.get(&layer.layer) == Some(&layer.native_revision))
         })
         .map(|layer| layer.layer)
         .collect()

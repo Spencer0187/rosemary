@@ -2304,6 +2304,8 @@ fn stage_native_scene_source(
     state.frames[slot].backing = Some(blended.unwrap_or(lease));
     if let Some(scene) = state.scene_layers.iter_mut().find(|s| s.id == layer.id) {
         scene.native_revision = Some(native.revision);
+        // Staging is not a committed original AppKit publication.
+        scene.native_published_revision = None;
     }
     state.note_scene_frame(layer.id, &frame);
     Ok(true)
@@ -2413,6 +2415,38 @@ fn crop_native_to_window(mut placement: ScenePlacement) -> Option<ScenePlacement
     Some(placement)
 }
 
+/// A published revision is acknowledged only when its *own* staged image
+/// generation is retained and the whole scene transaction committed. Old GPU
+/// images remain valid to display but never acknowledge a refused successor.
+fn committed_native_gpu_revisions(
+    state: &Swapchain,
+    effective: &[ScenePlacement],
+    published: &HashMap<usize, u64>,
+    staged: &std::collections::HashSet<usize>,
+    refused: &[usize],
+) -> Vec<(usize, u64)> {
+    effective
+        .iter()
+        .filter_map(|placement| {
+            let native = placement.native.as_ref()?;
+            if refused.contains(&placement.id) || !staged.contains(&placement.id) {
+                return None;
+            }
+            let original = *published.get(&placement.id)?;
+            state
+                .scene_layers
+                .iter()
+                .any(|source| {
+                    source.id == placement.id
+                        && source.ready
+                        && source.native_revision == Some(native.revision)
+                        && source.native_published_revision == Some(original)
+                })
+                .then_some((placement.id, original))
+        })
+        .collect()
+}
+
 fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
     let mut prepare_failures = 0u32;
     let mut acquire_timeouts = 0u32;
@@ -2511,6 +2545,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 // replace the last accepted scene. Scene metadata is applied
                 // in the subsequent synchronize_scene/redisplay_scene pass.
                 let previous_scene = state.scene_placements.clone();
+                // Every native staging submission may replace both a retained
+                // snapshot and the actual GPU window accumulator. Keep the
+                // previously committed image leases alive through the whole
+                // batch; metadata-only rollback is not sufficient.
+                let previous_layers = state.scene_layers.clone();
+                let previous_order = state.layers.clone();
+                let previous_frames = state.scene_frames.clone();
                 let mut native_ready = true;
                 let mut refused = Vec::new();
                 let mut staged_ids = std::collections::HashSet::new();
@@ -2536,7 +2577,21 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     }
                     match stage_native_scene_source(&mut state, layer) {
                         Ok(true) => {
-                            staged_ids.insert(layer.id);
+                            let original = published.get(&layer.id).copied();
+                            let revision = layer.native.as_ref().map(|n| n.revision);
+                            if let Some(image) = state.scene_layers.iter_mut().find(|image| {
+                                image.id == layer.id
+                                    && image.ready
+                                    && image.native_revision == revision
+                            }) {
+                                // Bind the exact original publication to the
+                                // retained image, not simply to the layer ID.
+                                image.native_published_revision = original;
+                                staged_ids.insert(layer.id);
+                            } else {
+                                native_ready = false;
+                                break;
+                            }
                         }
                         Ok(false) => {
                             native_ready = false;
@@ -2597,7 +2652,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     // scene (including retained Metal) and await the AppKit
                     // producer's CPU-replacement publication. Unlike an
                     // ordinary retry, this does not poll every 10 ms.
-                    state.synchronize_scene(window, &previous_scene);
+                    state.scene_layers = previous_layers;
+                    state.layers = previous_order;
+                    state.scene_frames = previous_frames;
+                    state.scene_placements = previous_scene;
+                    // Stage submissions have already changed composite GPU
+                    // pixels. Force a full render of the pinned old sources.
+                    state.scene_repaint_needed = true;
                     if state.scene_repaint_needed {
                         match state.redisplay_scene(window) {
                             Ok(true) => state.scene_repaint_needed = false,
@@ -2614,6 +2675,11 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         }
                     }
                 } else if !native_ready {
+                    state.scene_layers = previous_layers;
+                    state.layers = previous_order;
+                    state.scene_frames = previous_frames;
+                    state.scene_placements = previous_scene;
+                    state.scene_repaint_needed = true;
                     if !device_lost {
                         requeue_scene(&entry.pending_scene, effective);
                         retry_delay = Some(Duration::from_millis(10));
@@ -2630,8 +2696,14 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 wake_compositor_worker(&entry);
                             }
                             Ok(false) => {
-                                // An unfinished staging fence cannot consume the
-                                // only notification for a visibility change.
+                                // The compositor could defer even after native
+                                // stage submissions altered the accumulator.
+                                // Restore pinned pre-batch image generations.
+                                state.scene_layers = previous_layers.clone();
+                                state.layers = previous_order.clone();
+                                state.scene_frames = previous_frames.clone();
+                                state.scene_placements = previous_scene.clone();
+                                state.scene_repaint_needed = true;
                                 requeue_scene(&entry.pending_scene, effective.clone());
                                 retry_delay = Some(Duration::from_millis(1));
                             }
@@ -2639,6 +2711,11 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                 gpu::trace(format!(
                                     "recomposing changed layer tree failed: {error}"
                                 ));
+                                state.scene_layers = previous_layers.clone();
+                                state.layers = previous_order.clone();
+                                state.scene_frames = previous_frames.clone();
+                                state.scene_placements = previous_scene.clone();
+                                state.scene_repaint_needed = true;
                                 device_lost = error.contains("ERROR_DEVICE_LOST")
                                     || entry.gpu.lost.load(Ordering::Acquire);
                                 if !device_lost {
@@ -2652,22 +2729,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         }
                     }
                     if retry_delay.is_none() && !device_lost {
-                        let confirmed = effective
-                            .iter()
-                            .filter_map(|p| {
-                                let accepted = state
-                                    .scene_layers
-                                    .iter()
-                                    .any(|source| source.id == p.id && source.ready);
-                                if accepted
-                                    && (staged_ids.contains(&p.id) || refused.contains(&p.id))
-                                {
-                                    published.get(&p.id).map(|&revision| (p.id, revision))
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>();
+                        let confirmed = committed_native_gpu_revisions(
+                            &state,
+                            &effective,
+                            &published,
+                            &staged_ids,
+                            &refused,
+                        );
                         admitted_update = Some(confirmed);
                     }
                 }

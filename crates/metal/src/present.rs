@@ -2641,8 +2641,8 @@ mod drawable_pool_tests {
 
     #[test]
     #[cfg(not(target_os = "macos"))]
-    fn foreground_only_native_animation_avoids_reuploading_unchanged_gpu_underlay() {
-        let name = "present::drawable_pool_tests::foreground_only_native_animation_avoids_reuploading_unchanged_gpu_underlay";
+    fn unadmitted_native_foreground_updates_keep_cpu_backing_active() {
+        let name = "present::drawable_pool_tests::unadmitted_native_foreground_updates_keep_cpu_backing_active";
         if crate::swapchain::isolate_vulkan_graphical_test(name) {
             return;
         }
@@ -2766,8 +2766,9 @@ mod drawable_pool_tests {
             appkit::event::pump(std::ptr::null_mut());
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        // Allow the first acknowledged foreground update to settle the
-        // initial underlay admission transition before the steady-state count.
+        // Subsequent view pixel revisions have NOT been acknowledged by a
+        // GPU scene worker in this test. The CPU fallback must remain active
+        // rather than hiding pixels using an obsolete accepted image.
         set_overlay(1);
         for _ in 0..16 {
             appkit::event::pump(std::ptr::null_mut());
@@ -2796,10 +2797,9 @@ mod drawable_pool_tests {
                 .is_some_and(|pixels| pixels.as_slice().starts_with(&[19, 0, 255, 255]))),
             "the native foreground did not actually advance to its final pixels"
         );
-        assert_eq!(
-            backing_upload_submissions_for_test(),
-            initial,
-            "native foreground updates caused extra Vulkan full-underlay uploads"
+        assert!(
+            backing_upload_submissions_for_test() > initial,
+            "unadmitted changed foreground was wrongly excluded from CPU fallback uploads"
         );
         appkit::backing::remove_overlay(foreground);
         objc::arc::release(window);

@@ -3842,6 +3842,44 @@ mod tests {
             (native as usize) | (1usize << (usize::BITS - 1))
         );
         assert_eq!(scene[1].native_pixels.as_ref().unwrap().len(), 30 * 25 * 4);
+        let original_revision = scene[1].native_revision;
+        let previous_underlay =
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240))
+                .expect("GPU first acknowledgment produced native separation");
+        // A new source with the *same* view address is only a proposal until
+        // Metal commits those new pixels. The previously accepted revision
+        // must not exclude current pixels beneath a translucent drawable.
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [1u8, 0, 128, 128].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        let proposed = metal_scene(sdl).unwrap();
+        assert_ne!(proposed[1].native_revision, original_revision);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240),)
+                .is_none(),
+            "published revision was subtracted without GPU admission"
+        );
+        accept_published_native_for_tests(sdl);
+        let accepted_underlay =
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(320, 240))
+                .expect("newly committed revision reenabled separation");
+        assert!(
+            !std::sync::Arc::ptr_eq(&previous_underlay, &accepted_underlay),
+            "revision-only acknowledgment failed to invalidate cached underlay"
+        );
+        // Restore the original test pixels after checking the transition.
+        crate::backing::set_native_view_pixels_for_tests(
+            native,
+            30,
+            25,
+            [0u8, 0, 128, 128].repeat(30 * 25),
+        );
+        flush_metal_scenes();
+        accept_published_native_for_tests(sdl);
         // Software-backed view overlays follow the same above-Metal order,
         // rather than being silently baked into the bottom CPU image.
         crate::backing::set_overlay(
@@ -5081,7 +5119,7 @@ mod tests {
     }
 
     #[test]
-    fn native_foreground_updates_reuse_cpu_underlay_until_lower_content_changes() {
+    fn native_foreground_revision_changes_require_gpu_acknowledgment() {
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -5131,7 +5169,7 @@ mod tests {
         let initial =
             crate::backing::gpu_under_metal_cached(sdl, &flat).expect("independent foreground");
         let count = crate::backing::gpu_underlay_render_count_for_tests();
-        for index in 0..48u8 {
+        for index in 1..49u8 {
             crate::backing::set_native_view_pixels_for_tests(
                 foreground,
                 30,
@@ -5141,13 +5179,18 @@ mod tests {
             flush_metal_scenes();
             // Every draw dirties the *flattened* fallback store.
             flat.pixels[0] = index;
+            assert!(
+                crate::backing::gpu_under_metal_cached(sdl, &flat).is_none(),
+                "unadmitted new view content excluded its own fallback pixels"
+            );
+            accept_published_native_for_tests(sdl);
             let after = crate::backing::gpu_under_metal_cached(sdl, &flat).unwrap();
             assert!(
-                std::sync::Arc::ptr_eq(&initial, &after),
-                "foreground-only redraw recomputed the underlay"
+                !std::sync::Arc::ptr_eq(&initial, &after),
+                "revised acceptance did not invalidate an obsolete underlay"
             );
         }
-        assert_eq!(crate::backing::gpu_underlay_render_count_for_tests(), count);
+        assert!(crate::backing::gpu_underlay_render_count_for_tests() >= count + 48);
         assert_eq!(&initial.pixels[0..4], &[237, 237, 237, 255]);
         crate::backing::set_native_view_pixels_for_tests(
             content,

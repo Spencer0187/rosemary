@@ -4665,18 +4665,89 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
             })),
         }),
     };
-    // Stage a valid native source before an unreadable later DMA source.
-    // Rollback must undo its partial scene copy as well as scene metadata.
+    // A has already been displayed at revision 9. Stage its revision 10
+    // replacement before an unreadable newly introduced B. The batch must
+    // restore the prior GPU allocation AND final framebuffer, not only order.
     let earlier_id = (1usize << (usize::BITS - 1)) | 0x809124usize;
-    let earlier = ScenePlacement {
+    let earlier_frame = appkit::view::Frame {
+        x: 75,
+        y: 50,
+        ..native_frame
+    };
+    let previously_accepted_a = ScenePlacement {
         id: earlier_id,
+        frame: DirectFrame::from_frame(&earlier_frame),
+        native: Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
+            revision: 9,
+            dmabuf: None,
+        }),
+        ..unknown.clone()
+    };
+    let previous_gpu_a = {
+        let mut state = entry.state.lock().unwrap();
+        assert_eq!(
+            stage_native_scene_source(&mut state, &previously_accepted_a),
+            Ok(true)
+        );
+        state.synchronize_scene(
+            window as usize,
+            &[bottom.clone(), previously_accepted_a.clone()],
+        );
+        assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+        state.idle();
+        let image = state
+            .scene_layers
+            .iter_mut()
+            .find(|p| p.id == earlier_id)
+            .unwrap();
+        assert_eq!(image.native_revision, Some(9));
+        image.native_published_revision = Some(9);
+        let original_snapshot = Arc::clone(&image.snapshot);
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                whole.width,
+                whole.height,
+                80,
+                55
+            ),
+            [255, 0, 0, 255]
+        );
+        original_snapshot
+    };
+    let earlier = ScenePlacement {
         native: Some(scene::NativeCpuSceneSource {
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
             revision: 10,
             dmabuf: None,
         }),
-        ..unknown.clone()
+        ..previously_accepted_a.clone()
     };
+    // A refused replacement of A itself can never acknowledge revision 10
+    // using A's existing ready revision 9 GPU image.
+    {
+        let state = entry.state.lock().unwrap();
+        let publication = HashMap::from([(earlier_id, 10u64)]);
+        let staged = std::collections::HashSet::from([earlier_id]);
+        let previous = vec![previously_accepted_a.clone()];
+        assert!(
+            committed_native_gpu_revisions(&state, &previous, &publication, &staged, &[earlier_id])
+                .is_empty(),
+            "refused revision 10 must not claim previously accepted revision 9"
+        );
+        assert!(
+            committed_native_gpu_revisions(&state, &previous, &publication, &staged, &[])
+                .is_empty(),
+            "old GPU image cannot acknowledge a different AppKit publication"
+        );
+        let original = HashMap::from([(earlier_id, 9u64)]);
+        assert_eq!(
+            committed_native_gpu_revisions(&state, &previous, &original, &staged, &[]),
+            vec![(earlier_id, 9)]
+        );
+    }
     let prior_placements = entry.state.lock().unwrap().scene_placements.clone();
     *entry.pending_scene.lock().unwrap() =
         Some(vec![bottom.clone(), earlier.clone(), unknown.clone()]);
@@ -4710,7 +4781,38 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
             state
                 .scene_placements
                 .iter()
-                .all(|entry| entry.id != native_id && entry.id != earlier_id)
+                .all(|placement| placement.id != native_id)
+        );
+        let accepted_a = state
+            .scene_layers
+            .iter()
+            .find(|layer| layer.id == earlier_id)
+            .unwrap();
+        assert_eq!(
+            accepted_a.native_published_revision,
+            Some(9),
+            "failed transaction advanced the original AppKit publication"
+        );
+        assert_eq!(
+            accepted_a.native_revision,
+            Some(9),
+            "restored placements still point at changed GPU native revision"
+        );
+        assert!(
+            Arc::ptr_eq(&accepted_a.snapshot, &previous_gpu_a),
+            "failed transaction did not retain pre-batch GPU image lease"
+        );
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                whole.width,
+                whole.height,
+                80,
+                55
+            ),
+            [255, 0, 0, 255],
+            "failed B import left new A pixels in supposedly restored composite"
         );
         let source = state
             .composite
@@ -4747,6 +4849,11 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
                 read_scene_pixel(gpu, source.image, whole.width, whole.height, 28, 24),
                 [255, 0, 0, 255],
                 "actual producer CPU replacement was not shown above Metal"
+            );
+            assert_eq!(
+                read_scene_pixel(gpu, source.image, whole.width, whole.height, 80, 55),
+                [0, 0, 255, 255],
+                "successful later batch did not commit revised A pixels"
             );
             break;
         }

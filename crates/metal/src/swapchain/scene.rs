@@ -17,6 +17,9 @@ pub(super) struct SceneLayer {
     rounded: Vec<RoundedClip>,
     regions: Option<Vec<Region>>,
     pub(super) native_revision: Option<u64>,
+    /// Original AppKit publication revision for the *retained GPU image*.
+    /// The GPU revision may instead hash clipping or DMA mapping details.
+    pub(super) native_published_revision: Option<u64>,
     pub(super) ready: bool,
 }
 
@@ -898,6 +901,7 @@ impl Swapchain {
                 rounded: self.scene_rounded(old).to_vec(),
                 regions: None,
                 native_revision: None,
+                native_published_revision: None,
                 ready: false,
             });
         }
@@ -944,6 +948,7 @@ impl Swapchain {
                 rounded,
                 regions: regions.map(|r| r.to_vec()),
                 native_revision: None,
+                native_published_revision: None,
                 ready: false,
             });
         }
@@ -1370,6 +1375,7 @@ impl Swapchain {
             rounded: self.scene_rounded(id).to_vec(),
             regions: None,
             native_revision: None,
+            native_published_revision: None,
             ready: true,
         });
         Ok(())
