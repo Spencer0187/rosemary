@@ -2177,10 +2177,9 @@ fn fill(store: &mut Store, rect: Rect, color: [f64; 4], opacity: f64) {
 
 /// [`fill`] `shape` with its corners rounded to `radius` pixels, within `clip`.
 fn rounded_coverage(shape: Rect, radius: f64, x: i64, y: i64) -> f64 {
-    let radius = radius
-        .max(0.0)
-        .min(shape.width as f64 / 2.0)
-        .min(shape.height as f64 / 2.0);
+    // Native Core Animation honors cornerRadius beyond half the layer size.
+    // Its edge raster uses a wider coverage transition than a single pixel.
+    let radius = radius.max(0.0);
     if radius < 0.5 {
         return 1.0;
     }
@@ -2190,9 +2189,14 @@ fn rounded_coverage(shape: Rect, radius: f64, x: i64, y: i64) -> f64 {
     let top = shape.y as f64;
     let right = left + shape.width as f64;
     let bottom = top + shape.height as f64;
+    // The straight top/bottom edge already covers the central pixel strip.
+    if radius <= shape.width as f64 / 2.0 && cx >= left + radius - 1.0 && cx <= right - radius + 1.0
+    {
+        return 1.0;
+    }
     let dx = (left + radius - cx).max(cx - (right - radius)).max(0.0);
     let dy = (top + radius - cy).max(cy - (bottom - radius)).max(0.0);
-    (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0)
+    (0.5 + (radius - (dx * dx + dy * dy).sqrt()) / std::f64::consts::SQRT_2).clamp(0.0, 1.0)
 }
 
 fn fill_rounded(
@@ -2203,9 +2207,7 @@ fn fill_rounded(
     opacity: f64,
     radius: f64,
 ) {
-    let radius = radius
-        .min(shape.width as f64 / 2.0)
-        .min(shape.height as f64 / 2.0);
+    let radius = radius.max(0.0);
     if radius < 0.5 {
         fill(store, shape.intersection(&clip), color, opacity);
         return;
@@ -2220,8 +2222,8 @@ fn fill_rounded(
     if area.is_empty() {
         return;
     }
-    let (left, top) = (shape.x as f64, shape.y as f64);
-    let (right, bottom) = (left + shape.width as f64, top + shape.height as f64);
+    let top = shape.y as f64;
+    let bottom = top + shape.height as f64;
     for row in area.y..area.y + area.height {
         let cy = row as f64 + 0.5;
         // How far into a corner's square this row is, if it is in one.
@@ -2241,11 +2243,7 @@ fn fill_rounded(
             continue;
         }
         for column in area.x..area.x + area.width {
-            let cx = column as f64 + 0.5;
-            let dx = (left + radius - cx).max(cx - (right - radius)).max(0.0);
-            // Coverage from the distance to the corner's circle, one pixel of
-            // anti-aliasing wide.
-            let coverage = (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
+            let coverage = rounded_coverage(shape, radius, column, row);
             if coverage > 0.0 {
                 fill(
                     store,
@@ -4644,11 +4642,42 @@ mod tests {
             "rounded corner must expose the retained green Metal background"
         );
         assert_eq!(pixel(&first, 6, 6), [0, 0, 255, 255]);
+        // Differential reference captured from Apple M2's native
+        // CARenderer (macOS 26.5): r=5 on a 12x12 masked layer over green.
+        for ((x, y), expected_red) in [
+            ((0, 1), 1u8),
+            ((0, 2), 97),
+            ((1, 1), 136),
+            ((3, 0), 176),
+            ((4, 0), 255),
+        ] {
+            let actual = pixel(&first, x, y)[2];
+            assert!(
+                actual.abs_diff(expected_red) <= 12,
+                "native Core Animation edge ({x},{y}) red {expected_red}, got {actual}"
+            );
+        }
         let aa = pixel(&first, 0, 2);
         assert!(
             aa[1] > 0 && aa[1] < 255 && aa[2] > 0 && aa[2] < 255,
             "edge must be antialiased red over green: {aa:?}"
         );
+        // Native Apple M2/macOS 26.5 CARenderer: r=8 on 12x12
+        // does not get clamped to six. The top-left edge at x4/y0
+        // stays mostly green (BGRA [0,183,72,255]), unlike a
+        // half-width-clamped square corner.
+        send::<f64, ()>(mask, "setCornerRadius:", 8.);
+        let oversized = render();
+        let apple_edge = [0u8, 183, 72, 255];
+        let actual_edge = pixel(&oversized, 4, 0);
+        assert!(
+            actual_edge
+                .iter()
+                .zip(apple_edge)
+                .all(|(actual, native)| actual.abs_diff(native) <= 18),
+            "oversized native CALayer radius edge {actual_edge:?} vs {apple_edge:?}"
+        );
+        assert_eq!(pixel(&oversized, 0, 0), [0, 255, 0, 255]);
         send::<f64, ()>(mask, "setCornerRadius:", 0.);
         let square = render();
         assert_eq!(
@@ -4764,6 +4793,60 @@ mod tests {
         unsafe { corefoundation::api::CFRelease(surface) };
         objc::arc::release(a);
         objc::arc::release(b);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn nested_ordinary_ca_rounded_masks_preserve_native_corner_composition() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(object, "initWithFrame:", rect(0., 0., 20., 20.));
+        let metal_class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ca_class = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal: Id = send(metal_class, "layer", ());
+        let outer: Id = send(ca_class, "layer", ());
+        let inner: Id = send(ca_class, "layer", ());
+        let child: Id = send(ca_class, "layer", ());
+        send::<Id, ()>(view, "setLayer:", metal);
+        send::<NSRect, ()>(outer, "setFrame:", rect(0., 0., 20., 20.));
+        send::<NSRect, ()>(inner, "setFrame:", rect(2., 2., 16., 16.));
+        send::<NSRect, ()>(child, "setFrame:", rect(0., 0., 16., 16.));
+        send::<u8, ()>(outer, "setMasksToBounds:", 1);
+        send::<u8, ()>(inner, "setMasksToBounds:", 1);
+        send::<f64, ()>(outer, "setCornerRadius:", 7.);
+        send::<f64, ()>(inner, "setCornerRadius:", 4.);
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        send::<CFTypeRef, ()>(child, "setBackgroundColor:", red);
+        send::<Id, ()>(metal, "addSublayer:", outer);
+        send::<Id, ()>(outer, "addSublayer:", inner);
+        send::<Id, ()>(inner, "addSublayer:", child);
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: 20,
+            height: 20,
+        };
+        let mut store = Store::for_tests(20, 20);
+        for pixel in store.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 255, 0, 255]);
+        }
+        render_metal_sublayers_selected(view, &mut store, whole, whole, &[], &[]);
+        let at = |x: usize, y: usize| -> [u8; 4] {
+            store.pixels[(y * 20 + x) * 4..(y * 20 + x + 1) * 4]
+                .try_into()
+                .unwrap()
+        };
+        assert_eq!(at(0, 0), [0, 255, 0, 255]);
+        assert_eq!(at(5, 3), [0, 0, 255, 255]);
+        assert_eq!(at(17, 17), [0, 255, 0, 255]);
+        // Native macOS 26.5 M2 CARenderer, pixel +4,+2 from the
+        // 20x20 masked ancestor: premultiplied BGRA [0,85,170,255].
+        let sample = at(4, 2);
+        assert!(
+            sample[1].abs_diff(85) <= 16 && sample[2].abs_diff(170) <= 16,
+            "nested native rounded mask should be green/red edge: {sample:?}"
+        );
         objc::arc::pool_pop(pool);
     }
 
