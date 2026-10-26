@@ -2704,6 +2704,40 @@ fn draw_layer(
     )
 }
 
+/// A selected CPU run may implement a CALayer opacity group only when it
+/// owns all rendered descendants. A segment cut by an NSView-backed source
+/// cannot blend that missing source into the CPU group.
+fn owns_complete_opacity_group(layer: Id, selected: &[usize], excluded: &[usize]) -> bool {
+    if selected.is_empty() && excluded.is_empty() {
+        return true;
+    }
+    read_all_nodes(|nodes| {
+        fn scan(
+            nodes: &HashMap<usize, Node>,
+            id: usize,
+            selected: &[usize],
+            excluded: &[usize],
+            depth: usize,
+        ) -> bool {
+            if depth > 64 || excluded.contains(&id) {
+                return false;
+            }
+            let Some(node) = nodes.get(&id) else {
+                return true;
+            };
+            if (node.background.is_some_and(|c| c[3] > 0.0) || node.contents != 0)
+                && !selected.contains(&id)
+            {
+                return false;
+            }
+            node.sublayers
+                .iter()
+                .all(|&child| scan(nodes, child, selected, excluded, depth + 1))
+        }
+        scan(nodes, layer as usize, selected, excluded, 0)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_layer_filtered(
     store: &mut Store,
@@ -2730,7 +2764,44 @@ fn draw_layer_filtered(
     }
     let frame = presented.frame_at(origin);
     let pixels = mapping.to_pixels(frame);
-    let opacity = opacity * presented.opacity;
+    let group_alpha = presented.opacity.clamp(0.0, 1.0);
+    let isolated = group_alpha < 1.0
+        && group_alpha > 0.0
+        && !presented.sublayers.is_empty()
+        && owns_complete_opacity_group(layer, selected, excluded);
+    // The native CA compositor applies a container opacity after its children
+    // are composed. Remember the destination and temporarily draw at unit
+    // group opacity; this avoids a second full-size backing-store allocation.
+    let target = if isolated {
+        layer_paint_extent(
+            layer,
+            mapping,
+            origin,
+            Some(clip),
+            excluded,
+            selected,
+            now,
+            depth,
+        )
+        .unwrap_or_default()
+    } else {
+        Rect::default()
+    }
+    .intersection(&Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    });
+    let before = (isolated && !target.is_empty()).then(|| {
+        let mut saved = Vec::with_capacity(target.width as usize * target.height as usize * 4);
+        for row in target.y..target.y + target.height {
+            let offset = (row as usize * store.width as usize + target.x as usize) * 4;
+            saved.extend_from_slice(&store.pixels[offset..offset + target.width as usize * 4]);
+        }
+        saved
+    });
+    let opacity = opacity * if isolated { 1.0 } else { presented.opacity };
     if selected.is_empty() || selected.contains(&(layer as usize)) {
         if let Some(color) = presented.background {
             let radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
@@ -2766,6 +2837,17 @@ fn draw_layer_filtered(
             excluded,
             selected,
         );
+    }
+    if let Some(before) = before {
+        for (row, source) in before.chunks_exact(target.width as usize * 4).enumerate() {
+            let offset = ((target.y as usize + row) * store.width as usize + target.x as usize) * 4;
+            let after = &mut store.pixels[offset..offset + source.len()];
+            for (&prior, pixel) in source.iter().zip(after.iter_mut()) {
+                *pixel = (f64::from(prior) * (1.0 - group_alpha) + f64::from(*pixel) * group_alpha)
+                    .round()
+                    .clamp(0.0, 255.0) as u8;
+            }
+        }
     }
     animating
 }
@@ -2832,6 +2914,89 @@ pub(crate) fn metal_sublayers_extent(view: Id, rect: Rect) -> Option<Rect> {
     metal_sublayers_extent_selected(view, rect, &[])
 }
 
+fn layer_paint_extent(
+    layer: Id,
+    mapping: &Mapping,
+    origin: NSPoint,
+    clip: Option<Rect>,
+    excluded: &[usize],
+    selected: &[usize],
+    now: f64,
+    depth: usize,
+) -> Option<Rect> {
+    if depth >= 64 || excluded.contains(&(layer as usize)) {
+        return None;
+    }
+    let shown = presentation(layer, now);
+    if shown.hidden {
+        return None;
+    }
+    let frame = shown.frame_at(origin);
+    let pixels = mapping.to_pixels(frame);
+    // Empty CA containers contribute no source pixels themselves. Child
+    // contents may, independently, exceed this frame under CA gravity.
+    let (has_background, contents) = read_node(layer, |node| {
+        node.map_or((false, 0), |node| {
+            (node.background.is_some_and(|c| c[3] > 0.0), node.contents)
+        })
+    });
+    let own = if shown.opacity <= 0.0
+        || (!selected.is_empty() && !selected.contains(&(layer as usize)))
+    {
+        None
+    } else {
+        let mut own = has_background.then_some(pixels);
+        if contents != 0 {
+            let scale = crate::layer::contents_scale_of(layer);
+            let source = if let Some(source) = iosurface::pixels(contents as CFTypeRef) {
+                Some((source.width, source.height))
+            } else {
+                with_contents(layer, |source| (source.width, source.height))
+            };
+            let coverage = source
+                .and_then(|(w, h)| {
+                    source_area(place(
+                        shown.gravity,
+                        pixels,
+                        w as f64 / scale * mapping.scale_x,
+                        h as f64 / scale * mapping.scale_y,
+                    ))
+                })
+                .or(Some(pixels));
+            if let Some(coverage) = coverage {
+                own = Some(own.map_or(coverage, |area| area.union(&coverage)));
+            }
+        }
+        own.map(|area| clip.map_or(area, |clip| area.intersection(&clip)))
+            .filter(|area| !area.is_empty())
+    };
+    let mut union = own;
+    let child_clip = if shown.masks_to_bounds {
+        Some(clip.map_or(pixels, |clip| clip.intersection(&pixels)))
+    } else {
+        clip
+    };
+    let inner = NSPoint {
+        x: frame.origin.x - shown.bounds_origin.x,
+        y: frame.origin.y - shown.bounds_origin.y,
+    };
+    for child in shown.sublayers {
+        if let Some(part) = layer_paint_extent(
+            child as Id,
+            mapping,
+            inner,
+            child_clip,
+            excluded,
+            selected,
+            now,
+            depth + 1,
+        ) {
+            union = Some(union.map_or(part, |old| old.union(&part)));
+        }
+    }
+    union
+}
+
 pub(crate) fn metal_sublayers_extent_selected(
     view: Id,
     rect: Rect,
@@ -2852,91 +3017,10 @@ pub(crate) fn metal_sublayers_extent_selected(
         x: mapping.view_bounds.origin.x - presented.bounds_origin.x,
         y: mapping.view_bounds.origin.y - presented.bounds_origin.y,
     };
-    fn extent(
-        layer: Id,
-        mapping: &Mapping,
-        origin: NSPoint,
-        clip: Option<Rect>,
-        excluded: &[usize],
-        selected: &[usize],
-        now: f64,
-        depth: usize,
-    ) -> Option<Rect> {
-        if depth >= 64 || excluded.contains(&(layer as usize)) {
-            return None;
-        }
-        let shown = presentation(layer, now);
-        if shown.hidden {
-            return None;
-        }
-        let frame = shown.frame_at(origin);
-        let pixels = mapping.to_pixels(frame);
-        // Empty CA containers contribute no source pixels themselves. Child
-        // contents may, independently, exceed this frame under CA gravity.
-        let (has_background, contents) = read_node(layer, |node| {
-            node.map_or((false, 0), |node| {
-                (node.background.is_some_and(|c| c[3] > 0.0), node.contents)
-            })
-        });
-        let own = if shown.opacity <= 0.0
-            || (!selected.is_empty() && !selected.contains(&(layer as usize)))
-        {
-            None
-        } else {
-            let mut own = has_background.then_some(pixels);
-            if contents != 0 {
-                let scale = crate::layer::contents_scale_of(layer);
-                let source = if let Some(source) = iosurface::pixels(contents as CFTypeRef) {
-                    Some((source.width, source.height))
-                } else {
-                    with_contents(layer, |source| (source.width, source.height))
-                };
-                let coverage = source
-                    .and_then(|(w, h)| {
-                        source_area(place(
-                            shown.gravity,
-                            pixels,
-                            w as f64 / scale * mapping.scale_x,
-                            h as f64 / scale * mapping.scale_y,
-                        ))
-                    })
-                    .or(Some(pixels));
-                if let Some(coverage) = coverage {
-                    own = Some(own.map_or(coverage, |area| area.union(&coverage)));
-                }
-            }
-            own.map(|area| clip.map_or(area, |clip| area.intersection(&clip)))
-                .filter(|area| !area.is_empty())
-        };
-        let mut union = own;
-        let child_clip = if shown.masks_to_bounds {
-            Some(clip.map_or(pixels, |clip| clip.intersection(&pixels)))
-        } else {
-            clip
-        };
-        let inner = NSPoint {
-            x: frame.origin.x - shown.bounds_origin.x,
-            y: frame.origin.y - shown.bounds_origin.y,
-        };
-        for child in shown.sublayers {
-            if let Some(part) = extent(
-                child as Id,
-                mapping,
-                inner,
-                child_clip,
-                excluded,
-                selected,
-                now,
-                depth + 1,
-            ) {
-                union = Some(union.map_or(part, |old| old.union(&part)));
-            }
-        }
-        union
-    }
+
     let mut union: Option<Rect> = None;
     for child in presented.sublayers {
-        if let Some(part) = extent(
+        if let Some(part) = layer_paint_extent(
             child as Id,
             &mapping,
             origin,
@@ -4218,6 +4302,64 @@ mod tests {
         assert!(!surface_contents_changed(view, whole, whole));
         assert_eq!(layer_image(child), [2; 8]);
         unsafe { corefoundation::api::CFRelease(surface) };
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn metal_group_opacity_is_applied_after_overlapping_child_composition() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(object, "initWithFrame:", rect(0., 0., 8., 8.));
+        let metal_class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ca_class = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal: Id = send(metal_class, "layer", ());
+        let group: Id = send(ca_class, "layer", ());
+        let bottom: Id = send(ca_class, "layer", ());
+        let top: Id = send(ca_class, "layer", ());
+        send::<Id, ()>(view, "setLayer:", metal);
+        for child in [group, bottom, top] {
+            send::<NSRect, ()>(child, "setFrame:", rect(0., 0., 8., 8.));
+        }
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        let blue = unsafe { crate::cgcontext::CGColorCreateGenericRGB(0., 0., 1., 1.) };
+        send::<CFTypeRef, ()>(bottom, "setBackgroundColor:", red);
+        send::<CFTypeRef, ()>(top, "setBackgroundColor:", blue);
+        send::<f32, ()>(group, "setOpacity:", 0.5);
+        send::<Id, ()>(metal, "addSublayer:", group);
+        send::<Id, ()>(group, "addSublayer:", bottom);
+        send::<Id, ()>(group, "addSublayer:", top);
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 8,
+        };
+        let mut image = Store::for_tests(8, 8);
+        render_metal_sublayers_selected(view, &mut image, whole, whole, &[]);
+        let actual = &image.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4];
+        // Native Apple M2 26.5 offscreen CARenderer: opaque blue above
+        // opaque red in a half-opacity group appears as half blue over
+        // unmodified static Metal green: BGRA [128,127,0,255].
+        // The group's independent premultiplied source is [128,0,0,128].
+        assert_eq!(actual, &[128, 0, 0, 128]);
+        let mut green = Store::for_tests(8, 8);
+        for pixel in green.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 255, 0, 255]);
+        }
+        render_metal_sublayers_selected(view, &mut green, whole, whole, &[]);
+        let blended = &green.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4];
+        // Native Apple M2 output [128,127,0,255] over opaque green.
+        assert_eq!(blended[0], 128);
+        assert!((127..=128).contains(&blended[1]));
+        assert_eq!(&blended[2..], &[0, 255]);
+        send::<u8, ()>(top, "setHidden:", 1);
+        let mut just_red = Store::for_tests(8, 8);
+        render_metal_sublayers_selected(view, &mut just_red, whole, whole, &[]);
+        assert_eq!(
+            &just_red.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4],
+            &[0, 0, 128, 128]
+        );
         objc::arc::pool_pop(pool);
     }
 

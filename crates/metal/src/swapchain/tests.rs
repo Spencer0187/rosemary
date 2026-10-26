@@ -13225,6 +13225,48 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         [255, 0, 0, 255],
         "in-place IOSurface publication under a static CAMetalLayer remained stale"
     );
+    // Native Apple M2 CA oracle: a half-opacity CALayer *group* must
+    // compose overlapping red/blue children before applying group alpha.
+    // Multiplying both child alphas first leaks red through the blue top.
+    let group = make_layer("CALayer");
+    let group_red = make_layer("CALayer");
+    let group_blue = make_layer("CALayer");
+    let red_group_color = unsafe { appkit::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+    let blue_group_color = unsafe { appkit::cgcontext::CGColorCreateGenericRGB(0., 0., 1., 1.) };
+    let set_opacity: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        set_frame(group, objc::sel::get("setFrame:"), rect(64., 40., 24., 20.));
+        for child in [group_red, group_blue] {
+            set_frame(child, objc::sel::get("setFrame:"), rect(0., 0., 24., 20.));
+            set(group, objc::sel::get("addSublayer:"), child);
+        }
+        set(
+            group_red,
+            objc::sel::get("setBackgroundColor:"),
+            red_group_color as Id,
+        );
+        set(
+            group_blue,
+            objc::sel::get("setBackgroundColor:"),
+            blue_group_color as Id,
+        );
+        set_opacity(group, objc::sel::get("setOpacity:"), 0.5);
+        set(metal_layer, objc::sel::get("addSublayer:"), group);
+    }
+    repaint(&mut state);
+    let grouped = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        120,
+        90,
+        70,
+        40,
+    );
+    assert_eq!(grouped[0], 0);
+    assert!((127..=128).contains(&grouped[1]));
+    assert_eq!(grouped[2], 128);
+    assert_eq!(grouped[3], 255);
     unsafe { corefoundation::api::CFRelease(iosurface) };
     drop(state);
     gpu.destroy_image(source);
