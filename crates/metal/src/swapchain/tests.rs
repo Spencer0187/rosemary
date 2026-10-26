@@ -9235,6 +9235,131 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
     sdl3::video::destroy_window(window);
 }
 
+/// Exact retained-GPU output from an oversize-radius CA mask, including a
+/// nested intermediary mask, must match native M2 CARenderer edge samples.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn gpu_oversized_ca_radius_preserves_native_rounded_pixels() {
+    if isolate_vulkan_graphical_test("gpu_oversized_ca_radius_preserves_native_rounded_pixels") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, underlay, full)) = v10_fifo_fixture() else {
+        return;
+    };
+    let tile = appkit::view::Frame {
+        x: 30,
+        y: 24,
+        width: 12,
+        height: 12,
+        ..full
+    };
+    let red = test_render_target(gpu, 12, 12).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, underlay.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+    })
+    .unwrap();
+    let green = test_opaque_metal_placement(0x400, DirectFrame::from_frame(&full));
+    let mask = scene::RoundedClip {
+        frame: DirectFrame::from_frame(&tile),
+        radius: 8.0,
+    };
+    let foreground = ScenePlacement {
+        opacity_groups: vec![],
+        id: 0x401,
+        frame: DirectFrame::from_frame(&tile),
+        opacity: 1.0,
+        opaque: true,
+        clip: Some(DirectFrame::from_frame(&tile)),
+        rounded: vec![mask],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.extend([green.id, foreground.id]);
+    state.synchronize_scene(window as usize, &[green.clone(), foreground.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            green.id,
+            &full,
+            PresentSource::from(&underlay),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true,
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            foreground.id,
+            &tile,
+            PresentSource::from(&red),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true,
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    let sample = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            full.window_width,
+            full.window_height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(sample(&state, 30, 24), [0, 255, 0, 255]);
+    assert_eq!(sample(&state, 36, 30), [0, 0, 255, 255]);
+    // Apple M2/macOS 26.5 native r8 CALayer on 12x12 above green Metal:
+    // (local 4,0) BGRA [0,183,72,255], not the old radius-clamped ~204-red pixel.
+    let apple = [0u8, 183, 72, 255];
+    let actual = sample(&state, 34, 24);
+    assert!(
+        actual.iter().zip(apple).all(|(a, b)| a.abs_diff(b) <= 18),
+        "GPU radius8 final pixel {actual:?}, native reference {apple:?}"
+    );
+
+    let square = ScenePlacement {
+        rounded: vec![],
+        ..foreground.clone()
+    };
+    assert!(state.synchronize_scene(window as usize, &[green.clone(), square]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        sample(&state, 34, 24),
+        [0, 0, 255, 255],
+        "mask metadata change required a new drawable"
+    );
+
+    // Retain two distinct rounded ancestors: the intermediate ordinary CA
+    // mask and the NSView-backed layer's own mask share source-space pixels.
+    let nested = ScenePlacement {
+        rounded: vec![mask, mask],
+        ..foreground
+    };
+    assert!(state.synchronize_scene(window as usize, &[green.clone(), nested]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let edge = sample(&state, 34, 24);
+    assert!(
+        edge[2] < actual[2] && edge[1] > actual[1],
+        "nested rounded masks did not multiply GPU edge coverage: {edge:?}"
+    );
+    assert_eq!(sample(&state, 36, 30), [0, 0, 255, 255]);
+    drop(state);
+    gpu.destroy_image(red);
+    gpu.destroy_image(underlay);
+    sdl3::video::destroy_window(window);
+}
+
 /// The CPU backing image, including its pixels covered by Metal, is the
 /// bottom scene source. This is not the opaque-AppKit-over-Metal mask.
 #[test]

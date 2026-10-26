@@ -1590,7 +1590,11 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
         )?;
         let delta = b.composite_construct(vec2, None, [dx, dy])?;
         let distance = b.ext_inst(float, None, glsl, 66, [Operand::IdRef(delta)])?;
+        // Match appkit::coreanimation::rounded_coverage in window pixels:
+        // an unbounded radius and SQRT_2-wide fractional edge transition.
+        let inv_sqrt2 = b.constant_bit32(float, std::f32::consts::FRAC_1_SQRT_2.to_bits());
         let cov = b.f_sub(float, None, radius, distance)?;
+        let cov = b.f_mul(float, None, cov, inv_sqrt2)?;
         let cov = b.f_add(float, None, cov, half)?;
         let cov = b.ext_inst(
             float,
@@ -1603,6 +1607,21 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
                 Operand::IdRef(one),
             ],
         )?;
+        let two = b.constant_bit32(float, 2f32.to_bits());
+        let width = b.f_sub(float, None, right, left)?;
+        let half_width = b.f_div(float, None, width, two)?;
+        let radius_fits = b.f_ord_less_than_equal(boolean, None, radius, half_width)?;
+        let strip_left = b.f_sub(float, None, left_radius, one)?;
+        let strip_right = b.f_add(float, None, right_radius, one)?;
+        let past_left = b.f_ord_greater_than_equal(boolean, None, cx, strip_left)?;
+        let before_right = b.f_ord_less_than_equal(boolean, None, cx, strip_right)?;
+        let strip = b.logical_and(boolean, None, past_left, before_right)?;
+        let strip = b.logical_and(boolean, None, radius_fits, strip)?;
+        let vertical_center_band = b.f_ord_less_than_equal(boolean, None, dy, zero)?;
+        let smaller_than_pixel = b.f_ord_less_than(boolean, None, radius, half)?;
+        let full_strip = b.logical_or(boolean, None, strip, vertical_center_band)?;
+        let fully_covered = b.logical_or(boolean, None, full_strip, smaller_than_pixel)?;
+        let cov = b.select(float, None, fully_covered, one, cov)?;
         let aggregate = b.load(float, None, coverage_var, None, [])?;
         let aggregate = b.f_mul(float, None, aggregate, cov)?;
         b.store(coverage_var, aggregate, None, [])?;

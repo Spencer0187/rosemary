@@ -2194,8 +2194,13 @@ fn rounded_coverage(shape: Rect, radius: f64, x: i64, y: i64) -> f64 {
     {
         return 1.0;
     }
-    let dx = (left + radius - cx).max(cx - (right - radius)).max(0.0);
     let dy = (top + radius - cy).max(cy - (bottom - radius)).max(0.0);
+    // Native CA's center band has no corner cutoff, even if the radius
+    // exceeds half the layer width (M2 CARenderer 10x50, radius=8).
+    if dy <= 0.0 {
+        return 1.0;
+    }
+    let dx = (left + radius - cx).max(cx - (right - radius)).max(0.0);
     (0.5 + (radius - (dx * dx + dy * dy).sqrt()) / std::f64::consts::SQRT_2).clamp(0.0, 1.0)
 }
 
@@ -2226,9 +2231,10 @@ fn fill_rounded(
     let bottom = top + shape.height as f64;
     for row in area.y..area.y + area.height {
         let cy = row as f64 + 0.5;
-        // How far into a corner's square this row is, if it is in one.
         let dy = (top + radius - cy).max(cy - (bottom - radius)).max(0.0);
         if dy <= 0.0 {
+            // The center band has no corner cutoff, including when the
+            // radius is wider than half the shape (native CA 10x50/r8).
             fill(
                 store,
                 Rect {
@@ -2791,6 +2797,58 @@ fn owns_complete_opacity_group(layer: Id, selected: &[usize], excluded: &[usize]
     })
 }
 
+/// Preserve premultiplied BGRA destination pixels outside a CA round clip.
+/// Apply the mask to the source-over *contribution*, so both opaque and
+/// translucent contents retain their original over compositing semantics.
+fn paint_rounded_contribution(
+    store: &mut Store,
+    shape: Rect,
+    clip: Rect,
+    radius: f64,
+    paint: impl FnOnce(&mut Store),
+) {
+    if radius < 0.5 {
+        paint(store);
+        return;
+    }
+    let area = shape.intersection(&clip).intersection(&Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    });
+    if area.is_empty() {
+        return;
+    }
+    let row_bytes = area.width as usize * 4;
+    let mut before = Vec::with_capacity(row_bytes * area.height as usize);
+    for row in area.y..area.y + area.height {
+        let start = (row as usize * store.width as usize + area.x as usize) * 4;
+        before.extend_from_slice(&store.pixels[start..start + row_bytes]);
+    }
+    paint(store);
+    for (row, source) in before.chunks_exact(row_bytes).enumerate() {
+        let y = area.y + row as i64;
+        let start = (y as usize * store.width as usize + area.x as usize) * 4;
+        let after = &mut store.pixels[start..start + row_bytes];
+        for (column, (prior, current)) in source
+            .chunks_exact(4)
+            .zip(after.chunks_exact_mut(4))
+            .enumerate()
+        {
+            let coverage = rounded_coverage(shape, radius, area.x + column as i64, y);
+            if coverage < 1.0 {
+                for channel in 0..4 {
+                    current[channel] = (f64::from(prior[channel]) * (1.0 - coverage)
+                        + f64::from(current[channel]) * coverage)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_layer_filtered(
     store: &mut Store,
@@ -2866,93 +2924,76 @@ fn draw_layer_filtered(
         } else {
             presented.opacity
         };
+    let contents_clip = if presented.masks_to_bounds {
+        clip.intersection(&pixels)
+    } else {
+        clip
+    };
+    let rounded_radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
     if selected.is_empty() || selected.contains(&(layer as usize)) {
         if let Some(color) = presented.background {
-            let radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
-            fill_rounded(store, pixels, clip, color, opacity, radius);
+            fill_rounded(store, pixels, clip, color, opacity, rounded_radius);
         }
-        draw_contents(
-            store,
-            layer,
-            pixels,
-            (mapping.scale_x, mapping.scale_y),
-            clip,
-            opacity,
-        );
-    }
-    let clip = match presented.masks_to_bounds {
-        true => clip.intersection(&pixels),
-        false => clip,
-    };
-    // CA clips descendants to the rounded outline, not merely the
-    // container's rectangular bounds. Save the already-rendered parent
-    // (including its own rounded background), then mask child contributions.
-    let rounded_radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
-    let child_mask_area = clip.intersection(&pixels).intersection(&Rect {
-        x: 0,
-        y: 0,
-        width: i64::from(store.width),
-        height: i64::from(store.height),
-    });
-    let child_before = (presented.masks_to_bounds
-        && rounded_radius >= 0.5
-        && !presented.sublayers.is_empty()
-        && !child_mask_area.is_empty())
-    .then(|| {
-        let mut saved = Vec::with_capacity(
-            child_mask_area.width as usize * child_mask_area.height as usize * 4,
-        );
-        for row in child_mask_area.y..child_mask_area.y + child_mask_area.height {
-            let offset = (row as usize * store.width as usize + child_mask_area.x as usize) * 4;
-            saved.extend_from_slice(
-                &store.pixels[offset..offset + child_mask_area.width as usize * 4],
+        let has_contents = read_node(layer, |node| node.is_some_and(|node| node.contents != 0));
+        if has_contents && presented.masks_to_bounds {
+            paint_rounded_contribution(store, pixels, contents_clip, rounded_radius, |store| {
+                draw_contents(
+                    store,
+                    layer,
+                    pixels,
+                    (mapping.scale_x, mapping.scale_y),
+                    contents_clip,
+                    opacity,
+                );
+            });
+        } else if has_contents {
+            draw_contents(
+                store,
+                layer,
+                pixels,
+                (mapping.scale_x, mapping.scale_y),
+                contents_clip,
+                opacity,
             );
         }
-        saved
-    });
+    }
     let inner = NSPoint {
         x: frame.origin.x - presented.bounds_origin.x,
         y: frame.origin.y - presented.bounds_origin.y,
     };
-    for child in presented.sublayers {
-        animating |= draw_layer_filtered(
-            store,
-            mapping,
-            child as Id,
-            inner,
-            clip,
-            opacity,
-            now,
-            depth + 1,
-            excluded,
-            selected,
-            gpu_groups,
-        );
-    }
-    if let Some(saved) = child_before {
-        for (row, original) in saved
-            .chunks_exact(child_mask_area.width as usize * 4)
-            .enumerate()
-        {
-            let y = child_mask_area.y + row as i64;
-            let offset = (y as usize * store.width as usize + child_mask_area.x as usize) * 4;
-            let after = &mut store.pixels[offset..offset + original.len()];
-            for (column, (prior, current)) in original
-                .chunks_exact(4)
-                .zip(after.chunks_exact_mut(4))
-                .enumerate()
-            {
-                let coverage =
-                    rounded_coverage(pixels, rounded_radius, child_mask_area.x + column as i64, y);
-                if coverage < 1.0 {
-                    for channel in 0..4 {
-                        current[channel] = (f64::from(prior[channel]) * (1.0 - coverage)
-                            + f64::from(current[channel]) * coverage)
-                            .round()
-                            .clamp(0.0, 255.0) as u8;
-                    }
-                }
+    if presented.masks_to_bounds && !presented.sublayers.is_empty() {
+        paint_rounded_contribution(store, pixels, contents_clip, rounded_radius, |store| {
+            for child in presented.sublayers {
+                animating |= draw_layer_filtered(
+                    store,
+                    mapping,
+                    child as Id,
+                    inner,
+                    contents_clip,
+                    opacity,
+                    now,
+                    depth + 1,
+                    excluded,
+                    selected,
+                    gpu_groups,
+                );
             }
+        });
+    } else {
+        for child in presented.sublayers {
+            animating |= draw_layer_filtered(
+                store,
+                mapping,
+                child as Id,
+                inner,
+                clip,
+                opacity,
+                now,
+                depth + 1,
+                excluded,
+                selected,
+                gpu_groups,
+            );
         }
     }
     if let Some(before) = before {
@@ -4693,6 +4734,154 @@ mod tests {
             [0, 0, 255, 255],
             "unmasked ordinary descendants must not be rounded"
         );
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn rounded_ca_mask_clips_own_cgimage_and_iosurface_contents() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view: Id = send(
+            objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0),
+            "initWithFrame:",
+            rect(0., 0., 12., 12.),
+        );
+        let metal_class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ca_class = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal: Id = send(metal_class, "layer", ());
+        let layer: Id = send(ca_class, "layer", ());
+        send::<Id, ()>(view, "setLayer:", metal);
+        send::<NSRect, ()>(layer, "setFrame:", rect(0., 0., 12., 12.));
+        send::<u8, ()>(layer, "setMasksToBounds:", 1);
+        send::<f64, ()>(layer, "setCornerRadius:", 8.);
+        send::<Id, ()>(metal, "addSublayer:", layer);
+
+        let cg_pixels = [0u8, 0, 255, 255].repeat(12 * 12);
+        let provider = unsafe {
+            crate::graphics::CGDataProviderCreateWithData(
+                std::ptr::null_mut(),
+                cg_pixels.as_ptr().cast(),
+                cg_pixels.len(),
+                None,
+            )
+        };
+        let image = unsafe {
+            crate::graphics::CGImageCreate(
+                12,
+                12,
+                8,
+                32,
+                48,
+                std::ptr::null(),
+                0x2002,
+                provider,
+                std::ptr::null(),
+                0,
+                0,
+            )
+        };
+        assert!(!image.is_null());
+        unsafe { crate::graphics::CGDataProviderRelease(provider) };
+
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 12,
+        };
+        let render = || {
+            let mut pixels = Store::for_tests(12, 12);
+            for pixel in pixels.pixels.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0, 255, 0, 255]);
+            }
+            render_metal_sublayers_selected(view, &mut pixels, frame, frame, &[], &[]);
+            pixels
+        };
+        let sample = |store: &Store, x: usize, y: usize| -> [u8; 4] {
+            store.pixels[(y * 12 + x) * 4..(y * 12 + x + 1) * 4]
+                .try_into()
+                .unwrap()
+        };
+        let assert_native = |store: &Store| {
+            // Native Apple M2/macOS 26.5 CA own CGImage and IOSurface
+            // share these BGRA8 values at radius 8 on a 12x12 layer.
+            for (x, y, expected) in [
+                (0, 0, [0, 255, 0, 255]),
+                (1, 2, [0, 222, 33, 255]),
+                (4, 0, [0, 183, 72, 255]),
+                (5, 0, [0, 109, 146, 255]),
+                (6, 6, [0, 0, 255, 255]),
+            ] {
+                let pixel = sample(store, x, y);
+                assert!(
+                    pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 18),
+                    "native rounded contents ({x},{y}): {pixel:?}, expected {expected:?}"
+                );
+            }
+        };
+        send::<Id, ()>(layer, "setContents:", image as Id);
+        assert_native(&render());
+        // A radius-only update must not require a new image publication.
+        send::<f64, ()>(layer, "setCornerRadius:", 0.);
+        assert_eq!(sample(&render(), 0, 0), [0, 0, 255, 255]);
+        send::<f64, ()>(layer, "setCornerRadius:", 8.);
+
+        let surface = surface();
+        publish(surface, [0, 0, 255, 255, 0, 0, 255, 255]);
+        send::<Id, ()>(layer, "setContents:", surface as Id);
+        assert_native(&render());
+        send::<u8, ()>(layer, "setMasksToBounds:", 0);
+        assert_eq!(sample(&render(), 0, 0), [0, 0, 255, 255]);
+        send::<Id, ()>(layer, "setContents:", std::ptr::null_mut());
+        unsafe {
+            corefoundation::api::CFRelease(image);
+            corefoundation::api::CFRelease(surface);
+        }
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn narrow_tall_round_background_never_overpaints_middle_row_corners() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view: Id = send(
+            objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0),
+            "initWithFrame:",
+            rect(0., 0., 10., 50.),
+        );
+        let metal_class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ca_class = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal: Id = send(metal_class, "layer", ());
+        let layer: Id = send(ca_class, "layer", ());
+        send::<Id, ()>(view, "setLayer:", metal);
+        send::<NSRect, ()>(layer, "setFrame:", rect(0., 0., 10., 50.));
+        send::<f64, ()>(layer, "setCornerRadius:", 8.);
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        send::<CFTypeRef, ()>(layer, "setBackgroundColor:", red);
+        send::<Id, ()>(metal, "addSublayer:", layer);
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 50,
+        };
+        let mut pixels = Store::for_tests(10, 50);
+        for pixel in pixels.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 255, 0, 255]);
+        }
+        render_metal_sublayers_selected(view, &mut pixels, frame, frame, &[], &[]);
+        let sample = |x: usize, y: usize| &pixels.pixels[(y * 10 + x) * 4..(y * 10 + x + 1) * 4];
+        let left = sample(0, 25);
+        // Measured on Apple M2/macOS 26.5: the 10x50 radius8 middle row
+        // is fully opaque even at x=0. Rounded clipping applies near the
+        // top/bottom corners, not throughout the long center band.
+        assert_eq!(
+            left,
+            &[0, 0, 255, 255],
+            "native CA fully covers the center strip, including its edges"
+        );
+        assert_eq!(sample(5, 25), &[0, 0, 255, 255]);
+        assert_eq!(sample(0, 0), &[0, 255, 0, 255]);
         objc::arc::pool_pop(pool);
     }
 

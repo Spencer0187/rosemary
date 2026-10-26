@@ -971,8 +971,7 @@ fn visit_metal_scene(
                         if physical.is_finite() && physical > 0.0 {
                             rounded.push(RoundedSceneClip {
                                 frame,
-                                radius: physical.min(f64::from(frame.width.min(frame.height)) / 2.0)
-                                    as f32,
+                                radius: physical as f32,
                             });
                         }
                     }
@@ -991,7 +990,7 @@ fn visit_metal_scene(
                 if physical.is_finite() && physical > 0.0 {
                     rounded.push(RoundedSceneClip {
                         frame,
-                        radius: physical.min(f64::from(frame.width.min(frame.height)) / 2.0) as f32,
+                        radius: physical as f32,
                     });
                 }
             }
@@ -5313,18 +5312,36 @@ mod tests {
             unsafe { std::mem::transmute(objc::msg::entry()) };
         unsafe {
             ca_masks(parent_layer, objc::sel::get("setMasksToBounds:"), 1);
-            ca_radius(parent_layer, objc::sel::get("setCornerRadius:"), 18.0);
+            ca_radius(parent_layer, objc::sel::get("setCornerRadius:"), 80.0);
         }
         let rounded = metal_scene(sdl).unwrap();
         assert_eq!(rounded[1].rounded.len(), 1);
         assert_eq!(rounded[1].rounded[0].frame.x, expected.x);
         assert_eq!(rounded[1].rounded[0].frame.y, expected.y);
-        assert!(rounded[1].rounded[0].radius > 0.0);
+        assert!(
+            rounded[1].rounded[0].radius
+                > rounded[1].rounded[0]
+                    .frame
+                    .width
+                    .min(rounded[1].rounded[0].frame.height) as f32
+                    / 2.0,
+            "intermediate CALayer radius incorrectly clamped before GPU scene capture"
+        );
         unsafe {
             ca_masks(second, objc::sel::get("setMasksToBounds:"), 1);
-            ca_radius(second, objc::sel::get("setCornerRadius:"), 6.0);
+            ca_radius(second, objc::sel::get("setCornerRadius:"), 180.0);
         }
-        assert_eq!(metal_scene(sdl).unwrap()[1].rounded.len(), 2);
+        let both = metal_scene(sdl).unwrap();
+        assert_eq!(both[1].rounded.len(), 2);
+        assert!(
+            both[1].rounded[1].radius
+                > both[1].rounded[1]
+                    .frame
+                    .width
+                    .min(both[1].rounded[1].frame.height) as f32
+                    / 2.0,
+            "NSView-backed CALayer radius incorrectly clamped before GPU scene capture"
+        );
         unsafe {
             ca_masks(parent_layer, objc::sel::get("setMasksToBounds:"), 0);
             ca_masks(second, objc::sel::get("setMasksToBounds:"), 0);
