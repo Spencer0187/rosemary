@@ -2363,6 +2363,9 @@ fn stage_native_scene_source(
 #[cfg(test)]
 static TILED_NATIVE_GPU_COPY_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static TILED_NATIVE_FAIL_AFTER_ALLOCATION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 // Use the same producer proof for upload selection and physical-memory preflight.
 // An uncertain predecessor requires a complete, independent upload.
@@ -2471,6 +2474,8 @@ fn stage_tiled_native_source(
         return Ok(None);
     }
     let gpu = state.gpu;
+    #[cfg(test)]
+    let allocation_start = std::time::Instant::now();
     let lease = BackingImageLease::create_for_window(
         gpu,
         layer.frame.window as usize,
@@ -2491,6 +2496,8 @@ fn stage_tiled_native_source(
     )?;
     let charge = GpuCharge::reserve(layer.frame.window as usize, upload)?;
     let buffer = gpu.create_staging_buffer(upload)?;
+    #[cfg(test)]
+    let allocation_elapsed = allocation_start.elapsed();
     // Own both the mapped staging resource and budget reservation *before*
     // fallible source validation/copy. The owner frees the buffer on any
     // early error, and one_shot_owned quarantines it across uncertain fences.
@@ -2501,15 +2508,25 @@ fn stage_tiled_native_source(
         _source: Arc::clone(&lease),
         _target: old.as_ref().map(|(source, _)| Arc::clone(source)),
     };
+    #[cfg(test)]
+    if TILED_NATIVE_FAIL_AFTER_ALLOCATION.swap(false, Ordering::AcqRel) {
+        return Err("injected tiled native staging failure after allocation".into());
+    }
     let (x, y, width, height) = patch.map_or((0, 0, tiles.width, tiles.height), |r| {
         (r.x as u32, r.y as u32, r.width as u32, r.height as u32)
     });
+    #[cfg(test)]
+    let host_copy_start = std::time::Instant::now();
     let dest = unsafe {
         std::slice::from_raw_parts_mut(owned.buffer.as_ref().unwrap().contents, upload as usize)
     };
     tiles
         .copy_rect_to(x, y, width, height, dest)
         .ok_or("tiled CPU row source could not fill GPU transfer")?;
+    #[cfg(test)]
+    let host_copy_elapsed = host_copy_start.elapsed();
+    #[cfg(test)]
+    let submit_start = std::time::Instant::now();
     gpu.one_shot_owned(owned, |device, cb, owned| unsafe {
         let region = vk::ImageSubresourceLayers {
             aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -2627,6 +2644,19 @@ fn stage_tiled_native_source(
             &[visible],
         );
     })?;
+    #[cfg(test)]
+    if std::env::var_os("ROSEMARY_BENCH_TILED_STAGE").is_some() {
+        eprintln!(
+            "tiled native GPU staging {}x{} {} upload={} bytes: image+buffer allocation={:?}, host rect copy={:?}, command recording+queue submit+fence wait={:?}",
+            tiles.width,
+            tiles.height,
+            if patch.is_some() { "patch" } else { "full" },
+            upload,
+            allocation_elapsed,
+            host_copy_elapsed,
+            submit_start.elapsed(),
+        );
+    }
     accept_staged_native_image(state, layer, lease)?;
     Ok(StagedNativeIdentity::from_placement(layer))
 }

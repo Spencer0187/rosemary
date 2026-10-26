@@ -6396,6 +6396,134 @@ fn tiled_native_staging_escrows_retired_gpu_image_when_upload_buffer_is_pressure
     sdl3::video::destroy_window(window);
 }
 
+/// Failed tiled uploads must preserve committed pixels, quarantine uncertain
+/// submissions and reclaim every window-ledger reservation after retirement.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_stage_failure_retries_after_rollback_and_reclaims_gpu_charges() {
+    if isolate_vulkan_graphical_test(
+        "tiled_stage_failure_retries_after_rollback_and_reclaims_gpu_charges",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let frame = DirectFrame::from_frame(&appkit::view::Frame {
+        width,
+        height,
+        ..whole
+    });
+    let mut proposed = test_opaque_metal_placement(0x8cc1, frame);
+    proposed.opaque = false;
+    let pixels = [0u8, 0, 255, 255].repeat((width * height) as usize);
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &pixels).unwrap(),
+    );
+    proposed.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(Arc::clone(&tiles)),
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        cpu_capture: Some(appkit::backing::NativeCpuCapture {
+            revision: tiles.revision,
+            damage: None,
+        }),
+        dmabuf: None,
+        dma_sample: None,
+    });
+    assert_eq!(stage_native_scene_source(&mut state, &proposed), Ok(true));
+    state.synchronize_scene(window as usize, &[proposed.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let old = Arc::clone(&state.scene_layers[0].snapshot);
+    let original_revision = state.scene_layers[0].native_revision;
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let ledger = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let baseline = ledger.held.load(Ordering::Acquire);
+    let mut next_pixels = pixels;
+    let change = ((31 * width + 23) * 4) as usize;
+    next_pixels[change..change + 4].copy_from_slice(&[255, 0, 0, 255]);
+    let next_tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &next_pixels).unwrap(),
+    );
+    let next = proposed.native.as_mut().unwrap();
+    next.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+        revision: next_tiles.revision,
+        damage: Some(appkit::backing::NativeCpuDamage {
+            from_revision: tiles.revision,
+            rect: appkit::backing::Rect {
+                x: 23,
+                y: 31,
+                width: 1,
+                height: 1,
+            },
+        }),
+    });
+    next.revision = next_tiles.revision;
+    next.tiles = Some(next_tiles);
+    let rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    TILED_NATIVE_FAIL_AFTER_ALLOCATION.store(true, Ordering::Release);
+    let err = stage_native_scene_source(&mut state, &proposed).unwrap_err();
+    assert!(err.contains("injected tiled native staging failure after allocation"));
+    assert_eq!(ledger.held.load(Ordering::Acquire), baseline);
+    assert_eq!(state.scene_layers[0].native_revision, original_revision);
+    assert!(Arc::ptr_eq(&state.scene_layers[0].snapshot, &old));
+    assert_eq!(
+        read_scene_pixel(gpu, old.image.image, width, height, 23, 31),
+        [0, 0, 255, 255]
+    );
+    gpu.inject_immediate_wait_failure_for_test();
+    let err = stage_native_scene_source(&mut state, &proposed).unwrap_err();
+    assert!(err.contains("injected immediate fence wait error"));
+    assert!(gpu.immediate_quarantine_count_for_test() > 0);
+    assert!(ledger.held.load(Ordering::Acquire) > baseline);
+    assert_eq!(state.scene_layers[0].native_revision, original_revision);
+    assert_eq!(
+        read_scene_pixel(gpu, old.image.image, width, height, 23, 31),
+        [0, 0, 255, 255]
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
+    assert_eq!(ledger.held.load(Ordering::Acquire), baseline);
+    state.pending_scene_rollback = Some(rollback);
+    restore_native_rollback(&mut state).unwrap();
+    assert_eq!(state.scene_layers[0].native_revision, original_revision);
+    assert_eq!(stage_native_scene_source(&mut state, &proposed), Ok(true));
+    state.synchronize_scene(window as usize, &[proposed.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            23,
+            31
+        ),
+        [0, 0, 255, 255]
+    );
+    drop(old);
+    drop(state);
+    assert_eq!(ledger.held.load(Ordering::Acquire), 1);
+    drop(account);
+    assert_eq!(ledger.held.load(Ordering::Acquire), 0);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image() {
@@ -6727,6 +6855,473 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
     );
     drop(state);
     gpu.destroy_image(source);
+    sdl3::video::destroy_window(window);
+}
+
+/// Exercise the actual row-banded representation across all six 6K WSI
+/// partitions. Previous GPU generations remain live across dirty updates.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn six_k_row_banded_native_sources_patch_independently_and_present() {
+    if isolate_vulkan_graphical_test(
+        "six_k_row_banded_native_sources_patch_independently_and_present",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    const WIDTH: u32 = 6016;
+    const HEIGHT: u32 = 3384;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(
+        c"6K six immutable row bands",
+        WIDTH as i32,
+        HEIGHT as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    assert!(uses_layer_compositor(state.present_mode));
+    let metal = test_render_target(gpu, WIDTH, HEIGHT).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
+    })
+    .unwrap();
+    let whole = test_full_frame(window, WIDTH, HEIGHT);
+    let background = test_opaque_metal_placement(0x6a00, DirectFrame::from_frame(&whole));
+    state.layers.push(background.id);
+    state.synchronize_scene(window as usize, &[background.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            background.id,
+            &whole,
+            PresentSource::from(&metal),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    let mut initial = vec![background.clone()];
+    let mut cpu_pixels = Vec::new();
+    let mut positions = Vec::new();
+    let full_start = Instant::now();
+    let mut full_gpu_stage = Duration::ZERO;
+    for y in (0..HEIGHT).step_by(2048) {
+        for x in (0..WIDTH).step_by(2048) {
+            let tw = (WIDTH - x).min(2048);
+            let th = (HEIGHT - y).min(2048);
+            let n = positions.len();
+            let pixels = [0u8, 0, 255, 255].repeat((tw * th) as usize);
+            let tiles = Arc::new(
+                appkit::backing::NativePixelTiles::from_opaque_bgra(tw, th, &pixels).unwrap(),
+            );
+            let mut placement = test_opaque_metal_placement(
+                (3usize << (usize::BITS - 2)) | (n + 0x4000),
+                DirectFrame::from_frame(&appkit::view::Frame {
+                    x: x as i32,
+                    y: y as i32,
+                    width: tw,
+                    height: th,
+                    ..whole
+                }),
+            );
+            placement.opaque = false;
+            placement.native = Some(scene::NativeCpuSceneSource {
+                tiles: Some(Arc::clone(&tiles)),
+                bytes: Arc::new(Vec::new()),
+                cpu_capture: Some(appkit::backing::NativeCpuCapture {
+                    revision: tiles.revision,
+                    damage: None,
+                }),
+                revision: tiles.revision,
+                dmabuf: None,
+                dma_sample: None,
+            });
+            let gpu_stage_start = Instant::now();
+            assert_eq!(stage_native_scene_source(&mut state, &placement), Ok(true));
+            full_gpu_stage += gpu_stage_start.elapsed();
+            positions.push((x, y, tw, th));
+            cpu_pixels.push(pixels);
+            initial.push(placement);
+        }
+    }
+    assert_eq!(positions.len(), 6);
+    let full_stage = full_start.elapsed();
+    state.synchronize_scene(window as usize, &initial);
+    let full_recompose_start = Instant::now();
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let full_recompose = full_recompose_start.elapsed();
+    let full_present_start = Instant::now();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    let full_present = full_present_start.elapsed();
+    let original = state
+        .scene_layers
+        .iter()
+        .filter(|l| l.id != background.id)
+        .map(|l| (l.id, Arc::clone(&l.snapshot)))
+        .collect::<Vec<_>>();
+    assert_eq!(original.len(), 6);
+    if std::env::var_os("ROSEMARY_BENCH_TILED_STAGE").is_some() {
+        let mut gpu_copy_ns = Vec::new();
+        for (_, old_image) in &original {
+            let image = &old_image.image;
+            let pool = gpu.timestamp_pool();
+            if pool == vk::QueryPool::null() {
+                eprintln!("6K GPU copy timestamps unsupported by selected Vulkan queue");
+                break;
+            }
+            let dest = BackingImageLease::create_for_window(
+                gpu,
+                window as usize,
+                &ImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    format: vk::Format::B8G8R8A8_UNORM,
+                    width: image.width,
+                    height: image.height,
+                    depth: 1,
+                    levels: 1,
+                    layers: 1,
+                    samples: 1,
+                    usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                    cube: false,
+                    components: vk::ComponentMapping::default(),
+                },
+            )
+            .unwrap();
+            gpu.one_shot(|device, cb| unsafe {
+                device.cmd_reset_query_pool(cb, pool, 0, 2);
+                device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, pool, 0);
+                let region = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let source_barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[source_barrier],
+                );
+                device.cmd_copy_image(
+                    cb,
+                    image.image,
+                    vk::ImageLayout::GENERAL,
+                    dest.image.image,
+                    vk::ImageLayout::GENERAL,
+                    &[vk::ImageCopy::default()
+                        .src_subresource(region)
+                        .dst_subresource(region)
+                        .extent(vk::Extent3D {
+                            width: image.width,
+                            height: image.height,
+                            depth: 1,
+                        })],
+                );
+                device.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
+            })
+            .unwrap();
+            let mut ticks = [0u64; 2];
+            unsafe {
+                gpu.device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut ticks,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+            }
+            .unwrap();
+            let mask = match gpu.timestamp_valid_bits() {
+                64.. => u64::MAX,
+                bits => (1u64 << bits) - 1,
+            };
+            let ns = (ticks[1].wrapping_sub(ticks[0]) & mask) as f64 * gpu.timestamp_period();
+            gpu_copy_ns.push(ns);
+            gpu.release_timestamp_pool(pool);
+        }
+        if !gpu_copy_ns.is_empty() {
+            let total: f64 = gpu_copy_ns.iter().sum();
+            eprintln!(
+                "6K six source GPU-only full-image copy timestamps: {gpu_copy_ns:?} ns, total={total:.0}ns, excluding host allocation, queue wait and WSI"
+            );
+        }
+    }
+    for &(x, y, tw, th) in &positions {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x + tw / 2,
+                y + th / 2
+            ),
+            [255, 0, 0, 255]
+        );
+    }
+    let mut updated = initial.clone();
+    let mut dirty = Vec::new();
+    let copies_before = TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed);
+    let patch_start = Instant::now();
+    let mut patch_gpu_stage = Duration::ZERO;
+    for (n, &(x, y, tw, th)) in positions.iter().enumerate() {
+        let px = 11 + n as u32 * 23;
+        let py = 17 + n as u32 * 19;
+        let pixels = &mut cpu_pixels[n];
+        let index = ((py * tw + px) * 4) as usize;
+        pixels[index..index + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let tiles =
+            Arc::new(appkit::backing::NativePixelTiles::from_opaque_bgra(tw, th, pixels).unwrap());
+        let placement = &mut updated[n + 1];
+        let native = placement.native.as_mut().unwrap();
+        let previous_revision = native.revision;
+        assert_ne!(tiles.revision, previous_revision);
+        native.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+            revision: tiles.revision,
+            damage: Some(appkit::backing::NativeCpuDamage {
+                from_revision: previous_revision,
+                rect: appkit::backing::Rect {
+                    x: px as i64,
+                    y: py as i64,
+                    width: 1,
+                    height: 1,
+                },
+            }),
+        });
+        native.revision = tiles.revision;
+        native.tiles = Some(tiles);
+        assert_eq!(
+            tiled_native_staging_bytes(&state, placement),
+            u64::from(tw) * u64::from(th) * 4 + 4
+        );
+        let gpu_stage_start = Instant::now();
+        assert_eq!(stage_native_scene_source(&mut state, placement), Ok(true));
+        patch_gpu_stage += gpu_stage_start.elapsed();
+        dirty.push((x + px, y + py, n));
+    }
+    let patch_stage = patch_start.elapsed();
+    assert_eq!(
+        TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed) - copies_before,
+        6
+    );
+    state.synchronize_scene(window as usize, &updated);
+    let patch_recompose_start = Instant::now();
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let patch_recompose = patch_recompose_start.elapsed();
+    let patch_present_start = Instant::now();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    let patch_present = patch_present_start.elapsed();
+    for &(x, y, n) in &dirty {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x,
+                y
+            ),
+            [0, 0, 255, 255],
+            "dirty tile {n} lost in composite"
+        );
+        let (id, old_image) = &original[n];
+        assert_eq!(*id, updated[n + 1].id);
+        let (_, _, tw, _) = positions[n];
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                old_image.image.image,
+                tw,
+                positions[n].3,
+                x - positions[n].0,
+                y - positions[n].1
+            ),
+            [0, 0, 255, 255],
+            "old GPU generation {n} mutated"
+        );
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                positions[n].0 + tw - 5,
+                positions[n].1 + positions[n].3 - 5
+            ),
+            [255, 0, 0, 255],
+            "untouched texel {n} corrupted"
+        );
+    }
+    // A second independently attested round retains both older GPU generations.
+    // This exercises 18 real tiled image versions, not only one update per tile.
+    let prior_patches = state
+        .scene_layers
+        .iter()
+        .filter(|l| l.id != background.id)
+        .map(|l| (l.id, Arc::clone(&l.snapshot)))
+        .collect::<Vec<_>>();
+    assert_eq!(prior_patches.len(), 6);
+    let second_copy_before = TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed);
+    let second_start = Instant::now();
+    let mut second_gpu_stage = Duration::ZERO;
+    let mut second_dirty = Vec::new();
+    for (n, &(x, y, tw, th)) in positions.iter().enumerate() {
+        let px = 41 + n as u32 * 17;
+        let py = 63 + n as u32 * 13;
+        let pixels = &mut cpu_pixels[n];
+        let index = ((py * tw + px) * 4) as usize;
+        pixels[index..index + 4].copy_from_slice(&[0, 255, 0, 255]);
+        let tiles =
+            Arc::new(appkit::backing::NativePixelTiles::from_opaque_bgra(tw, th, pixels).unwrap());
+        let placement = &mut updated[n + 1];
+        let native = placement.native.as_mut().unwrap();
+        let old_revision = native.revision;
+        native.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+            revision: tiles.revision,
+            damage: Some(appkit::backing::NativeCpuDamage {
+                from_revision: old_revision,
+                rect: appkit::backing::Rect {
+                    x: px as i64,
+                    y: py as i64,
+                    width: 1,
+                    height: 1,
+                },
+            }),
+        });
+        native.revision = tiles.revision;
+        native.tiles = Some(tiles);
+        let gpu_stage_start = Instant::now();
+        assert_eq!(stage_native_scene_source(&mut state, placement), Ok(true));
+        second_gpu_stage += gpu_stage_start.elapsed();
+        second_dirty.push((x + px, y + py, n));
+    }
+    let second_elapsed = second_start.elapsed();
+    assert_eq!(
+        TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed) - second_copy_before,
+        6
+    );
+    state.synchronize_scene(window as usize, &updated);
+    let second_scene_start = Instant::now();
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let second_scene = second_scene_start.elapsed();
+    let second_present_start = Instant::now();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    let second_present = second_present_start.elapsed();
+    for &(x, y, n) in &second_dirty {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x,
+                y
+            ),
+            [0, 255, 0, 255],
+            "second dirty tile {n} not presented"
+        );
+        let (id, old_gpu) = &prior_patches[n];
+        assert_eq!(*id, updated[n + 1].id);
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                old_gpu.image.image,
+                positions[n].2,
+                positions[n].3,
+                x - positions[n].0,
+                y - positions[n].1
+            ),
+            [0, 0, 255, 255],
+            "second prior generation {n} mutated"
+        );
+    }
+    for &(x, y, n) in &dirty {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x,
+                y
+            ),
+            [0, 0, 255, 255],
+            "second update erased first dirty region {n}"
+        );
+    }
+    // The last tile can disappear without a fresh Metal drawable.
+    updated.pop();
+    state.synchronize_scene(window as usize, &updated);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            WIDTH,
+            HEIGHT,
+            5000,
+            3000
+        ),
+        [0, 255, 0, 255]
+    );
+    eprintln!(
+        "6K real Vulkan 6-source: initial producer+stage={full_stage:?} stage-only={full_gpu_stage:?} scene={full_recompose:?} WSI-submission={full_present:?}; first six 1px producer+stage={patch_stage:?} stage-only={patch_gpu_stage:?} scene={patch_recompose:?} WSI-submission={patch_present:?}; second six 1px producer+stage={second_elapsed:?} stage-only={second_gpu_stage:?} scene={second_scene:?} WSI-submission={second_present:?}"
+    );
+    drop(prior_patches);
+    drop(original);
+    drop(state);
+    gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
 
