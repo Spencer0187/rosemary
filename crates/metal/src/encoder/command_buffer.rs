@@ -71,6 +71,7 @@ pub(super) unsafe extern "C" fn new_command_buffer(receiver: Id, _sel: Sel) -> I
             completion: Arc::new(CommandCompletion::new()),
             recording: true,
             profile,
+            occlusion: Occlusion::default(),
         },
     ))
 }
@@ -119,6 +120,9 @@ pub(super) unsafe extern "C" fn command_buffer_dealloc(receiver: Id, _sel: Sel) 
             &mut command.timestamps,
             vk::QueryPool::null(),
         ));
+        for pool in command.occlusion.take_pools() {
+            gpu.release_occlusion_pool(pool);
+        }
         command.retained.clear();
         for drawable in command.presents.drain(..) {
             crate::present::complete(drawable.as_id());
@@ -204,6 +208,7 @@ pub(super) unsafe extern "C" fn commit(receiver: Id, _sel: Sel) {
     let mut submission = Some(Submission {
         gpu,
         timestamps: std::mem::replace(&mut command.timestamps, vk::QueryPool::null()),
+        occlusion_pools: command.occlusion.take_pools(),
         pool: command.pool,
         command_buffer: command.command_buffer,
         fence: command.fence,

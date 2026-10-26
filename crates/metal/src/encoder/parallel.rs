@@ -109,6 +109,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
             completion: Arc::new(CommandCompletion::new()),
             recording: true,
             profile: parent.profile.clone(),
+            occlusion: Occlusion::default(),
         },
     );
     let encoder = new_encoder(child, Kind::Render);
@@ -122,6 +123,7 @@ pub(super) unsafe extern "C" fn new_sub_encoder(receiver: Id, _sel: Sel) -> Id {
     sub.in_render_pass = true;
     sub.resolve_mask = inner.resolve_mask;
     sub.depth_resolve = inner.depth_resolve;
+    sub.visibility = inner.visibility;
     parallel.children.push(child);
     encoder
 }
@@ -131,6 +133,9 @@ pub(super) fn close_secondary(command: &mut CommandBuffer) {
     if !command.secondary || command.command_buffer == vk::CommandBuffer::null() {
         return;
     }
+    command
+        .occlusion
+        .end(&command.gpu.device, command.command_buffer);
     // SAFETY: recording began when the sub-encoder was made.
     if let Err(error) = unsafe {
         command
@@ -168,6 +173,7 @@ pub(super) unsafe extern "C" fn end_parallel_encoding(receiver: Id, sel: Sel) {
                 .descriptor_pools
                 .append(&mut command.descriptor_pools);
             parent.uploads.append(&mut command.uploads);
+            parent.occlusion.adopt(&mut command.occlusion);
             command.retained_set.clear();
             parent.retained.append(&mut command.retained);
             parent.secondaries.push(gpu::SecondaryContext {

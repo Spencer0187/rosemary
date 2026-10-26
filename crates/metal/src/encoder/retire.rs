@@ -115,6 +115,7 @@ pub(super) struct CommandState {
 pub(crate) struct Submission {
     pub(super) gpu: &'static Gpu,
     pub(super) timestamps: vk::QueryPool,
+    pub(super) occlusion_pools: Vec<vk::QueryPool>,
     pub(super) pool: vk::CommandPool,
     pub(super) command_buffer: vk::CommandBuffer,
     pub(crate) fence: vk::Fence,
@@ -192,6 +193,9 @@ impl Submission {
             gpu_times = Some((self.scheduled_time.min(end), end));
         }
         self.gpu.release_timestamp_pool(self.timestamps);
+        for pool in self.occlusion_pools.drain(..) {
+            self.gpu.release_occlusion_pool(pool);
+        }
         if let Some(profile) = self.profile.take() {
             profile.finish(self.gpu, result.is_ok());
         }

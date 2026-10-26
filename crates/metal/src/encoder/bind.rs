@@ -29,6 +29,7 @@ pub(crate) fn new_encoder(command_buffer: Id, kind: Kind) -> Id {
             pending_copies: Vec::new(),
             capture_targets: Vec::new(),
             capture_pass: None,
+            visibility: None,
             render_variant: None,
             compute_variant: None,
             bound: Default::default(),
@@ -85,6 +86,9 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
     }
     if encoder.in_render_pass {
         let command = encoder.command();
+        command
+            .occlusion
+            .end(&command.gpu.device, command.command_buffer);
         // SAFETY: a render pass began when the encoder was made.
         unsafe {
             command
@@ -93,6 +97,7 @@ pub(super) unsafe extern "C" fn end_encoding(receiver: Id, _sel: Sel) {
                 .cmd_end_render_pass(command.command_buffer)
         };
         encoder.in_render_pass = false;
+        visibility::resolve(encoder);
         for copy in std::mem::take(&mut encoder.pending_copies) {
             let source = vk::ImageSubresourceLayers {
                 aspect_mask: copy.aspect,

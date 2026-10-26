@@ -8,6 +8,7 @@ mod queue;
 mod render;
 mod retire;
 mod state;
+mod visibility;
 
 use bind::*;
 use blit::*;
@@ -19,6 +20,7 @@ use queue::*;
 use render::*;
 use retire::*;
 use state::*;
+use visibility::*;
 
 use objc::address::AddressSet;
 
@@ -173,6 +175,7 @@ pub(crate) struct CommandBuffer {
     recording: bool,
     /// `ROSEMARY_METAL_PROFILE`: shared with its parallel sub-encoders.
     profile: Option<Arc<crate::profile::Profile>>,
+    occlusion: Occlusion,
 }
 
 pub(crate) struct Encoder {
@@ -209,6 +212,8 @@ pub(crate) struct Encoder {
     /// and the ordinal the capture of this pass is named by.
     capture_targets: Vec<crate::capture::Target>,
     capture_pass: Option<u64>,
+    /// Where the pass being recorded writes its visibility results.
+    visibility: Option<VisibilityTarget>,
     /// The pipeline variant the last draw or dispatch used, with the state
     /// which chose it, so a run of draws with one state asks no cache.
     render_variant: Option<(Id, RenderVariantKey, vk::Pipeline)>,
@@ -404,6 +409,7 @@ impl Default for RenderPassDescriptor {
             depth_object: std::ptr::null_mut(),
             stencil_object: std::ptr::null_mut(),
             visibility_result_buffer: std::ptr::null_mut(),
+            visibility_result_type: 0,
         }
     }
 }
@@ -577,7 +583,7 @@ pub(crate) fn install() {
         "insertDebugSignpost:" => crate::no_op, c"v24@0:8@16";
         "setLabel:" => crate::no_op, c"v24@0:8@16";
         "useResource:usage:" => crate::no_op, c"v32@0:8@16Q24";
-        "setVisibilityResultMode:offset:" => crate::no_op, c"v32@0:8Q16Q24";
+        "setVisibilityResultMode:offset:" => set_visibility_result_mode, c"v32@0:8Q16Q24";
     });
 
     let pass = object::register::<RenderPassDescriptor>(c"MTLRenderPassDescriptor");
@@ -597,6 +603,8 @@ pub(crate) fn install() {
         "stencilAttachment" => pass_single_attachment, c"@16@0:8";
         "visibilityResultBuffer" => pass_visibility_result_buffer, c"@16@0:8";
         "setVisibilityResultBuffer:" => set_pass_visibility_result_buffer, c"v24@0:8@16";
+        "visibilityResultType" => pass_visibility_result_type, c"Q16@0:8";
+        "setVisibilityResultType:" => set_pass_visibility_result_type, c"v24@0:8Q16";
         "setRenderTargetWidth:" => crate::no_op, c"v24@0:8Q16";
         "setRenderTargetHeight:" => crate::no_op, c"v24@0:8Q16";
         "setDefaultRasterSampleCount:" => crate::no_op, c"v24@0:8Q16";

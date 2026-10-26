@@ -45,11 +45,9 @@ pub(crate) struct RenderPassDescriptor {
     pub color_objects: Id,
     pub depth_object: Id,
     pub stencil_object: Id,
-    /// FIXME (ACCURACY): kept so that a guest reading the property back sees
-    /// what it set, and never written to. Occlusion queries are not
-    /// implemented, so a guest which reads the counts finds whatever the
-    /// buffer already held.
     pub visibility_result_buffer: Id,
+    /// `MTLVisibilityResultType`.
+    pub visibility_result_type: u64,
 }
 
 /// `ROSEMARY_TRACE_PASSES=1`: each distinct render pass shape, once.
@@ -703,6 +701,8 @@ pub(crate) fn begin_render_pass(
     for texture in textures {
         command.retain(texture);
     }
+    encoder.visibility = VisibilityTarget::of(descriptor);
+    command.retain(descriptor.visibility_result_buffer);
     command.framebuffers.push(framebuffer);
     let area = vk::Rect2D {
         offset: vk::Offset2D { x: 0, y: 0 },

@@ -1750,3 +1750,300 @@ fn recording_cost() {
         render.as_secs_f64() * 1e6 / DRAWS as f64,
     );
 }
+
+/// `MTLVisibilityResultMode`.
+const VISIBILITY_DISABLED: u64 = 0;
+const VISIBILITY_BOOLEAN: u64 = 1;
+const VISIBILITY_COUNTING: u64 = 2;
+
+/// The side of the target a covering draw fills, so each draw passes
+/// `COVERING_SIZE` squared samples.
+const COVERING_SIZE: u64 = 8;
+
+/// A pipeline, a one-sample target and a triangle which covers all of it.
+struct CoveringDraw {
+    state: Id,
+    target: Id,
+    vertices: Id,
+    queue: Id,
+}
+
+/// The triangle program and target of `a_translated_triangle_draws_on_the_gpu`,
+/// or `None` where the device cannot count samples exactly.
+fn covering_draw(device: Id) -> Option<CoveringDraw> {
+    let gpu = gpu_of(device).expect("a Vulkan device");
+    if !gpu.occlusion_precise {
+        return None;
+    }
+    let library = retain_library(device, triangle_library(), None, vec![0, 0], None);
+    // SAFETY: a library this test made.
+    let (vertex, fragment) = unsafe {
+        (
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_vertex"),
+            ),
+            new_function_with_name(
+                library,
+                std::ptr::null(),
+                foundation::string::from_str("triangle_fragment"),
+            ),
+        )
+    };
+    let vertex_descriptor = object::make(
+        c"MTLVertexDescriptor",
+        resource::VertexDescriptor {
+            layouts: [resource::VertexLayout::default(); resource::VERTEX_SLOTS],
+            attributes: [resource::VertexAttribute::default(); resource::VERTEX_SLOTS],
+            layout_objects: std::ptr::null_mut(),
+            attribute_objects: std::ptr::null_mut(),
+        },
+    );
+    let descriptor = object::make(
+        c"MTLRenderPipelineDescriptor",
+        pipeline::RenderPipelineDescriptor {
+            vertex_function: vertex,
+            fragment_function: fragment,
+            vertex_descriptor,
+            colors: [pipeline::ColorAttachment::fresh(); pipeline::COLOR_ATTACHMENTS],
+            depth_format: 0,
+            stencil_format: 0,
+            sample_count: 1,
+            alpha_to_coverage: false,
+            color_objects: std::ptr::null_mut(),
+        },
+    );
+    let mut error = std::ptr::null_mut();
+    // SAFETY: objects this test made, sent the selectors they implement.
+    let state = unsafe {
+        let layouts = send(vertex_descriptor, "layouts");
+        send_number(element_at(layouts, 0), "setStride:", 16);
+        let attribute = element_at(send(vertex_descriptor, "attributes"), 0);
+        send_number(attribute, "setFormat:", 31); // MTLVertexFormatFloat4
+        send_number(attribute, "setOffset:", 0);
+        send_number(attribute, "setBufferIndex:", 0);
+        let colors = send(descriptor, "colorAttachments");
+        send_number(element_at(colors, 0), "setPixelFormat:", 80); // BGRA8Unorm
+        new_render_pipeline(device, std::ptr::null(), descriptor, &mut error)
+    };
+    assert!(!state.is_null(), "render pipeline creation failed");
+    let target = resource::new_texture(
+        gpu,
+        resource::TextureDescriptor {
+            texture_type: 2,
+            pixel_format: 80,
+            width: COVERING_SIZE,
+            height: COVERING_SIZE,
+            depth: 1,
+            mipmap_level_count: 1,
+            sample_count: 1,
+            array_length: 1,
+            storage_mode: 2,
+            usage: gpu::USAGE_RENDER_TARGET,
+        },
+    );
+    // SAFETY: the same calls the guest makes.
+    let (vertices, queue) = unsafe {
+        (
+            new_buffer(device, std::ptr::null(), 48, 0),
+            new_command_queue(device, std::ptr::null()),
+        )
+    };
+    // SAFETY: a buffer this test made, mapped over its whole length.
+    unsafe {
+        let contents = object::body::<resource::Buffer>(vertices).inner.contents as *mut f32;
+        for (index, value) in [
+            -1.0f32, -1.0, 0.0, 1.0, //
+            3.0, -1.0, 0.0, 1.0, //
+            -1.0, 3.0, 0.0, 1.0,
+        ]
+        .iter()
+        .enumerate()
+        {
+            contents.add(index).write(*value);
+        }
+    }
+    Some(CoveringDraw {
+        state,
+        target,
+        vertices,
+        queue,
+    })
+}
+
+impl CoveringDraw {
+    /// A pass clearing the target, with its visibility results in `results`.
+    fn pass(&self, results: Id) -> Id {
+        let pass = object::make(
+            c"MTLRenderPassDescriptor",
+            encoder::RenderPassDescriptor::default(),
+        );
+        // SAFETY: objects this test made, sent the selectors they implement.
+        unsafe {
+            let attachment = element_at(send(pass, "colorAttachments"), 0);
+            send_with_object(attachment, "setTexture:", self.target);
+            send_number(attachment, "setLoadAction:", 2); // Clear
+            send_number(attachment, "setStoreAction:", 1); // Store
+            send_with_object(pass, "setVisibilityResultBuffer:", results);
+        }
+        pass
+    }
+
+    /// # Safety
+    ///
+    /// `encoder` must be a render encoder inside a pass.
+    unsafe fn bind(&self, encoder: Id) {
+        unsafe {
+            send_with_object(encoder, "setRenderPipelineState:", self.state);
+            set_buffer_named(
+                encoder,
+                "setVertexBuffer:offset:atIndex:",
+                self.vertices,
+                0,
+                0,
+            );
+        }
+    }
+}
+
+/// A shared buffer of `words` results, each holding `value`.
+fn results_buffer(device: Id, words: usize, value: u64) -> Id {
+    // SAFETY: the same call the guest makes.
+    let buffer = unsafe { new_buffer(device, std::ptr::null(), words * 8, 0) };
+    for at in 0..words {
+        // SAFETY: a buffer this test made, mapped over its whole length.
+        unsafe {
+            (object::body::<resource::Buffer>(buffer).inner.contents as *mut u64)
+                .add(at)
+                .write(value)
+        };
+    }
+    buffer
+}
+
+fn result_at(buffer: Id, at: usize) -> u64 {
+    // SAFETY: a shared buffer this test made, read after its work completed.
+    unsafe {
+        (object::body::<resource::Buffer>(buffer).inner.contents as *const u64)
+            .add(at)
+            .read()
+    }
+}
+
+/// # Safety
+///
+/// `encoder` must be an `RosemaryMTLCommandEncoder`.
+unsafe fn set_visibility_mode(encoder: Id, mode: u64, offset: u64) {
+    let sel = objc::sel::get("setVisibilityResultMode:offset:");
+    // SAFETY: an object the runtime allocated.
+    let method = unsafe { objc::object::class_of(encoder) }
+        .and_then(|class| class.method(sel))
+        .expect("the selector is registered");
+    // SAFETY: the registered signature.
+    let call: unsafe extern "C" fn(Id, Sel, u64, u64) =
+        unsafe { std::mem::transmute(method.implementation()) };
+    unsafe { call(encoder, sel, mode, offset) };
+}
+
+/// Runs at one offset in one pass add up, a disabled run is not counted, and
+/// an offset the pass never names keeps what it held.
+#[test]
+fn visibility_results_add_each_offsets_runs_in_a_pass() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    const UNTOUCHED: u64 = 0xabab_abab_abab_abab;
+    let results = results_buffer(device, 3, UNTOUCHED);
+    let pass = fixture.pass(results);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+        draw(render, 3);
+        set_visibility_mode(render, VISIBILITY_DISABLED, 0);
+        draw(render, 3);
+        set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+        draw(render, 3);
+        set_visibility_mode(render, VISIBILITY_BOOLEAN, 8);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    assert_eq!(result_at(results, 0), 2 * COVERING_SIZE * COVERING_SIZE);
+    assert_ne!(result_at(results, 1), 0);
+    assert_eq!(result_at(results, 2), UNTOUCHED);
+}
+
+/// `MTLVisibilityResultTypeAccumulate` adds to the count already in the
+/// buffer rather than starting from zero.
+#[test]
+fn an_accumulating_pass_adds_to_the_held_result() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    const HELD: u64 = 5;
+    let results = results_buffer(device, 1, HELD);
+    let pass = fixture.pass(results);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        send_number(pass, "setVisibilityResultType:", 1); // Accumulate
+        let command = send(fixture.queue, "commandBuffer");
+        let render = render_encoder(command, pass);
+        fixture.bind(render);
+        set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+        draw(render, 3);
+        send_void(render, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    assert_eq!(result_at(results, 0), HELD + COVERING_SIZE * COVERING_SIZE);
+}
+
+/// Each parallel sub-encoder records its own queries, and the pass sums them
+/// all into the one offset they name.
+#[test]
+fn parallel_sub_encoders_add_into_one_result() {
+    isolate_metal_fixture!();
+    let Some(device) = gpu_device() else {
+        return;
+    };
+    let Some(fixture) = covering_draw(device) else {
+        return;
+    };
+    let results = results_buffer(device, 1, 0);
+    let pass = fixture.pass(results);
+    // SAFETY: objects this test made, sent the selectors they implement.
+    unsafe {
+        let command = send(fixture.queue, "commandBuffer");
+        let sel = objc::sel::get("parallelRenderCommandEncoderWithDescriptor:");
+        let method = objc::object::class_of(command)
+            .and_then(|class| class.method(sel))
+            .expect("the selector is registered");
+        let call: unsafe extern "C" fn(Id, Sel, Id) -> Id =
+            std::mem::transmute(method.implementation());
+        let parallel = call(command, sel, pass);
+        for _ in 0..2 {
+            let render = send(parallel, "renderCommandEncoder");
+            fixture.bind(render);
+            set_visibility_mode(render, VISIBILITY_COUNTING, 0);
+            draw(render, 3);
+            send_void(render, "endEncoding");
+        }
+        send_void(parallel, "endEncoding");
+        send_void(command, "commit");
+        send_void(command, "waitUntilCompleted");
+    }
+    assert_eq!(result_at(results, 0), 2 * COVERING_SIZE * COVERING_SIZE);
+}

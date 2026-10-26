@@ -42,6 +42,7 @@ struct DeviceCapabilities {
     /// Whether `VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE` is legal, as
     /// the Vulkan 1.2 feature bit rather than the extension.
     sampler_mirror_clamp_to_edge: bool,
+    host_query_reset: bool,
 }
 
 /// What `VK_KHR_depth_stencil_resolve` - core in Vulkan 1.2 - can do on this
@@ -116,6 +117,12 @@ pub struct Gpu {
     timestamp_pools: Mutex<Vec<vk::QueryPool>>,
     timestamp_period: f32,
     timestamp_valid_bits: u32,
+    /// Occlusion query pools whose submission has retired.
+    occlusion_pools: Mutex<Vec<vk::QueryPool>>,
+    /// Whether an occlusion query can count samples rather than only say
+    /// whether any passed.
+    pub(crate) occlusion_precise: bool,
+    host_query_reset: bool,
     /// Command pools, descriptor pools and upload chunks whose submission has
     /// retired, kept for the next command buffer. A game commits several
     /// command buffers a frame, and creating and destroying each one's pool,
@@ -233,6 +240,10 @@ const RECYCLED: usize = 32;
 /// copy to four kilobytes, so a chunk holds a frame's worth of them.
 pub const UPLOAD_CHUNK: u64 = 256 << 10;
 
+/// How many occlusion queries one pool holds; a command buffer which needs
+/// more takes another pool.
+pub const OCCLUSION_QUERIES: u32 = 256;
+
 fn create_device(
     instance: &Instance,
     physical: vk::PhysicalDevice,
@@ -263,6 +274,7 @@ fn create_device(
         shader_float16: target.shader_float16.into(),
         shader_int8: target.shader_int8.into(),
         sampler_mirror_clamp_to_edge: capabilities.sampler_mirror_clamp_to_edge.into(),
+        host_query_reset: capabilities.host_query_reset.into(),
         ..Default::default()
     };
     let mut v13 = vk::PhysicalDeviceVulkan13Features {
@@ -508,14 +520,20 @@ impl Gpu {
         // carries it as an optional feature bit, and the extension which
         // preceded it needs no bit at all - only enabling. Prefer the bit,
         // and fall back to the extension where the device reports it instead.
-        let mirror_clamp_feature = target.vulkan_version >= (1, 2) && {
+        let v12 = (target.vulkan_version >= (1, 2)).then(|| {
             let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
             let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut v12);
             // SAFETY: the device reports Vulkan 1.2 and both structures live
             // across the query.
             unsafe { instance.get_physical_device_features2(physical, &mut features) };
-            v12.sampler_mirror_clamp_to_edge == vk::TRUE
-        };
+            v12
+        });
+        let mirror_clamp_feature =
+            v12.is_some_and(|v12| v12.sampler_mirror_clamp_to_edge == vk::TRUE);
+        // Occlusion query pools are reset from the host: a parallel render
+        // sub-encoder begins its queries inside a pass, where no reset can be
+        // recorded.
+        let host_query_reset = v12.is_some_and(|v12| v12.host_query_reset == vk::TRUE);
         let (mirror_clamp_feature, mirror_clamp_extension) = mirror_clamp_support(
             mirror_clamp_feature,
             has(ash::khr::sampler_mirror_clamp_to_edge::NAME),
@@ -660,6 +678,7 @@ impl Gpu {
                 vertex_attribute_divisor: max_vertex_attribute_divisor != 0,
                 swapchain_maintenance1,
                 sampler_mirror_clamp_to_edge: mirror_clamp_feature,
+                host_query_reset,
             },
         )?;
         // SAFETY: the family was requested above with one queue.
@@ -725,6 +744,9 @@ impl Gpu {
             timestamp_pools: Mutex::new(Vec::new()),
             timestamp_period: properties.limits.timestamp_period,
             timestamp_valid_bits: families[queue_family as usize].timestamp_valid_bits,
+            occlusion_pools: Mutex::new(Vec::new()),
+            occlusion_precise: features.occlusion_query_precise == vk::TRUE,
+            host_query_reset,
             contexts: Mutex::new(Vec::new()),
             secondaries: Mutex::new(Vec::new()),
             context_budget: ContextBudget::new(),
