@@ -509,6 +509,7 @@ fn destroy_sdl_window(sdl: sdl3::Window) {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|window| *window != member as usize);
         crate::backing::forget_window(member);
+        crate::view::forget_metal_scene(member);
         crate::screen::forget_relative_pointer(member);
         for hook in &hooks {
             hook(member);
@@ -2327,6 +2328,9 @@ pub(crate) unsafe extern "C" fn dealloc(receiver: Id, sel: Sel) {
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(p, c)| *p != receiver as usize && *c != receiver as usize);
     let window = window_of(receiver);
+    if !window.sdl.is_null() {
+        crate::view::forget_metal_scene(window.sdl);
+    }
     objc::arc::release(std::mem::replace(
         &mut window.appearance,
         std::ptr::null_mut(),

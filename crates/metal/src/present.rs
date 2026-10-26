@@ -3,7 +3,7 @@ use objc::object::Id;
 use objc::sel::Sel;
 
 use crate::constants::*;
-use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
+use crate::gpu::{self, Gpu, ImageDescription};
 use crate::object::{self, methods};
 use crate::resource::Texture;
 
@@ -85,11 +85,6 @@ pub(crate) struct Drawable {
     pub gpu: &'static Gpu,
     pub texture: Id,
     pub layer: Id,
-    /// The buffer the frame is read back into, kept for the life of the
-    /// drawable. Making one per frame is a `vkCreateBuffer` and a range of the
-    /// heap for every frame, and the drawable's size never changes: a layer
-    /// which resizes vends a new drawable.
-    readback: Option<crate::gpu::GpuBuffer>,
 }
 
 /// Three drawable images let the guest record ahead without ever writing an
@@ -349,7 +344,6 @@ fn make_drawable(
             gpu,
             texture,
             layer: objc::arc::retain(layer),
-            readback: None,
         },
     );
     if drawable.is_null() {
@@ -468,9 +462,6 @@ unsafe extern "C" fn drawable_present(receiver: Id, _sel: Sel) {
 unsafe extern "C" fn drawable_dealloc(receiver: Id, _sel: Sel) {
     // SAFETY: a drawable of this crate's.
     let drawable = unsafe { object::body::<Drawable>(receiver) };
-    if let Some(readback) = drawable.readback.take() {
-        drawable.gpu.destroy_buffer(readback);
-    }
     // The texture owns the drawable's image, and destroys it in its own
     // `dealloc`.
     objc::arc::release(std::mem::replace(
@@ -1099,6 +1090,106 @@ fn present_readback(drawable: Id) {
     crate::stats::tick();
 }
 
+// The immediate submission must keep BOTH the mapped target and the
+// drawable's texture alive when a successful submit has an uncertain wait.
+// The old drawable-local reused target could be destroyed/reused early.
+struct ReadbackOwner {
+    gpu: &'static Gpu,
+    buffer: Option<crate::gpu::GpuBuffer>,
+    texture: usize,
+}
+
+impl Drop for ReadbackOwner {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.gpu.destroy_buffer(buffer);
+        }
+        objc::arc::release(self.texture as Id);
+    }
+}
+
+fn submit_owned_readback(
+    gpu: &'static Gpu,
+    texture_id: Id,
+    image: vk::Image,
+    width: u32,
+    height: u32,
+) -> Result<std::sync::Arc<std::sync::Mutex<ReadbackOwner>>, String> {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+
+    let staging = match gpu.create_buffer(bytes) {
+        Ok(buffer) => buffer,
+        Err(reason) => return Err(format!("presentation staging failed: {reason}")),
+    };
+    // This strong owner survives drawable completion/teardown until the GPU
+    // actually signals its readback fence; it never reuses uncertain storage.
+    let staging = std::sync::Arc::new(std::sync::Mutex::new(ReadbackOwner {
+        gpu,
+        buffer: Some(staging),
+        texture: objc::arc::retain(texture_id) as usize,
+    }));
+    #[cfg(test)]
+    {
+        *LAST_READBACK_OWNER.lock().unwrap() = Some(std::sync::Arc::downgrade(&staging));
+    }
+    let copy = vk::BufferImageCopy::default()
+        .buffer_offset(0)
+        .buffer_row_length(width)
+        .buffer_image_height(height)
+        .image_subresource(vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        })
+        .image_extent(vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        });
+    gpu.one_shot_owned(
+        std::sync::Arc::clone(&staging),
+        |device, command_buffer, staging| {
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                });
+            // SAFETY: recording into a command buffer the call owns; the image
+            // is in GENERAL layout from creation.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[barrier],
+                );
+                device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    staging.lock().unwrap().buffer.as_ref().unwrap().buffer,
+                    &[copy],
+                )
+            };
+        },
+    )?;
+    Ok(staging)
+}
+
 fn present_inner(drawable: Id) {
     if drawable.is_null() || !object::is_kind(drawable, c"RosemaryCAMetalDrawable") {
         return;
@@ -1132,90 +1223,36 @@ fn present_inner(drawable: Id) {
     let width = texture.image.width;
     let height = texture.image.height;
     let bytes = u64::from(width) * u64::from(height) * 4;
-
-    if described.readback.is_none() {
-        match gpu.create_buffer(bytes) {
-            Ok(staging) => described.readback = Some(staging),
-            Err(reason) => return gpu::trace(format!("presentation staging failed: {reason}")),
-        }
-    }
-    let staging = described.readback.as_ref().expect("just made");
-    let copy = vk::BufferImageCopy::default()
-        .buffer_offset(0)
-        .buffer_row_length(width)
-        .buffer_image_height(height)
-        .image_subresource(vk::ImageSubresourceLayers {
-            aspect_mask: vk::ImageAspectFlags::COLOR,
-            mip_level: 0,
-            base_array_layer: 0,
-            layer_count: 1,
-        })
-        .image_extent(vk::Extent3D {
-            width,
-            height,
-            depth: 1,
-        });
-    let image = texture.image.image;
     let result = crate::stats::timed(crate::stats::Counter::ReadbackMicros, || {
-        gpu.one_shot(|device, command_buffer| {
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::GENERAL)
-                .new_layout(vk::ImageLayout::GENERAL)
-                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                });
-            // SAFETY: recording into a command buffer the call owns; the image
-            // is in GENERAL layout from creation.
-            unsafe {
-                device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[barrier],
-                );
-                device.cmd_copy_image_to_buffer(
-                    command_buffer,
-                    image,
-                    vk::ImageLayout::GENERAL,
-                    staging.buffer,
-                    &[copy],
+        submit_owned_readback(gpu, described.texture, texture.image.image, width, height)
+    });
+    match result {
+        Err(reason) => gpu::trace(format!("presentation readback failed: {reason}")),
+        Ok(staging) => {
+            // SAFETY: the readback completed and the staging buffer is mapped over
+            // the whole allocation.
+            let pixels = unsafe {
+                std::slice::from_raw_parts(
+                    staging.lock().unwrap().buffer.as_ref().unwrap().contents,
+                    bytes as usize,
                 )
             };
-        })
-    });
-    if let Err(reason) = result {
-        gpu::trace(format!("presentation readback failed: {reason}"));
-    } else {
-        // SAFETY: the readback completed and the staging buffer is mapped over
-        // the whole allocation.
-        let pixels = unsafe { std::slice::from_raw_parts(staging.contents, bytes as usize) };
-        gpu::milestone("presented frame");
-        crate::stats::frame();
-        dump_frame(pixels, width, height, texture.image.format);
-        if let Some(window) = window {
-            if let Some(properties) = sdl3::video::presentation_window(window) {
-                enqueue_completed_readback(ReadbackFrame {
-                    window: window as usize,
-                    window_id: properties.id,
-                    layer: described.layer as usize,
-                    pixels: pixels.to_vec(),
-                    width,
-                    height,
-                    format: texture.image.format,
-                    placement,
-                });
+            gpu::milestone("presented frame");
+            crate::stats::frame();
+            dump_frame(pixels, width, height, texture.image.format);
+            if let Some(window) = window {
+                if let Some(properties) = sdl3::video::presentation_window(window) {
+                    enqueue_completed_readback(ReadbackFrame {
+                        window: window as usize,
+                        window_id: properties.id,
+                        layer: described.layer as usize,
+                        pixels: pixels.to_vec(),
+                        width,
+                        height,
+                        format: texture.image.format,
+                        placement,
+                    });
+                }
             }
         }
     }
@@ -1472,10 +1509,12 @@ fn send_size(receiver: Id, selector: &str) -> (f64, f64) {
 pub(crate) fn install() {
     appkit::bootstrap();
     appkit::backing::set_presenter(present_store);
+    appkit::view::set_metal_scene_changed(crate::swapchain::scene_changed);
     appkit::backing::set_importer(crate::overlay::importer);
     appkit::event::add_pump_hook(flush_readbacks);
     appkit::event::add_modal_presentation_hook(flush_readbacks);
     appkit::window::add_destroy_hook(forget_window);
+    appkit::window::add_destroy_hook(appkit::view::forget_metal_scene);
     object::register::<Drawable>(c"RosemaryCAMetalDrawable");
     let drawable = objc::class::lookup(c"RosemaryCAMetalDrawable").expect("just registered");
     methods!(drawable, {
@@ -1498,25 +1537,397 @@ unsafe extern "C" fn drawable_id(_receiver: Id, _sel: Sel) -> u64 {
     0
 }
 
+/// Allocate an owned upload source; its allocation remains alive until
+/// every window presentation that refers to it finishes its source copy.
+fn make_backing_source(
+    gpu: &'static Gpu,
+    width: u32,
+    height: u32,
+    window: Option<usize>,
+) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String> {
+    let description = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width,
+        height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    match window {
+        Some(window) => {
+            crate::swapchain::BackingImageLease::create_for_window(gpu, window, &description)
+        }
+        None => gpu
+            .create_image(&description)
+            .map(|image| crate::swapchain::BackingImageLease::new(gpu, image)),
+    }
+}
+
+fn make_blended_source(
+    gpu: &'static Gpu,
+    width: u32,
+    height: u32,
+    window: Option<usize>,
+) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String> {
+    let description = crate::overlay::target_description(width, height);
+    match window {
+        Some(window) => {
+            crate::swapchain::BackingImageLease::create_for_window(gpu, window, &description)
+        }
+        None => gpu
+            .create_image(&description)
+            .map(|image| crate::swapchain::BackingImageLease::new(gpu, image)),
+    }
+}
+
+// A 4K BGRA8 image occupies about 31.6 MiB of pixel payload. This allowance
+// covers both reusable source pools together, not each pool independently.
+// GPU allocation requirements may exceed the payload due to alignment.
+const STORE_SOURCE_BUDGET_BYTES: u64 = 192 * 1024 * 1024;
+const MAX_IMAGES_PER_STORE_POOL: usize = 8;
+
+fn store_source_bytes(width: u32, height: u32) -> u64 {
+    u64::from(width)
+        .saturating_mul(u64::from(height))
+        .saturating_mul(4)
+}
+
+fn budget_allows_store_source(current_images: usize, bytes_per_image: u64) -> bool {
+    (current_images as u64)
+        .saturating_add(1)
+        .saturating_mul(bytes_per_image)
+        <= STORE_SOURCE_BUDGET_BYTES
+}
+
+/// Select an image that no compositor copy can still read. If every existing
+/// source is busy, allow another only within both the pool count and combined
+/// per-window pixel-storage allowance. Defer rather than overwriting busy GPU
+/// memory when the allowance is exhausted.
+fn reserve_backing_source(
+    image: &mut std::sync::Arc<crate::swapchain::BackingImageLease>,
+    spare: &mut Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
+    current_images: usize,
+    bytes_per_image: u64,
+    create: impl FnOnce() -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, String>,
+) -> Result<bool, String> {
+    if std::sync::Arc::strong_count(image) == 1 {
+        return Ok(true);
+    }
+    let available = spare
+        .iter()
+        .position(|candidate| std::sync::Arc::strong_count(candidate) == 1);
+    let replacement = if let Some(at) = available {
+        spare.swap_remove(at)
+    } else {
+        if spare.len() + 1 >= MAX_IMAGES_PER_STORE_POOL
+            || !budget_allows_store_source(current_images, bytes_per_image)
+        {
+            return Ok(false);
+        }
+        create()?
+    };
+    spare.push(std::mem::replace(image, replacement));
+    Ok(true)
+}
+
+// A backing upload may outlive its StoreImage when a fence wait fails. The
+// buffer AND its charged allocation retire together only after completion.
+struct StoreStaging {
+    gpu: &'static Gpu,
+    buffer: Option<gpu::GpuBuffer>,
+    _charge: Option<crate::swapchain::GpuCharge>,
+}
+
+impl Drop for StoreStaging {
+    fn drop(&mut self) {
+        if let Some(buffer) = self.buffer.take() {
+            self.gpu.destroy_buffer(buffer);
+        }
+    }
+}
+
 /// A window's CPU-drawn contents on the device: see [`present_store`].
 struct StoreImage {
     gpu: &'static Gpu,
-    image: GpuImage,
-    staging: gpu::GpuBuffer,
+    account_window: Option<usize>,
+    image: std::sync::Arc<crate::swapchain::BackingImageLease>,
+    /// Recycle images only after every WSI copy and idle snapshot releases them.
+    spare: Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
+    staging: Option<std::sync::Arc<std::sync::Mutex<StoreStaging>>>,
     /// The store with dma-buf overlays blended over it, made the first time
     /// the window has any.
-    blended: Option<GpuImage>,
+    blended: Option<std::sync::Arc<crate::swapchain::BackingImageLease>>,
+    blended_spare: Vec<std::sync::Arc<crate::swapchain::BackingImageLease>>,
 }
 
 impl StoreImage {
+    /// Select an image no outstanding WSI copy can read. An occluded window
+    /// can exhaust the pool; return `Ok(false)` so the store worker retries
+    /// without holding up AppKit or allocating images without bound.
+    fn total_source_images(&self) -> usize {
+        1 + self.spare.len() + usize::from(self.blended.is_some()) + self.blended_spare.len()
+    }
+
+    fn reserve_upload_source(&mut self) -> Result<bool, String> {
+        let (width, height) = (self.image.width, self.image.height);
+        let current_images = self.total_source_images();
+        let account_window = self.account_window;
+        reserve_backing_source(
+            &mut self.image,
+            &mut self.spare,
+            current_images,
+            store_source_bytes(width, height),
+            || make_backing_source(self.gpu, width, height, account_window),
+        )
+    }
+
+    fn reserve_blended_source(&mut self) -> Result<bool, String> {
+        let (width, height) = (self.image.width, self.image.height);
+        if self.blended.is_none() {
+            // Even the first blend image must fit. Do not give mandatory
+            // backing images an unbounded exception to aggregate ownership.
+            if !budget_allows_store_source(
+                self.total_source_images(),
+                store_source_bytes(width, height),
+            ) {
+                return Ok(false);
+            }
+            self.blended = Some(make_blended_source(
+                self.gpu,
+                width,
+                height,
+                self.account_window,
+            )?);
+        }
+        let current_images = self.total_source_images();
+        let blended = self.blended.as_mut().expect("made above");
+        let account_window = self.account_window;
+        reserve_backing_source(
+            blended,
+            &mut self.blended_spare,
+            current_images,
+            store_source_bytes(width, height),
+            || make_blended_source(self.gpu, width, height, account_window),
+        )
+    }
+
     /// Every presentation that could name one of its images has finished.
     fn destroy(self) {
-        self.gpu.destroy_buffer(self.staging);
-        self.gpu.destroy_image(self.image);
-        if let Some(blended) = self.blended {
-            self.gpu.destroy_image(blended);
-        }
+        // All regular and blended sources have ref-counted GPU lifetimes;
+        // the WSI worker may still be reading one when this store retires.
     }
+}
+
+#[cfg(test)]
+#[test]
+fn backing_store_budget_adapts_to_resolution_across_both_pools() {
+    let image4k = store_source_bytes(3840, 2160);
+    assert_eq!(image4k, 33_177_600);
+    assert!(budget_allows_store_source(5, image4k));
+    assert!(!budget_allows_store_source(6, image4k));
+    assert!(budget_allows_store_source(
+        23,
+        store_source_bytes(1920, 1080)
+    ));
+    assert!(!budget_allows_store_source(
+        24,
+        store_source_bytes(1920, 1080)
+    ));
+    let image8k = store_source_bytes(7680, 4320);
+    assert!(!budget_allows_store_source(2, image8k));
+    assert!(store_source_bytes(u32::MAX, u32::MAX) > STORE_SOURCE_BUDGET_BYTES);
+}
+
+/// Explicitly opt in to a real 4K GPU allocation stress case; it is not
+/// suitable for every CI GPU's available memory. The two pools share the same
+/// byte allowance, including when each has in-flight source leases.
+#[cfg(test)]
+#[test]
+fn real_4k_backing_and_overlay_pools_respect_combined_budget() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN_BUDGET").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .expect("Vulkan adapter")
+        .first()
+        .expect("GPU")
+        .gpu()
+        .expect("GPU device");
+    let dimensions = (3840, 2160);
+    let image =
+        make_backing_source(gpu, dimensions.0, dimensions.1, None).expect("4K backing image");
+    let staging = gpu
+        .create_buffer(store_source_bytes(dimensions.0, dimensions.1))
+        .expect("4K upload buffer");
+    let mut store = StoreImage {
+        gpu,
+        account_window: None,
+        image,
+        spare: Vec::new(),
+        staging: Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+            gpu,
+            buffer: Some(staging),
+            _charge: None,
+        }))),
+        blended: None,
+        blended_spare: Vec::new(),
+    };
+    let started = std::time::Instant::now();
+    store.reserve_blended_source().expect("4K blended image");
+    let mut regular_held = Vec::new();
+    let mut blended_held = Vec::new();
+    for _ in 0..2 {
+        regular_held.push(std::sync::Arc::clone(&store.image));
+        assert!(
+            store
+                .reserve_upload_source()
+                .expect("4K upload source rotation")
+        );
+        blended_held.push(std::sync::Arc::clone(store.blended.as_ref().unwrap()));
+        assert!(
+            store
+                .reserve_blended_source()
+                .expect("4K overlay source rotation")
+        );
+    }
+    assert_eq!(store.total_source_images(), 6);
+    let image_bytes = store_source_bytes(dimensions.0, dimensions.1);
+    assert_eq!(
+        store.total_source_images() as u64 * image_bytes,
+        199_065_600
+    );
+    regular_held.push(std::sync::Arc::clone(&store.image));
+    blended_held.push(std::sync::Arc::clone(store.blended.as_ref().unwrap()));
+    assert!(!store.reserve_upload_source().expect("4K combined budget"));
+    assert!(!store.reserve_blended_source().expect("4K combined budget"));
+    let allocation_millis = started.elapsed().as_millis();
+    // This is the real Vulkan memory requirement, including the driver's
+    // alignment, not merely the modeled RGBA8 pixel payload.
+    let allocated_vk_bytes: u64 = std::iter::once(&store.image)
+        .chain(store.spare.iter())
+        .chain(store.blended.iter())
+        .chain(store.blended_spare.iter())
+        .map(|lease| unsafe {
+            gpu.device
+                .get_image_memory_requirements(lease.image.image)
+                .size
+        })
+        .sum();
+    assert!(
+        allocated_vk_bytes <= STORE_SOURCE_BUDGET_BYTES,
+        "4K Vulkan image allocations exceeded the shared source allowance"
+    );
+    drop(regular_held);
+    drop(blended_held);
+    let old = std::sync::Arc::clone(&store.image);
+    assert!(
+        store
+            .reserve_upload_source()
+            .expect("reuse retired 4K source")
+    );
+    assert_eq!(store.total_source_images(), 6);
+    drop(old);
+    eprintln!(
+        "4K store allocation: {} images, {} bytes pixel payload ({} MiB), {} bytes Vulkan image memory requirements, {} ms wall clock; reused existing slot without allocating",
+        6,
+        6 * image_bytes,
+        6 * image_bytes / 1024 / 1024,
+        allocated_vk_bytes,
+        allocation_millis
+    );
+    store.destroy();
+}
+
+#[cfg(test)]
+#[test]
+fn backing_upload_source_pool_is_bounded_and_reuses_released_images() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Some(gpu) = crate::vulkan::adapters()
+        .ok()
+        .and_then(|a| a.first()?.gpu().ok())
+    else {
+        return;
+    };
+    let first = make_backing_source(gpu, 32, 24, None).expect("initial backing source");
+    let staging = gpu
+        .create_buffer(32 * 24 * 4)
+        .expect("upload staging buffer");
+    let mut store = StoreImage {
+        gpu,
+        account_window: None,
+        image: first,
+        spare: Vec::new(),
+        staging: Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+            gpu,
+            buffer: Some(staging),
+            _charge: None,
+        }))),
+        blended: None,
+        blended_spare: Vec::new(),
+    };
+    let mut retained = Vec::new();
+    for index in 0..8 {
+        retained.push(std::sync::Arc::clone(&store.image));
+        let expected = index < 7;
+        assert_eq!(
+            store
+                .reserve_upload_source()
+                .expect("bounded pool allocation"),
+            expected,
+            "unexpected source pool capacity"
+        );
+    }
+    assert_eq!(store.spare.len(), 7);
+    assert!(!store.reserve_upload_source().expect("bounded pool"));
+    drop(retained);
+    let current = std::sync::Arc::clone(&store.image);
+    assert!(
+        store
+            .reserve_upload_source()
+            .expect("reuse released pool slot")
+    );
+    assert!(!std::sync::Arc::ptr_eq(&current, &store.image));
+    drop(current);
+    // The overlay output has an independent pool, including when the base
+    // backing upload remains unretained and is reused each frame.
+    assert!(
+        store
+            .reserve_blended_source()
+            .expect("initial blended source")
+    );
+    let mut blended_held = Vec::new();
+    for index in 0..8 {
+        blended_held.push(std::sync::Arc::clone(store.blended.as_ref().unwrap()));
+        assert_eq!(
+            store
+                .reserve_blended_source()
+                .expect("bounded blended pool"),
+            index < 7,
+            "blended GPU sources exceeded the fixed cap"
+        );
+    }
+    assert_eq!(store.blended_spare.len(), 7);
+    drop(blended_held);
+    let blended_old = std::sync::Arc::clone(store.blended.as_ref().unwrap());
+    assert!(
+        store
+            .reserve_blended_source()
+            .expect("reuse idle blended source")
+    );
+    assert!(!std::sync::Arc::ptr_eq(
+        &blended_old,
+        store.blended.as_ref().unwrap()
+    ));
+    drop(blended_old);
+    store.destroy();
 }
 
 // SAFETY: Vulkan handles and a permanent mapping, used under `STORE_IMAGES`.
@@ -1524,14 +1935,102 @@ unsafe impl Send for StoreImage {}
 
 /// Keyed by the SDL window's address.
 static STORE_IMAGES: std::sync::Mutex<Vec<(usize, StoreImage)>> = std::sync::Mutex::new(Vec::new());
+#[cfg(test)]
+static TEST_STORE_UPLOAD_SUBMISSIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn backing_upload_submissions_for_test() -> usize {
+    TEST_STORE_UPLOAD_SUBMISSIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn hold_every_blended_source_for_test(
+    window: sdl3::Window,
+) -> Vec<std::sync::Arc<crate::swapchain::BackingImageLease>> {
+    let mut stores = STORE_IMAGES.lock().expect("store images");
+    let entry = &mut stores
+        .iter_mut()
+        .find(|(key, _)| *key == window as usize)
+        .expect("active backing store")
+        .1;
+    let mut retained = Vec::new();
+    loop {
+        retained.push(std::sync::Arc::clone(
+            entry.blended.as_ref().expect("initial blended frame"),
+        ));
+        if !entry.reserve_blended_source().expect("source pool") {
+            break;
+        }
+    }
+    assert_eq!(1 + entry.blended_spare.len(), MAX_IMAGES_PER_STORE_POOL);
+    retained
+}
+
+#[cfg(test)]
+pub(crate) fn backing_store_blended_for_test(
+    window: sdl3::Window,
+) -> Option<std::sync::Arc<crate::swapchain::BackingImageLease>> {
+    STORE_IMAGES
+        .lock()
+        .expect("store images")
+        .iter()
+        .find(|(key, _)| *key == window as usize)
+        .and_then(|(_, entry)| entry.blended.as_ref().cloned())
+}
+
+#[cfg(test)]
+pub(crate) fn backing_store_image_for_test(
+    window: sdl3::Window,
+) -> Option<(std::sync::Arc<crate::swapchain::BackingImageLease>, usize)> {
+    STORE_IMAGES
+        .lock()
+        .expect("store images")
+        .iter()
+        .find(|(key, _)| *key == window as usize)
+        .map(|(_, entry)| (std::sync::Arc::clone(&entry.image), entry.spare.len()))
+}
+
+#[cfg(test)]
+pub(crate) fn forget_backing_store_for_test(window: sdl3::Window) {
+    forget_window(window);
+}
 
 /// CPU backing-store contents and overlay references owned through completion
 /// of an asynchronous GPU upload. The SDL event thread only copies the bytes.
+/// On the AppKit thread, omit only DMA-BUF overlays that the native-scene
+/// compositor has already captured as independent ordered sources. Both
+/// generation equality and ownership comparisons must use this same filter.
+fn unflattened_dma_overlays(
+    window: sdl3::Window,
+    overlays: &[appkit::backing::GpuOverlay],
+) -> Vec<appkit::backing::GpuOverlay> {
+    let separate = appkit::backing::native_dma_above_metal(window);
+    filter_native_overlay_instances(overlays, &separate)
+}
+
+/// Filter presentation instances, not the (possibly shared) DMA allocation.
+fn filter_native_overlay_instances(
+    overlays: &[appkit::backing::GpuOverlay],
+    separate_views: &[usize],
+) -> Vec<appkit::backing::GpuOverlay> {
+    overlays
+        .iter()
+        .filter(|overlay| !separate_views.contains(&overlay.view))
+        .map(|overlay| appkit::backing::GpuOverlay {
+            picture: std::sync::Arc::clone(&overlay.picture),
+            rect: overlay.rect,
+            view: overlay.view,
+        })
+        .collect()
+}
+
 struct StoreUpload {
     window: usize,
     identity: u32,
     generation: u64,
-    store: appkit::backing::Store,
+    underlay: Option<std::sync::Arc<appkit::backing::Store>>,
+    store: std::sync::Arc<appkit::backing::Store>,
     holes: Vec<appkit::backing::Hole>,
     overlays: Vec<appkit::backing::GpuOverlay>,
 }
@@ -1544,21 +2043,26 @@ impl StoreUpload {
         holes: &[appkit::backing::Hole],
         overlays: &[appkit::backing::GpuOverlay],
     ) -> Self {
-        let mut owned = appkit::backing::Store::new(store.width, store.height);
-        owned.pixels.clone_from(&store.pixels);
+        // A scene-only native foreground update changes the flattened store
+        // but does not change the immutable underlying source. Share its Arc
+        // without a second full-window CPU allocation or copy.
+        let underlay = appkit::backing::gpu_under_metal_cached(window, store);
+        let owned = underlay
+            .as_ref()
+            .map(std::sync::Arc::clone)
+            .unwrap_or_else(|| {
+                let mut copy = appkit::backing::Store::new(store.width, store.height);
+                copy.pixels.clone_from(&store.pixels);
+                std::sync::Arc::new(copy)
+            });
         Self {
             window: window as usize,
             identity,
             generation: store.generation(),
+            underlay,
             store: owned,
             holes: holes.to_vec(),
-            overlays: overlays
-                .iter()
-                .map(|overlay| appkit::backing::GpuOverlay {
-                    picture: std::sync::Arc::clone(&overlay.picture),
-                    rect: overlay.rect,
-                })
-                .collect(),
+            overlays: unflattened_dma_overlays(window, overlays),
         }
     }
 
@@ -1569,10 +2073,17 @@ impl StoreUpload {
         holes: &[appkit::backing::Hole],
         overlays: &[appkit::backing::GpuOverlay],
     ) -> bool {
-        // Not the pixels, which would compare a whole store on the event
-        // thread for every finished upload.
+        // Not the pixels: a cached bottom source remains identical even when
+        // the flattened fallback changes for an independent native foreground.
+        let underlay = appkit::backing::gpu_under_metal_cached(self.window as sdl3::Window, store);
+        let same_underlay = match (&self.underlay, underlay) {
+            (Some(old), Some(new)) => std::sync::Arc::ptr_eq(old, &new),
+            (None, None) => self.generation == store.generation(),
+            _ => false,
+        };
+        let overlays = unflattened_dma_overlays(self.window as sdl3::Window, overlays);
         self.identity == identity
-            && self.generation == store.generation()
+            && same_underlay
             && self.store.width == store.width
             && self.store.height == store.height
             && self.holes.len() == holes.len()
@@ -1582,11 +2093,11 @@ impl StoreUpload {
                 .zip(holes)
                 .all(|(a, b)| a.layer == b.layer && a.rect == b.rect)
             && self.overlays.len() == overlays.len()
-            && self
-                .overlays
-                .iter()
-                .zip(overlays)
-                .all(|(a, b)| a.rect == b.rect && std::sync::Arc::ptr_eq(&a.picture, &b.picture))
+            && self.overlays.iter().zip(&overlays).all(|(a, b)| {
+                a.rect == b.rect
+                    && a.view == b.view
+                    && std::sync::Arc::ptr_eq(&a.picture, &b.picture)
+            })
     }
 }
 
@@ -1747,6 +2258,18 @@ fn forget_window(window: sdl3::Window) {
 }
 
 #[cfg(test)]
+pub(crate) fn store_upload_completed_outcome_for_test(
+    window: sdl3::Window,
+) -> Option<appkit::backing::PresentOutcome> {
+    let all = STORE_UPLOADS.lock().expect("store workers");
+    let worker = all.get(&(window as usize))?;
+    let state = worker.state.lock().expect("store job");
+    (!state.busy && state.pending.is_none())
+        .then(|| state.completed.as_ref().map(|(_, outcome)| *outcome))
+        .flatten()
+}
+
+#[cfg(test)]
 pub(crate) fn test_has_store_upload_worker(window: sdl3::Window) -> bool {
     STORE_UPLOADS
         .lock()
@@ -1820,6 +2343,11 @@ fn converted_vulkan_window_preserves_dirty_store_after_gpu_failure() {
 #[cfg(test)]
 #[test]
 fn lost_vulkan_gpu_retains_unconverted_window_cpu_fallback() {
+    if crate::swapchain::isolate_vulkan_graphical_test(
+        "present::lost_vulkan_gpu_retains_unconverted_window_cpu_fallback",
+    ) {
+        return;
+    }
     use appkit::backing::PresentOutcome::Fallback;
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
@@ -1925,7 +2453,13 @@ pub(crate) fn present_store(
     let earlier = match state.completed.take() {
         Some((completed, outcome)) if completed.identity == identity => match outcome {
             Fallback => return Fallback,
-            Displayed if completed.matches(identity, store, holes, overlays) => return Displayed,
+            Displayed if completed.matches(identity, store, holes, overlays) => {
+                // Keep the accepted source for the next foreground-only damage
+                // event. Taking it here would upload the same underlay again
+                // on every second native scene update.
+                state.completed = Some((completed, Displayed));
+                return Displayed;
+            }
             Displayed => DisplayedEarlier,
             _ => Deferred,
         },
@@ -1940,7 +2474,7 @@ pub(crate) fn present_store(
 
 /// Runs off the AppKit thread. Owns the CPU staging contents until one_shot
 /// completes and holds the window's SDL lifetime token through GPU teardown.
-fn present_store_synchronous(
+pub(crate) fn present_store_synchronous(
     window: sdl3::Window,
     store: &appkit::backing::Store,
     holes: &[appkit::backing::Hole],
@@ -1986,30 +2520,32 @@ fn present_store_synchronous(
             .push((old, FRAMES_RETIRED));
     }
     if at.is_none() || stale {
-        let image = match gpu.create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: store.width,
-            height: store.height,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_SHADER_READ,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        }) {
+        if store_source_bytes(store.width, store.height) > STORE_SOURCE_BUDGET_BYTES {
+            return store_failure_outcome(window);
+        }
+        let image = match make_backing_source(gpu, store.width, store.height, Some(window as usize))
+        {
             Ok(image) => image,
             Err(reason) => {
                 gpu::trace(format!("window store image creation failed: {reason}"));
                 return store_failure_outcome(window);
             }
         };
+        let staging_charge = match crate::swapchain::GpuCharge::reserve(
+            window as usize,
+            store.pixels.len() as u64,
+        ) {
+            Ok(charge) => charge,
+            Err(reason) => {
+                drop(image);
+                gpu::trace(format!("window store staging budget exhausted: {reason}"));
+                return store_failure_outcome(window);
+            }
+        };
         let staging = match gpu.create_buffer(store.pixels.len() as u64) {
             Ok(staging) => staging,
             Err(reason) => {
-                gpu.destroy_image(image);
+                drop(image);
                 gpu::trace(format!("window store staging failed: {reason}"));
                 return store_failure_outcome(window);
             }
@@ -2018,9 +2554,16 @@ fn present_store_synchronous(
             window as usize,
             StoreImage {
                 gpu,
+                account_window: Some(window as usize),
                 image,
-                staging,
+                spare: Vec::new(),
+                staging: Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+                    gpu,
+                    buffer: Some(staging),
+                    _charge: Some(staging_charge),
+                }))),
                 blended: None,
+                blended_spare: Vec::new(),
             },
         ));
     }
@@ -2029,11 +2572,82 @@ fn present_store_synchronous(
         .find(|(key, _)| *key == window as usize)
         .expect("made above")
         .1;
-    // SAFETY: the staging buffer is mapped over the store's whole length.
+    // Reused store GPU allocations cannot be overwritten while a WSI copy
+    // still owns them. The pool is capped so occluded windows cannot consume
+    // unbounded device memory.
+    match entry.reserve_upload_source() {
+        Ok(true) => {}
+        Ok(false) => return Deferred,
+        Err(reason) => {
+            gpu::trace(format!("backing-store source allocation failed: {reason}"));
+            return store_failure_outcome(window);
+        }
+    }
+    // Reserve BOTH destinations before copying CPU pixels or submitting a
+    // Vulkan upload. Otherwise an exhausted overlay pool would repeatedly
+    // upload whole frames while the store worker waits for a source lease.
+    let blend_available = if overlays.is_empty() {
+        false
+    } else {
+        #[cfg(test)]
+        let injected_allocation = TEST_BLEND_FAILURE
+            .compare_exchange(
+                1,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        #[cfg(not(test))]
+        let injected_allocation = false;
+        let reserve = if injected_allocation {
+            Err("injected blended-image allocation failure".into())
+        } else {
+            entry.reserve_blended_source()
+        };
+        match reserve {
+            Ok(true) => true,
+            Ok(false) => return Deferred,
+            Err(reason) => {
+                gpu::trace(format!("no image to blend overlays into: {reason}"));
+                return Deferred; // An incomplete DMA composite cannot be accepted.
+            }
+        }
+    };
+    if entry.staging.is_none() {
+        // An uncertain prior upload cannot reuse its host mapping. Allocate
+        // a new, separately charged buffer only after the old one retires or
+        // when the physical window ledger can admit another in-flight copy.
+        let charge = match crate::swapchain::GpuCharge::reserve(
+            window as usize,
+            store.pixels.len() as u64,
+        ) {
+            Ok(charge) => charge,
+            Err(reason) => {
+                gpu::trace(format!("retrying backing staging budget: {reason}"));
+                return store_failure_outcome(window);
+            }
+        };
+        let buffer = match gpu.create_buffer(store.pixels.len() as u64) {
+            Ok(buffer) => buffer,
+            Err(reason) => {
+                gpu::trace(format!("retrying backing staging allocation: {reason}"));
+                return store_failure_outcome(window);
+            }
+        };
+        entry.staging = Some(std::sync::Arc::new(std::sync::Mutex::new(StoreStaging {
+            gpu,
+            buffer: Some(buffer),
+            _charge: Some(charge),
+        })));
+    }
+    let staging = std::sync::Arc::clone(entry.staging.as_ref().unwrap());
+    // SAFETY: this buffer is not concurrently submitted: only successful
+    // uploads are reusable, and the per-window StoreImage is held exclusively.
     unsafe {
         std::ptr::copy_nonoverlapping(
             store.pixels.as_ptr(),
-            entry.staging.contents,
+            staging.lock().unwrap().buffer.as_ref().unwrap().contents,
             store.pixels.len(),
         )
     };
@@ -2049,27 +2663,55 @@ fn present_store_synchronous(
             height: store.height,
             depth: 1,
         });
-    let (buffer, image) = (entry.staging.buffer, entry.image.image);
-    let uploaded = entry.gpu.one_shot(|device, command_buffer| {
-        // SAFETY: recording into a command buffer the call owns; the image is
-        // in GENERAL layout from creation.
-        unsafe {
-            device.cmd_copy_buffer_to_image(
-                command_buffer,
-                buffer,
-                image,
-                vk::ImageLayout::GENERAL,
-                &[copy],
-            )
-        };
-    });
+    let image = entry.image.image.image;
+    #[cfg(test)]
+    TEST_STORE_UPLOAD_SUBMISSIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let uploaded = entry.gpu.one_shot_owned(
+        (staging, std::sync::Arc::clone(&entry.image)),
+        |device, command_buffer, resources| {
+            let buffer = resources.0.lock().unwrap().buffer.as_ref().unwrap().buffer;
+            // SAFETY: recording into a command buffer the call owns; the image is
+            // in GENERAL layout from creation.
+            unsafe {
+                device.cmd_copy_buffer_to_image(
+                    command_buffer,
+                    buffer,
+                    image,
+                    vk::ImageLayout::GENERAL,
+                    &[copy],
+                )
+            };
+        },
+    );
     if let Err(reason) = uploaded {
+        // This submission may have reached the queue. Drop the reusable
+        // pointer to the old staging buffer; the fence owns its remaining
+        // allocation and charge until completion is positively established.
+        entry.staging = None;
         gpu::trace(format!("window store upload failed: {reason}"));
         return store_failure_outcome(window);
     }
-    let shown = match overlays.is_empty() {
-        true => &entry.image,
-        false => blend_overlays(window, entry, overlays),
+    let shown = if blend_available {
+        match blend_overlays(entry, overlays) {
+            Ok(image) => image,
+            Err(BlendFailure::Retryable) => return Deferred,
+            Err(BlendFailure::UnsupportedProducer(views)) => {
+                // Only the rejected producer needs an AppKit/WebKit CPU frame.
+                // A window-wide refusal would disable unrelated GPU-only views.
+                for overlay in overlays {
+                    if views.contains(&overlay.view) {
+                        appkit::backing::refuse_dmabuf_producer(
+                            window,
+                            overlay.view,
+                            &overlay.picture,
+                        );
+                    }
+                }
+                return store_failure_outcome(window);
+            }
+        }
+    } else {
+        std::sync::Arc::clone(&entry.image)
     };
     let frame = appkit::view::Frame {
         window,
@@ -2084,16 +2726,19 @@ fn present_store_synchronous(
         .iter()
         .map(|hole| (hole.layer, crate::swapchain::Region::from(hole.rect)))
         .collect();
-    let presented =
-        match crate::swapchain::present_nonblocking(gpu, window as usize, &frame, shown, &holes) {
-            Ok(Some(true)) => Displayed,
-            Ok(Some(false)) => store_failure_outcome(window),
-            Ok(None) => Deferred,
-            Err(reason) => {
-                gpu::trace(format!("window store presentation failed: {reason}"));
-                store_failure_outcome(window)
-            }
-        };
+    // Both raw and blended backing-store images are immutable while leased.
+    // A single opaque full-window result can therefore use direct WSI.
+    let presented_result =
+        crate::swapchain::present_backing_nonblocking(gpu, window as usize, &frame, shown, &holes);
+    let presented = match presented_result {
+        Ok(Some(true)) => Displayed,
+        Ok(Some(false)) => store_failure_outcome(window),
+        Ok(None) => Deferred,
+        Err(reason) => {
+            gpu::trace(format!("window store presentation failed: {reason}"));
+            store_failure_outcome(window)
+        }
+    };
     drop(images);
     // A deferred store was not staged. Its previous swapchain submissions
     // still refer to retired images, so only successful presentation attempts
@@ -2120,46 +2765,311 @@ fn present_store_synchronous(
     presented
 }
 
-/// The store with `overlays` blended over it, or the store alone where they
-/// cannot be; the window is then given pixel overlays from the next frame.
-fn blend_overlays<'a>(
-    window: sdl3::Window,
-    entry: &'a mut StoreImage,
+#[cfg(test)]
+static TEST_ACCEPTED_DMA_BLENDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn accepted_dma_blends_for_test() -> usize {
+    TEST_ACCEPTED_DMA_BLENDS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static TEST_BLEND_FAILURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn inject_blend_failure_for_test(mode: usize) {
+    TEST_BLEND_FAILURE.store(mode, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn blend_failure_pending_for_test() -> usize {
+    TEST_BLEND_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A failed DMA blend cannot publish the underlying CPU image as complete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BlendFailure {
+    Retryable,
+    UnsupportedProducer(Vec<usize>),
+}
+
+fn blend_refusal(refused: &[crate::overlay::ImportRefusal]) -> Result<(), BlendFailure> {
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let unsupported = refused
+        .iter()
+        .filter(|item| item.kind == crate::overlay::ImportFailureKind::UnsupportedProducer)
+        .map(|item| item.producer_view)
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        Err(BlendFailure::Retryable)
+    } else {
+        Err(BlendFailure::UnsupportedProducer(unsupported))
+    }
+}
+
+/// Blend into the source reserved before the backing-store upload. Only
+/// call this after `reserve_blended_source` succeeds while STORE_IMAGES is held.
+fn blend_overlays(
+    entry: &mut StoreImage,
     overlays: &[appkit::backing::GpuOverlay],
-) -> &'a GpuImage {
-    let (width, height) = (entry.image.width, entry.image.height);
-    if entry.blended.is_none() {
-        match entry
-            .gpu
-            .create_image(&crate::overlay::target_description(width, height))
-        {
-            Ok(image) => entry.blended = Some(image),
-            Err(reason) => {
-                gpu::trace(format!("no image to blend overlays into: {reason}"));
-                appkit::backing::refuse_dmabufs(window);
-                return &entry.image;
-            }
+) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, BlendFailure> {
+    #[cfg(test)]
+    match TEST_BLEND_FAILURE.swap(0, std::sync::atomic::Ordering::SeqCst) {
+        2 => return Err(BlendFailure::Retryable),
+        3 => {
+            return Err(BlendFailure::UnsupportedProducer(
+                overlays.iter().map(|overlay| overlay.view).collect(),
+            ));
         }
+        _ => {}
     }
-    let blended = entry.blended.as_ref().expect("made above");
-    match crate::overlay::blend(entry.gpu, &entry.image, blended, overlays) {
-        Ok(refused) => {
-            if !refused.is_empty() {
-                appkit::backing::refuse_dmabufs(window);
-            }
-            blended
-        }
-        Err(reason) => {
+    let blended = entry.blended.as_ref().expect("reserved before upload");
+    // Descriptor sets are reused after their GPU fence has completed.
+    // Each batch keeps the preceding target intact; the first alone copies
+    // the store. Never admit this target unless every batch succeeded.
+    for (index, batch) in overlays
+        .chunks(crate::overlay::overlay_batch_capacity())
+        .enumerate()
+    {
+        let refusals = crate::overlay::blend_with_store_init_owned(
+            entry.gpu,
+            &entry.image,
+            &blended.image,
+            batch,
+            None,
+            index == 0,
+            (
+                std::sync::Arc::clone(&entry.image),
+                std::sync::Arc::clone(blended),
+            ),
+        )
+        .map_err(|reason| {
             gpu::trace(format!("blending overlays failed: {reason}"));
-            appkit::backing::refuse_dmabufs(window);
-            &entry.image
+            BlendFailure::Retryable
+        })?;
+        for refused in &refusals {
+            gpu::trace(format!("DMA overlay import refused: {}", refused.reason));
         }
+        blend_refusal(&refusals)?;
     }
+    #[cfg(test)]
+    TEST_ACCEPTED_DMA_BLENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(std::sync::Arc::clone(blended))
 }
 
 #[cfg(test)]
 mod drawable_pool_tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn unadmitted_native_foreground_updates_keep_cpu_backing_active() {
+        let name = "present::drawable_pool_tests::unadmitted_native_foreground_updates_keep_cpu_backing_active";
+        if crate::swapchain::isolate_vulkan_graphical_test(name) {
+            return;
+        }
+        if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+            return;
+        }
+        let Ok(adapters) = crate::vulkan::adapters() else {
+            return;
+        };
+        if adapters
+            .first()
+            .and_then(|adapter| adapter.gpu().ok())
+            .is_none()
+        {
+            return;
+        }
+        crate::bootstrap();
+        let rect = |w: f64, h: f64| foundation::geometry::NSRect {
+            origin: foundation::geometry::NSPoint { x: 0.0, y: 0.0 },
+            size: foundation::geometry::NSSize {
+                width: w,
+                height: h,
+            },
+        };
+        let window = objc::object::create_instance(
+            objc::class::lookup(c"NSWindow").unwrap(),
+            appkit::window::INSTANCE_SIZE,
+        );
+        let init_window: unsafe extern "C" fn(
+            objc::object::Id,
+            objc::sel::Sel,
+            foundation::geometry::NSRect,
+            usize,
+            usize,
+            u8,
+        ) -> objc::object::Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+        assert_eq!(
+            unsafe {
+                init_window(
+                    window,
+                    objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                    rect(160.0, 120.0),
+                    0,
+                    0,
+                    0,
+                )
+            },
+            window
+        );
+        let sdl = unsafe { appkit::window::sdl_window(window) };
+        if sdl.is_null() {
+            return;
+        }
+        let mk_view = |w, h| {
+            let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            let init: unsafe extern "C" fn(
+                objc::object::Id,
+                objc::sel::Sel,
+                foundation::geometry::NSRect,
+            ) -> objc::object::Id = unsafe { std::mem::transmute(objc::msg::entry()) };
+            unsafe { init(object, objc::sel::get("initWithFrame:"), rect(w, h)) }
+        };
+        let content = mk_view(160.0, 120.0);
+        let metal_view = mk_view(160.0, 120.0);
+        let foreground = mk_view(20.0, 20.0);
+        let set: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel, objc::object::Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal_cls = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let make: unsafe extern "C" fn(objc::object::Id, objc::sel::Sel) -> objc::object::Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let layer = unsafe {
+            make(
+                metal_cls as *const _ as objc::object::Id,
+                objc::sel::get("layer"),
+            )
+        };
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), layer);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set(content, objc::sel::get("addSubview:"), foreground);
+            set(window, objc::sel::get("orderFront:"), std::ptr::null_mut());
+        }
+        let set_overlay = |value| {
+            appkit::backing::set_overlay(
+                foreground,
+                appkit::backing::Overlay {
+                    width: 20,
+                    height: 20,
+                    picture: appkit::backing::Picture::Pixels([value, 0, 255, 255].repeat(20 * 20)),
+                },
+            )
+        };
+        set_overlay(0);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
+        while backing_upload_submissions_for_test() == 0 {
+            appkit::event::pump(std::ptr::null_mut());
+            assert!(
+                std::time::Instant::now() < deadline,
+                "initial Vulkan underlay never uploaded"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Drain outstanding initial first-frame uploads before measuring.
+        for _ in 0..16 {
+            appkit::event::pump(std::ptr::null_mut());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // This fixture has no guest Metal drawable submission, so the
+        // test intentionally acknowledges the native scene as if GPU staging
+        // completed. The test checks CPU-underlay cache reuse, not admission.
+        let admitted = appkit::view::metal_scene(sdl)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|p| p.native_pixels.is_some() || p.native_dmabuf.is_some())
+            .map(|p| (p.layer, p.native_revision))
+            .collect::<Vec<_>>();
+        assert!(!admitted.is_empty());
+        appkit::backing::set_native_gpu_admission(sdl, &admitted);
+        for _ in 0..16 {
+            appkit::event::pump(std::ptr::null_mut());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Subsequent view pixel revisions have NOT been acknowledged by a
+        // GPU scene worker in this test. The CPU fallback must remain active
+        // rather than hiding pixels using an obsolete accepted image.
+        set_overlay(1);
+        for _ in 0..16 {
+            appkit::event::pump(std::ptr::null_mut());
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let initial = backing_upload_submissions_for_test();
+        assert!(
+            appkit::view::metal_scene(sdl)
+                .unwrap_or_default()
+                .iter()
+                .any(|source| source.native_pixels.is_some()),
+            "native overlay never entered the retained scene"
+        );
+        for step in 2..20u8 {
+            set_overlay(step);
+            for _ in 0..3 {
+                appkit::event::pump(std::ptr::null_mut());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let latest = appkit::view::metal_scene(sdl).unwrap_or_default();
+        assert!(
+            latest.iter().any(|source| source
+                .native_pixels
+                .as_ref()
+                .is_some_and(|pixels| pixels.as_slice().starts_with(&[19, 0, 255, 255]))),
+            "the native foreground did not actually advance to its final pixels"
+        );
+        assert!(
+            backing_upload_submissions_for_test() > initial,
+            "unadmitted changed foreground was wrongly excluded from CPU fallback uploads"
+        );
+        appkit::backing::remove_overlay(foreground);
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn shared_dma_allocation_preserves_the_lower_view_instance() {
+        let shared = std::sync::Arc::new(appkit::backing::Dmabuf {
+            width: 2,
+            height: 2,
+            fourcc: 0,
+            modifier: 0,
+            planes: vec![],
+        });
+        let rect = appkit::backing::Rect {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let overlays = [
+            appkit::backing::GpuOverlay {
+                view: 10,
+                picture: shared.clone(),
+                rect,
+            },
+            appkit::backing::GpuOverlay {
+                view: 20,
+                picture: shared.clone(),
+                rect,
+            },
+        ];
+        assert!(std::sync::Arc::ptr_eq(
+            &overlays[0].picture,
+            &overlays[1].picture
+        ));
+        let kept = filter_native_overlay_instances(&overlays, &[20]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].view, 10);
+        assert!(std::sync::Arc::ptr_eq(&kept[0].picture, &shared));
+        assert_eq!(
+            filter_native_overlay_instances(&overlays, &[10, 20]).len(),
+            0
+        );
+    }
 
     #[test]
     fn cpu_fallback_blacks_out_previous_frame_outside_logical_bounds() {
@@ -2577,4 +3487,78 @@ fn window_teardown_between_readback_identity_lookup_and_publish_never_queues_sta
     assert_eq!(sdl3::video::presentation_window(direct), None);
     flush_readbacks();
     assert!(READBACKS.lock().unwrap().is_empty());
+}
+
+#[cfg(test)]
+static LAST_READBACK_OWNER: std::sync::LazyLock<
+    std::sync::Mutex<Option<std::sync::Weak<std::sync::Mutex<ReadbackOwner>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn failed_readback_fence_wait_retains_texture_and_buffer_past_drawable_release() {
+    if crate::swapchain::isolate_vulkan_graphical_test(
+        "present::failed_readback_fence_wait_retains_texture_and_buffer_past_drawable_release",
+    ) {
+        return;
+    }
+    crate::bootstrap();
+    let Some(gpu) = crate::vulkan::adapters()
+        .ok()
+        .and_then(|adapters| adapters.first().and_then(|adapter| adapter.gpu().ok()))
+    else {
+        return;
+    };
+    let image = gpu
+        .create_image(&ImageDescription {
+            image_type: vk::ImageType::TYPE_2D,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format: vk::Format::B8G8R8A8_UNORM,
+            width: 16,
+            height: 16,
+            depth: 1,
+            levels: 1,
+            layers: 1,
+            samples: 1,
+            usage: gpu::USAGE_RENDER_TARGET,
+            cube: false,
+            components: vk::ComponentMapping::default(),
+        })
+        .unwrap();
+    let image_handle = image.image;
+    let texture = crate::resource::drawable_texture(gpu, image, 80);
+    assert!(!texture.is_null());
+    gpu.inject_immediate_wait_failure_for_test();
+    let error = submit_owned_readback(gpu, texture, image_handle, 16, 16)
+        .err()
+        .expect("injected post-submit failed wait");
+    assert!(error.contains("injected immediate fence wait error"));
+    // The outer drawable can release its texture at this point. The GPU
+    // command's strong readback owner still keeps both image and buffer.
+    objc::arc::release(texture);
+    let weak = LAST_READBACK_OWNER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    let owned = weak
+        .upgrade()
+        .expect("submitted readback was freed before the GPU fence");
+    let first_buffer = owned.lock().unwrap().buffer.as_ref().unwrap().buffer;
+    assert_ne!(first_buffer, vk::Buffer::null());
+    // The next readback allocation cannot recycle a buffer still owned by
+    // an uncertain GPU submission, even after the drawable was released.
+    let next = gpu.create_buffer(16 * 16 * 4).unwrap();
+    assert_ne!(next.buffer, first_buffer);
+    gpu.destroy_buffer(next);
+    drop(owned);
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 1);
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert!(
+        weak.upgrade().is_none(),
+        "readback owner not retired after actual completion"
+    );
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
 }

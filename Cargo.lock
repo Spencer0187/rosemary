@@ -2017,6 +2017,7 @@ dependencies = [
  "darwin",
  "exports",
  "foundation",
+ "iosurface",
  "libc",
  "metal_translate",
  "objc",

@@ -502,6 +502,24 @@ pub(super) unsafe extern "C" fn get_bytes(
     unsafe { get_bytes_slice(receiver, sel, bytes, bytes_per_row, 0, region, level, 0) }
 }
 
+// A failed post-submit Vulkan wait must retain both the GPU staging buffer
+// and the source MTLTexture. The caller's guest destination is only touched
+// after confirmed completion, never while the GPU may still be writing.
+struct TextureReadbackOwner {
+    gpu: &'static Gpu,
+    staging: Option<gpu::GpuBuffer>,
+    texture: usize,
+}
+
+impl Drop for TextureReadbackOwner {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take() {
+            self.gpu.destroy_buffer(staging);
+        }
+        objc::arc::release(self.texture as Id);
+    }
+}
+
 /// `-[MTLTexture getBytes:bytesPerRow:bytesPerImage:fromRegion:mipmapLevel:slice:]`.
 ///
 /// Metal copies on the spot and leaves ordering against GPU writes to the
@@ -600,44 +618,53 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
             height: checked.size[1],
             depth: checked.size[2],
         });
-    let (vk_image, buffer) = (image.image, staging.buffer);
-    let result = texture.gpu.one_shot(|device, command_buffer| {
-        let before = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-        let after = vk::MemoryBarrier::default()
-            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(vk::AccessFlags::HOST_READ);
-        // SAFETY: recording into the immediate command buffer, which the call
-        // owns; every image this runtime makes stays in GENERAL.
-        unsafe {
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[before],
-                &[],
-                &[],
-            );
-            device.cmd_copy_image_to_buffer(
-                command_buffer,
-                vk_image,
-                vk::ImageLayout::GENERAL,
-                buffer,
-                &[copy],
-            );
-            device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::HOST,
-                vk::DependencyFlags::empty(),
-                &[after],
-                &[],
-                &[],
-            );
-        }
-    });
+    let (vk_image, gpu) = (image.image, texture.gpu);
+    let staging = std::sync::Arc::new(std::sync::Mutex::new(TextureReadbackOwner {
+        gpu,
+        staging: Some(staging),
+        texture: objc::arc::retain(receiver) as usize,
+    }));
+    let result = gpu.one_shot_owned(
+        std::sync::Arc::clone(&staging),
+        |device, command_buffer, owned| {
+            let buffer = owned.lock().unwrap().staging.as_ref().unwrap().buffer;
+            let before = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            let after = vk::MemoryBarrier::default()
+                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .dst_access_mask(vk::AccessFlags::HOST_READ);
+            // SAFETY: recording into the immediate command buffer, which the call
+            // owns; every image this runtime makes stays in GENERAL.
+            unsafe {
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[before],
+                    &[],
+                    &[],
+                );
+                device.cmd_copy_image_to_buffer(
+                    command_buffer,
+                    vk_image,
+                    vk::ImageLayout::GENERAL,
+                    buffer,
+                    &[copy],
+                );
+                device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::HOST,
+                    vk::DependencyFlags::empty(),
+                    &[after],
+                    &[],
+                    &[],
+                );
+            }
+        },
+    );
     match result {
         Err(reason) => gpu::trace(format!("getBytes: copy failed: {reason}")),
         Ok(()) => {
@@ -650,7 +677,14 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
                     // its own strides.
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            staging.contents.add(from),
+                            staging
+                                .lock()
+                                .unwrap()
+                                .staging
+                                .as_ref()
+                                .unwrap()
+                                .contents
+                                .add(from),
                             bytes.add(to),
                             tight_row as usize,
                         )
@@ -659,7 +693,6 @@ pub(super) unsafe extern "C" fn get_bytes_slice(
             }
         }
     }
-    texture.gpu.destroy_buffer(staging);
 }
 
 fn lcm(a: u64, b: u64) -> u64 {

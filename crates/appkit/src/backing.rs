@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -18,6 +19,12 @@ pub struct Store {
     /// Bumped by every change to what the store shows, so that a presenter
     /// can tell whether a copy it took is still current without comparing it.
     generation: u64,
+    // Bounded producer-authored changes. Missing generations mean full damage.
+    changes: VecDeque<(u64, Rect)>,
+    /// 0 = unclassified, 1 = contains transparent pixels, 2 = fully opaque.
+    /// Invalidated by every Store::touch and Store::resize. Atomic so immutable
+    /// window snapshots remain shareable with the Vulkan worker.
+    alpha_class: AtomicU8,
 }
 
 impl Store {
@@ -34,6 +41,8 @@ impl Store {
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
+            changes: VecDeque::new(),
+            alpha_class: AtomicU8::new(0),
         }
     }
 
@@ -43,8 +52,76 @@ impl Store {
 
     /// What the store shows changed, and has to be presented again.
     fn touch(&mut self) {
+        self.touch_region(Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(self.width),
+            height: i64::from(self.height),
+        });
+    }
+
+    fn touch_region(&mut self, area: Rect) {
+        const MAX_GENERATIONS: usize = 32;
+        self.alpha_class.store(0, Ordering::Relaxed);
         self.dirty = true;
-        self.generation = self.generation.wrapping_add(1);
+        let next = self.generation.wrapping_add(1);
+        if next <= self.generation {
+            self.changes.clear();
+        }
+        self.generation = next;
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(self.width),
+            height: i64::from(self.height),
+        };
+        self.changes.push_back((next, area.intersection(&whole)));
+        if self.changes.len() > MAX_GENERATIONS {
+            self.changes.pop_front();
+        }
+    }
+
+    /// Only consecutive producer-verified versions may authorize partial work.
+    /// A missing generation, replaced Store, or wraparound fails closed.
+    fn damage_since(&self, generation: u64) -> Option<Rect> {
+        if generation >= self.generation {
+            return None;
+        }
+        let mut expected = generation.checked_add(1)?;
+        let mut union = None;
+        for &(at, rect) in &self.changes {
+            if at < expected {
+                continue;
+            }
+            if at != expected {
+                return None;
+            }
+            union = Some(union.map_or(rect, |prev: Rect| prev.union(&rect)));
+            expected = expected.checked_add(1)?;
+        }
+        (expected == self.generation.checked_add(1)?)
+            .then_some(union?)
+            .filter(|rect| !rect.is_empty())
+    }
+
+    fn fully_opaque(&self) -> bool {
+        match self.alpha_class.load(Ordering::Relaxed) {
+            1 => false,
+            2 => true,
+            _ => {
+                #[cfg(test)]
+                OPAQUE_ALPHA_SCANS.fetch_add(1, Ordering::Relaxed);
+                let opaque = self
+                    .pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| pixel[3] == 255);
+                self.alpha_class
+                    .store(if opaque { 2 } else { 1 }, Ordering::Relaxed);
+                opaque
+            }
+        }
     }
 
     /// Change the size, keeping what the top-left corner held.
@@ -65,13 +142,15 @@ impl Store {
             pixels,
             dirty: true,
             generation: self.generation.wrapping_add(1),
+            changes: VecDeque::new(),
+            alpha_class: AtomicU8::new(0),
         };
     }
 }
 
 /// A rectangle of pixels, top-left origin; empty when either extent is not
 /// positive.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Rect {
     pub x: i64,
     pub y: i64,
@@ -143,7 +222,7 @@ impl Rect {
         pieces
     }
 
-    fn union(&self, other: &Rect) -> Rect {
+    pub(crate) fn union(&self, other: &Rect) -> Rect {
         if self.is_empty() {
             return *other;
         }
@@ -169,11 +248,62 @@ pub struct Hole {
     pub rect: Rect,
 }
 
+#[cfg(test)]
+static OPAQUE_ALPHA_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn opaque_alpha_scan_count_for_tests() -> usize {
+    OPAQUE_ALPHA_SCANS.load(Ordering::Relaxed)
+}
+
 /// Each window's composite, keyed by the SDL window's address.
 static STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
 
 /// Each drawn view's own pixels, keyed by the view's address.
 static VIEW_STORES: Mutex<Option<HashMap<usize, Store>>> = Mutex::new(None);
+
+/// Immutable per-view pixel captures keyed by native content versions, not by
+/// the view's window placement, opacity, corner mask or ancestor geometry.
+/// Only the AppKit owner thread accesses these entries. The GPU worker gets
+/// an Arc snapshot and never follows an Objective-C view pointer.
+/// Exact producer damage from one captured CPU image to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCpuDamage {
+    pub from_revision: u64,
+    pub rect: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NativeCpuCapture {
+    pub revision: u64,
+    pub damage: Option<NativeCpuDamage>,
+}
+
+struct NativeCapture {
+    layer: usize,
+    width: u32,
+    height: u32,
+    crop_x: i64,
+    crop_y: i64,
+    view_generation: Option<u64>,
+    overlay_generation: u64,
+    ca_content_revision: u64,
+    ca_descendant_revision: u64,
+    excluded_view_layers: u64,
+    plain_store: bool,
+    pixels: std::sync::Arc<Vec<u8>>,
+    revision: u64,
+    damage: Option<NativeCpuDamage>,
+}
+type CaptureKey = (usize, i64, i64, u32, u32, u32, u32, bool, u64);
+const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
+static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(test)]
+static NATIVE_RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn native_render_count_for_tests() -> usize {
+    NATIVE_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// What a window's composite is waiting on: the part of it views have drawn
 /// over since it was last composed, and where each view was then, so that a
@@ -197,6 +327,10 @@ static WINDOWS: Mutex<Option<HashMap<usize, WindowState>>> = Mutex::new(None);
 
 /// Views sent `-setNeedsDisplay:`, by address, drawn at the next pump.
 static NEEDS_DISPLAY: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+// A partial request is authoritative only while no full-display request is
+// pending. All explicit geometry is in guest NSView point coordinates.
+static NEEDS_DISPLAY_RECTS: std::sync::LazyLock<Mutex<HashMap<usize, NSRect>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The batches [`pump`] is drawing, innermost last, so a view freed by another
 /// view's `-drawRect:` is taken out of them too. A stack because a `-drawRect:`
@@ -242,6 +376,8 @@ pub struct DmabufPlane {
 pub struct GpuOverlay {
     pub picture: std::sync::Arc<Dmabuf>,
     pub rect: Rect,
+    /// Presenting NSView identity, not the allocation shared by its content.
+    pub view: usize,
 }
 
 /// The GPU a presenter shows windows with, and what it can show from a
@@ -288,6 +424,84 @@ pub fn shows_dmabufs(sdl: sdl3::Window) -> bool {
 
 /// The presenter could not draw a dma-buf overlay on `sdl`'s window; from
 /// now on it is given pixels there.
+/// Whether an actual import failed. Unlike shows_dmabufs(), false before
+/// the first GPU present is not itself a permanent failure.
+pub fn dmabuf_import_refused(sdl: sdl3::Window) -> bool {
+    GPU_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(window, refused)| window == sdl as usize && refused)
+}
+
+/// A rejected DMA image does not disable unrelated producers in the window.
+/// Weak identity also prevents a later replacement at the same view address
+/// from inheriting a previous producer's incompatibility.
+struct RefusedDmabufProducer {
+    window: usize,
+    view: usize,
+    picture: std::sync::Weak<Dmabuf>,
+}
+
+static REFUSED_DMABUF_PRODUCERS: Mutex<Vec<RefusedDmabufProducer>> = Mutex::new(Vec::new());
+
+pub fn dmabuf_producer_refused(
+    sdl: sdl3::Window,
+    view: usize,
+    picture: &std::sync::Arc<Dmabuf>,
+) -> bool {
+    let mut refused = REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    refused.retain(|entry| entry.picture.strong_count() > 0);
+    refused.iter().any(|entry| {
+        entry.window == sdl as usize
+            && entry.view == view
+            && entry.picture.ptr_eq(&std::sync::Arc::downgrade(picture))
+    })
+}
+
+pub fn refuse_dmabuf_producer(sdl: sdl3::Window, view: usize, picture: &std::sync::Arc<Dmabuf>) {
+    const MAX_REFUSED_PRODUCERS: usize = 256;
+    let mut refused = REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    refused.retain(|entry| entry.picture.strong_count() > 0);
+    if refused.iter().any(|entry| {
+        entry.window == sdl as usize
+            && entry.view == view
+            && entry.picture.ptr_eq(&std::sync::Arc::downgrade(picture))
+    }) {
+        return;
+    }
+    if refused.len() == MAX_REFUSED_PRODUCERS {
+        refused.remove(0);
+    }
+    refused.push(RefusedDmabufProducer {
+        window: sdl as usize,
+        view,
+        picture: std::sync::Arc::downgrade(picture),
+    });
+}
+
+/// WebKit's next CPU-frame request is restricted to its failed current image.
+/// Other view producers remain eligible for DRM/DMA negotiation.
+pub fn shows_dmabufs_for_view(sdl: sdl3::Window, view: usize) -> bool {
+    if !shows_dmabufs(sdl) {
+        return false;
+    }
+    let picture = OVERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(owner, _)| *owner == view)
+        .and_then(|(_, overlay)| match &overlay.picture {
+            Picture::Dmabuf(picture) => Some(std::sync::Arc::clone(picture)),
+            Picture::Pixels(_) => None,
+        });
+    picture.is_none_or(|picture| !dmabuf_producer_refused(sdl, view, &picture))
+}
+
 pub fn refuse_dmabufs(sdl: sdl3::Window) {
     let mut windows = GPU_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     match windows
@@ -334,6 +548,9 @@ struct Focus {
     /// Drawing into [`OFFSCREEN`]'s store keyed by `view`, an image being
     /// rendered, rather than into a view in a window.
     offscreen: bool,
+    // `drawRect:`'s requested local top-left pixel region, if old pixels
+    // outside it remain valid and the producer has supplied exact damage.
+    clip: Option<Rect>,
 }
 
 thread_local! {
@@ -362,6 +579,7 @@ pub(crate) fn begin_offscreen(key: usize, width: u32, height: u32, density: f64,
             density: if density > 0.0 { density } else { 1.0 },
             flipped,
             offscreen: true,
+            clip: None,
         })
     });
 }
@@ -404,6 +622,7 @@ fn focus_on(view: Id) -> Option<Focus> {
         density: if density > 0.0 { density } else { 1.0 },
         flipped: crate::view::is_flipped(view),
         offscreen: false,
+        clip: None,
     })
 }
 
@@ -491,10 +710,20 @@ pub(crate) fn paint_coverage(left: i64, top: i64, width: usize, coverage: &[f32]
             .or_insert_with(|| Store::new(store_width, store_height));
         store.resize(store_width, store_height);
         let rows = coverage.len() / width;
-        let x0 = left.max(0);
-        let y0 = top.max(0);
-        let x1 = (left + width as i64).min(i64::from(store.width));
-        let y1 = (top + rows as i64).min(i64::from(store.height));
+        let clip = focus.clip.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(store.width),
+            height: i64::from(store.height),
+        });
+        let x0 = left.max(0).max(clip.x);
+        let y0 = top.max(0).max(clip.y);
+        let x1 = (left + width as i64)
+            .min(i64::from(store.width))
+            .min(clip.x + clip.width);
+        let y1 = (top + rows as i64)
+            .min(i64::from(store.height))
+            .min(clip.y + clip.height);
         if x0 >= x1 || y0 >= y1 {
             return;
         }
@@ -513,13 +742,14 @@ pub(crate) fn paint_coverage(left: i64, top: i64, width: usize, coverage: &[f32]
                 }
             }
         }
-        store.touch();
-        Rect {
+        let changed = Rect {
             x: x0,
             y: y0,
             width: x1 - x0,
             height: y1 - y0,
-        }
+        };
+        store.touch_region(changed);
+        changed
     };
     if focus.offscreen {
         return;
@@ -637,20 +867,36 @@ pub(crate) fn draw_focused(draw: impl FnOnce(&mut [u8], u32, u32) -> Option<Rect
             .or_insert_with(|| Store::new(width, height));
         store.resize(width, height);
         let drawn = draw(&mut store.pixels, store.width, store.height);
-        if drawn.is_some_and(|r| !r.is_empty()) {
-            store.touch();
+        if let Some(area) = drawn.filter(|r| !r.is_empty()) {
+            if focus.clip.is_some() {
+                // Arbitrary canvas callbacks can alter pixels outside the
+                // advertised dirty bounds; never certify narrow damage.
+                store.touch();
+            } else {
+                store.touch_region(area);
+            }
         }
         drawn
     };
     if let Some(drawn) = drawn
         && !focus.offscreen
     {
+        let actual = if focus.clip.is_some() {
+            Rect {
+                x: 0,
+                y: 0,
+                width: width as i64,
+                height: height as i64,
+            }
+        } else {
+            drawn
+        };
         damage(
             focus.window,
             Rect {
-                x: drawn.x + focus.x as i64,
-                y: drawn.y + focus.y as i64,
-                ..drawn
+                x: actual.x + focus.x as i64,
+                y: actual.y + focus.y as i64,
+                ..actual
             },
         );
     }
@@ -712,10 +958,16 @@ fn draw_into(
     let mirrored = focus.flipped && !respect_flipped;
     let opacity = (fraction.min(1.0) * 256.0) as u32;
 
-    let x0 = left.max(0.0).round() as i64;
-    let x1 = (left + width).min(f64::from(store.width)).round() as i64;
-    let y0 = top.max(0.0).round() as i64;
-    let y1 = (top + height).min(f64::from(store.height)).round() as i64;
+    let clip = focus.clip.unwrap_or(Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    });
+    let x0 = (left.max(0.0).round() as i64).max(clip.x);
+    let x1 = ((left + width).min(f64::from(store.width)).round() as i64).min(clip.x + clip.width);
+    let y0 = (top.max(0.0).round() as i64).max(clip.y);
+    let y1 = ((top + height).min(f64::from(store.height)).round() as i64).min(clip.y + clip.height);
     if x0 >= x1 || y0 >= y1 {
         return Rect::default();
     }
@@ -757,21 +1009,102 @@ fn draw_into(
             }
         }
     }
-    store.touch();
-    Rect {
+    let changed = Rect {
         x: x0,
         y: y0,
         width: x1 - x0,
         height: y1 - y0,
-    }
+    };
+    store.touch_region(changed);
+    changed
 }
 
 /// Mark a view for `-drawRect:` at the next pump.
 pub(crate) fn needs_display(view: Id) {
     let mut pending = NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(view as usize));
     if !pending.contains(&(view as usize)) {
         pending.push(view as usize);
     }
+}
+
+pub(crate) fn needs_display_in_rect(view: Id, rect: NSRect) {
+    let values = [
+        rect.origin.x,
+        rect.origin.y,
+        rect.size.width,
+        rect.size.height,
+    ];
+    if !values.iter().all(|v| v.is_finite()) || rect.size.width < 0.0 || rect.size.height < 0.0 {
+        needs_display(view);
+        return;
+    }
+    if rect.size.width == 0.0 || rect.size.height == 0.0 {
+        return;
+    }
+    let mut pending = NEEDS_DISPLAY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut areas = NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if !pending.contains(&(view as usize)) {
+        pending.push(view as usize);
+        areas.insert(view as usize, rect);
+    } else if let Some(previous) = areas.get_mut(&(view as usize)) {
+        let x0 = previous.origin.x.min(rect.origin.x);
+        let y0 = previous.origin.y.min(rect.origin.y);
+        let x1 = (previous.origin.x + previous.size.width).max(rect.origin.x + rect.size.width);
+        let y1 = (previous.origin.y + previous.size.height).max(rect.origin.y + rect.size.height);
+        if ![x0, y0, x1, y1].iter().all(|v| v.is_finite()) {
+            areas.remove(&(view as usize));
+        } else {
+            *previous = NSRect {
+                origin: NSPoint { x: x0, y: y0 },
+                size: NSSize {
+                    width: x1 - x0,
+                    height: y1 - y0,
+                },
+            };
+        }
+    }
+}
+
+fn focus_dirty_pixels(focus: Focus, requested: NSRect) -> Option<Rect> {
+    let [x, y, w, h] = [
+        requested.origin.x,
+        requested.origin.y,
+        requested.size.width,
+        requested.size.height,
+    ];
+    let left = (x * focus.density).floor();
+    let right = ((x + w) * focus.density).ceil();
+    let top = if focus.flipped {
+        (y * focus.density).floor()
+    } else {
+        (focus.height - (y + h) * focus.density).floor()
+    };
+    let bottom = if focus.flipped {
+        ((y + h) * focus.density).ceil()
+    } else {
+        (focus.height - y * focus.density).ceil()
+    };
+    if ![left, right, top, bottom].iter().all(|v| v.is_finite()) {
+        return None;
+    }
+    let width = focus.width.max(1.0) as i64;
+    let height = focus.height.max(1.0) as i64;
+    let x0 = (left as i64).clamp(0, width);
+    let x1 = (right as i64).clamp(0, width);
+    let y0 = (top as i64).clamp(0, height);
+    let y1 = (bottom as i64).clamp(0, height);
+    (x0 < x1 && y0 < y1).then_some(Rect {
+        x: x0,
+        y: y0,
+        width: x1 - x0,
+        height: y1 - y0,
+    })
 }
 
 /// Whether a view of `window` is waiting to be displayed.
@@ -804,6 +1137,22 @@ pub(crate) fn needs_display_in_tree(view: Id, depth: usize) {
 /// a store left behind would be handed to the next window made - at the size the
 /// old one was.
 pub fn forget_window(sdl: sdl3::Window) {
+    GPU_ADMISSION_DAMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
+    GPU_ADMITTED_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
+    UNDERLAY_ANIMATING_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
     if let Some(stores) = STORES.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         stores.remove(&(sdl as usize));
     }
@@ -811,6 +1160,10 @@ pub fn forget_window(sdl: sdl3::Window) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(window, _)| *window != sdl as usize);
+    REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|entry| entry.window != sdl as usize);
     SURFACE_LAYERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -837,11 +1190,33 @@ pub fn layer_drew_on_surface(sdl: sdl3::Window, layer: usize) {
 
 /// Forget a view that is being deallocated, so no pump draws freed memory.
 pub(crate) fn forget(view: Id) {
+    // A new view may reuse this address with an identical initial generation.
+    // The old underlay is never safe across that lifetime transition.
     let key = view as usize;
+    REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|entry| entry.view != key);
+    // An address may be recycled with generation zero. Evict only underlays
+    // which actually read this NSView while it was alive; unrelated windows
+    // retain their immutable backing images and cached upload identities.
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, entry| !entry.views.contains(&key));
+    NATIVE_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(owner, _, _, _, _, _, _, _, _), _| *owner != key);
+    crate::view::forget_native_tile_ids(view);
     NEEDS_DISPLAY
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|v| *v != key);
+    NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&key);
     ANIMATING
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -869,6 +1244,17 @@ pub(crate) fn forget(view: Id) {
 /// with YES is sent `-updateLayer`. Every other view has `-drawRect:` sent with
 /// its focus locked, and what it draws is its layer's content.
 pub(crate) fn display_view(view: Id) {
+    // Explicit `-display` can run before a queued pump. The pixels it draws
+    // satisfy that prior invalidation; a later region-only request must not
+    // inherit an obsolete full-view pending entry.
+    NEEDS_DISPLAY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|pending| *pending != view as usize);
+    let dirty = NEEDS_DISPLAY_RECTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(view as usize));
     if crate::view::is_layer_backed(view) && focus_on(view).is_some() {
         let layer = crate::view::layer_of(view);
         let delegate = crate::layer::delegate_of(layer);
@@ -897,13 +1283,46 @@ pub(crate) fn display_view(view: Id) {
     if !responds || !push_focus(view) {
         return;
     }
+    FOCUS.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        let focus = stack.last_mut().unwrap();
+        if let Some(requested) = dirty {
+            let has_base = VIEW_STORES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|stores| stores.get(&(view as usize)))
+                .is_some_and(|store| {
+                    store.width == focus.width as u32 && store.height == focus.height as u32
+                });
+            if has_base {
+                focus.clip = focus_dirty_pixels(*focus, requested);
+            }
+        }
+    });
     clear_focused_store();
-    let bounds = current_focus().map_or(NSRect::default(), |focus| NSRect {
-        origin: NSPoint { x: 0.0, y: 0.0 },
-        size: NSSize {
-            width: focus.width / focus.density,
-            height: focus.height / focus.density,
-        },
+    let bounds = current_focus().map_or(NSRect::default(), |focus| {
+        let area = focus.clip.unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            width: focus.width as i64,
+            height: focus.height as i64,
+        });
+        let origin_y = if focus.flipped {
+            area.y as f64 / focus.density
+        } else {
+            (focus.height - (area.y + area.height) as f64) / focus.density
+        };
+        NSRect {
+            size: NSSize {
+                width: area.width as f64 / focus.density,
+                height: area.height as f64 / focus.density,
+            },
+            origin: NSPoint {
+                x: area.x as f64 / focus.density,
+                y: origin_y,
+            },
+        }
     });
     // SAFETY: `-drawRect:` is `void (id, SEL, NSRect)`.
     unsafe {
@@ -926,13 +1345,27 @@ fn clear_focused_store() {
         .as_mut()
         .and_then(|stores| stores.get_mut(&(focus.view as usize)))
         .map(|store| {
-            store.pixels.fill(0);
-            store.touch();
-            Rect {
-                x: focus.x as i64,
-                y: focus.y as i64,
+            let area = focus.clip.unwrap_or(Rect {
+                x: 0,
+                y: 0,
                 width: i64::from(store.width),
                 height: i64::from(store.height),
+            });
+            if focus.clip.is_none() {
+                store.pixels.fill(0);
+                store.touch();
+            } else {
+                let row_bytes = area.width as usize * 4;
+                for y in area.y..area.y + area.height {
+                    let start = (y as usize * store.width as usize + area.x as usize) * 4;
+                    store.pixels[start..start + row_bytes].fill(0);
+                }
+                store.touch_region(area);
+            }
+            Rect {
+                x: area.x + focus.x as i64,
+                y: area.y + focus.y as i64,
+                ..area
             }
         });
     if let Some(area) = cleared {
@@ -950,6 +1383,27 @@ fn send(receiver: Id, name: &str) {
 
 /// Draw everything marked for display and present every window that changed.
 pub fn pump() {
+    for window in std::mem::take(
+        &mut *GPU_ADMISSION_DAMAGE
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()),
+    ) {
+        let sdl = window as sdl3::Window;
+        if crate::window::window_for(sdl).is_null() {
+            continue;
+        }
+        if let Some((width, height)) = sdl3::video::window_size_in_pixels(sdl) {
+            damage(
+                sdl,
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: i64::from(width.max(0)),
+                    height: i64::from(height.max(0)),
+                },
+            );
+        }
+    }
     crate::decor::pump();
     crate::layout::prepare();
     for window in crate::window::all() {
@@ -1220,20 +1674,903 @@ fn opaque_views(placed: &[Placed]) -> Vec<usize> {
     };
     placed[first + 1..]
         .iter()
-        .filter(|p| !p.clip.is_empty() && p.alpha >= 1.0)
+        .filter(|p| {
+            !p.clip.is_empty()
+                && p.alpha >= 1.0
+                && !crate::view::has_rounded_mask_ancestor(p.view)
+                && crate::view::native_scene_ca_opacity(p.view, darwin::mach::media_time()) >= 1.0
+        })
         .filter(|p| {
             stores.get(&(p.view as usize)).is_some_and(|store| {
                 i64::from(store.width) >= p.rect.width
                     && i64::from(store.height) >= p.rect.height
-                    && store.pixels.as_chunks::<4>().0.iter().all(|t| t[3] == 255)
+                    && store.fully_opaque()
             })
         })
         .map(|p| p.view as usize)
         .collect()
 }
 
+/// Authoritative opaque native-view coverage, recomputed from live AppKit
+/// stacking order on the video thread. Independent of whether a CPU window
+/// backing image has *ever* been submitted to the Metal scene.
+pub(crate) fn live_metal_occlusion(
+    sdl: sdl3::Window,
+    scene: &[crate::view::MetalSceneLayer],
+) -> Vec<(usize, Vec<Rect>)> {
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return Vec::new();
+    }
+    let opaque = opaque_views(&place_tree(window, sdl));
+    let native_id_bit = 1usize << (usize::BITS - 1);
+    scene
+        .iter()
+        .enumerate()
+        .filter(|(_, layer)| layer.layer & native_id_bit == 0)
+        .map(|(index, layer)| {
+            let metal = Rect {
+                x: i64::from(layer.frame.x),
+                y: i64::from(layer.frame.y),
+                width: i64::from(layer.frame.width),
+                height: i64::from(layer.frame.height),
+            };
+            let covered = scene[index + 1..]
+                .iter()
+                .filter(|native| {
+                    native.layer & native_id_bit != 0
+                        && opaque.contains(&native.native_owner)
+                        && native.opacity >= 1.0
+                        // Rounded clips are not fully covered by any rectangle.
+                        && native.rounded.is_empty()
+                })
+                .map(|native| {
+                    let image = Rect {
+                        x: i64::from(native.frame.x),
+                        y: i64::from(native.frame.y),
+                        width: i64::from(native.frame.width),
+                        height: i64::from(native.frame.height),
+                    };
+                    // The *same* clip projected by visit_metal_scene for the
+                    // native GPU source, including intermediate rectangular CA
+                    // masks. Never subtract outside its drawn geometry.
+                    let clip = native.clip.map_or(image, |clip| {
+                        image.intersection(&Rect {
+                            x: i64::from(clip.x),
+                            y: i64::from(clip.y),
+                            width: i64::from(clip.width),
+                            height: i64::from(clip.height),
+                        })
+                    });
+                    clip.intersection(&metal)
+                })
+                .filter(|rect| !rect.is_empty())
+                .collect();
+            (layer.layer, covered)
+        })
+        .collect()
+}
+
+/// Render the native content of one NSView into a transparent, view-local
+/// source. The Metal presenter retains its own copy; no Objective-C pointer
+/// crosses onto the GPU worker. A CPU-owned view above Metal must be sampled
+/// *after* that Metal source, not flattened into the window's bottom image.
+pub fn native_scene_extent_supported(width: u32, height: u32) -> bool {
+    u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|area| area.checked_mul(4))
+        .is_some_and(|bytes| bytes > 0 && bytes <= 64 * 1024 * 1024)
+}
+
+/// DMA-BUF-only images do not allocate an RGBA copy on the AppKit thread.
+/// Bound their GPU staging footprint separately from CPU-backed captures.
+pub fn native_scene_dma_extent_supported(width: u32, height: u32) -> bool {
+    width <= 16384
+        && height <= 16384
+        && u64::from(width)
+            .checked_mul(u64::from(height))
+            .and_then(|area| area.checked_mul(4))
+            .is_some_and(|bytes| bytes > 0 && bytes <= 256 * 1024 * 1024)
+}
+
+#[cfg(test)]
+pub(crate) fn native_scene_pixels(
+    view: Id,
+    width: u32,
+    height: u32,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_cropped(
+        view,
+        width,
+        height,
+        Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(width),
+            height: i64::from(height),
+        },
+    )
+}
+
+/// Rasterize only the visible window-pixel portion of a larger NSView. Keep
+/// the full logical source extent for CA and overlay coordinate projection;
+/// otherwise a clipped view's backing content gets scaled to its crop.
+pub(crate) fn native_scene_pixels_cropped_with_damage(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64, Option<NativeCpuDamage>)> {
+    let (pixels, revision) = native_scene_pixels_cropped(view, width, height, crop)?;
+    let key = (
+        view as usize,
+        crop.x,
+        crop.y,
+        crop.width as u32,
+        crop.height as u32,
+        width,
+        height,
+        false,
+        0,
+    );
+    let damage = NATIVE_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .filter(|capture| {
+            capture.revision == revision && std::sync::Arc::ptr_eq(&capture.pixels, &pixels)
+        })
+        .and_then(|capture| capture.damage);
+    Some((pixels, revision, damage))
+}
+
+pub fn native_scene_pixels_cropped(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_impl(view, width, height, crop, false, &[], &[])
+}
+
+#[cfg(test)]
+pub(crate) fn metal_sublayers_pixels_cropped(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_impl(view, width, height, crop, true, &[], &[])
+}
+
+pub(crate) fn metal_sublayers_segment_pixels_cropped(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+    selected: &[usize],
+    gpu_groups: &[usize],
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    native_scene_pixels_impl(view, width, height, crop, true, selected, gpu_groups)
+}
+
+fn native_scene_pixels_impl(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+    metal_children: bool,
+    selected: &[usize],
+    gpu_groups: &[usize],
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    if (!metal_children
+        && (crop.x < 0
+            || crop.y < 0
+            || crop.x.checked_add(crop.width)? > i64::from(width)
+            || crop.y.checked_add(crop.height)? > i64::from(height)))
+        || crop.is_empty()
+        || !native_scene_extent_supported(crop.width as u32, crop.height as u32)
+    {
+        return None;
+    }
+    use std::hash::{Hash, Hasher};
+    let selection_hash = if metal_children {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        selected.hash(&mut hash);
+        gpu_groups.hash(&mut hash);
+        hash.finish()
+    } else {
+        0
+    };
+    let key = (
+        view as usize,
+        crop.x,
+        crop.y,
+        crop.width as u32,
+        crop.height as u32,
+        width,
+        height,
+        metal_children,
+        selection_hash,
+    );
+    let layer = crate::view::layer_of(view);
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let source = views.as_ref().and_then(|all| all.get(&(view as usize)));
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let source = if metal_children { None } else { source };
+    let overlay = if metal_children {
+        None
+    } else {
+        overlays
+            .iter()
+            .find(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
+            .map(|(_, entry)| entry)
+    };
+    if metal_children
+        && (!crate::layer::is_metal(layer)
+            || !crate::coreanimation::has_renderable_sublayers(layer))
+        || (!metal_children
+            && source.is_none()
+            && overlay.is_none()
+            && !crate::coreanimation::has_tree(layer))
+    {
+        NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+        return None;
+    }
+    let view_generation = source.map(Store::generation);
+    let overlay_generation = OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(view as usize))
+        .copied()
+        .unwrap_or(0);
+    let ca_content_revision = crate::coreanimation::native_scene_content_revision(layer);
+    let ca_descendant_revision = crate::coreanimation::native_scene_descendant_revision(layer);
+    let excluded_view_layers = if metal_children {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        crate::view::descendant_view_layers(view).hash(&mut hash);
+        hash.finish()
+    } else {
+        0
+    };
+    let content_animating =
+        crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time());
+    if !content_animating
+        && let Some(hit) = NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|hit| {
+                hit.layer == layer as usize
+                    && hit.width == crop.width as u32
+                    && hit.height == crop.height as u32
+                    && hit.crop_x == crop.x
+                    && hit.crop_y == crop.y
+                    && hit.view_generation == view_generation
+                    && hit.overlay_generation == overlay_generation
+                    && hit.ca_content_revision == ca_content_revision
+                    && hit.ca_descendant_revision == ca_descendant_revision
+                    && hit.excluded_view_layers == excluded_view_layers
+            })
+    {
+        return (!hit.pixels.is_empty())
+            .then(|| (std::sync::Arc::clone(&hit.pixels), hit.revision));
+    }
+    // CA animations, overlay content and sublayer rendering have their own
+    // invalidation paths: only a plain source store can assert narrow damage.
+    let plain_store = !content_animating
+        && overlay.is_none()
+        && !crate::coreanimation::has_tree(layer)
+        && source.is_some();
+    // For a producer-verified local edit, other cached tiles remain
+    // bit-identical. Advance their generation without re-rasterizing or
+    // hashing a full tile; missing damage history fails closed below.
+    if plain_store && let Some(src) = source {
+        let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prior) = captures.get_mut(&key)
+            && prior.plain_store
+            && prior.layer == layer as usize
+            && prior.overlay_generation == overlay_generation
+            && prior.ca_content_revision == ca_content_revision
+            && prior.ca_descendant_revision == ca_descendant_revision
+            && prior.view_generation.is_some()
+            && src.width == width
+            && src.height == height
+            && src
+                .damage_since(prior.view_generation.unwrap())
+                .is_some_and(|region| region.intersection(&crop).is_empty())
+        {
+            prior.view_generation = view_generation;
+            prior.damage = None;
+            return (!prior.pixels.is_empty())
+                .then(|| (std::sync::Arc::clone(&prior.pixels), prior.revision));
+        }
+    }
+
+    let damage = if plain_store && let Some(source) = source {
+        NATIVE_CAPTURES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .and_then(|prior| {
+                (prior.plain_store
+                    && prior.layer == layer as usize
+                    && prior.ca_content_revision == ca_content_revision
+                    && prior.ca_descendant_revision == ca_descendant_revision
+                    && prior.overlay_generation == overlay_generation)
+                    .then_some(prior)?;
+                let region = source
+                    .damage_since(prior.view_generation?)?
+                    .intersection(&crop);
+                (!region.is_empty()).then_some(NativeCpuDamage {
+                    from_revision: prior.revision,
+                    rect: Rect {
+                        x: region.x - crop.x,
+                        y: region.y - crop.y,
+                        ..region
+                    },
+                })
+            })
+    } else {
+        None
+    };
+    #[cfg(test)]
+    NATIVE_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // A plain fully opaque backing store has exactly the same BGRA texels
+    // after blending over a transparent native background. Allocate/copy its
+    // crop directly; the existing compositor path handles alpha and CA.
+    #[cfg(test)]
+    let compare_slow = std::env::var_os("ROSEMARY_BENCH_NATIVE_CAPTURE_FORCE_SLOW").is_some();
+    #[cfg(not(test))]
+    let compare_slow = false;
+    let exact_opaque = if plain_store && !compare_slow {
+        source.filter(|src| src.width == width && src.height == height && src.fully_opaque())
+    } else {
+        None
+    };
+    let output = if let Some(src) = exact_opaque {
+        let mut pixels = Vec::with_capacity(crop.width as usize * crop.height as usize * 4);
+        for row in crop.y as usize..(crop.y + crop.height) as usize {
+            let offset = (row * src.width as usize + crop.x as usize) * 4;
+            pixels.extend_from_slice(&src.pixels[offset..offset + crop.width as usize * 4]);
+        }
+        Store {
+            width: crop.width as u32,
+            height: crop.height as u32,
+            pixels,
+            dirty: false,
+            generation: 0,
+            changes: VecDeque::new(),
+            alpha_class: AtomicU8::new(2),
+        }
+    } else {
+        let mut output = Store::new(crop.width as u32, crop.height as u32);
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: crop.width,
+            height: crop.height,
+        };
+        let logical = Rect {
+            x: -crop.x,
+            y: -crop.y,
+            width: i64::from(width),
+            height: i64::from(height),
+        };
+        use crate::coreanimation::{Pass, render_with_root_opacity};
+        if !metal_children {
+            render_with_root_opacity(
+                view,
+                &mut output,
+                logical,
+                whole,
+                Pass::Background,
+                Some(1.0),
+            );
+        }
+        if let Some(source) = source {
+            // CA/view opacity is applied by the retained scene, not a second time
+            // during this isolated pixel capture.
+            blend_at(&mut output, source, -crop.x, -crop.y, whole, 1.0);
+        }
+        if let Some(overlay) = overlay {
+            // Software overlays (including CPU-backed web content) are also
+            // separate native layers; previously they were irreversibly composed
+            // under the later Metal drawable in the full window store.
+            blend_overlay_clipped(
+                &mut output,
+                overlay,
+                (-crop.x).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                (-crop.y).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                width,
+                height,
+                whole,
+            );
+        }
+        if metal_children {
+            crate::coreanimation::render_metal_sublayers_selected(
+                view,
+                &mut output,
+                logical,
+                whole,
+                selected,
+                gpu_groups,
+            );
+        } else {
+            render_with_root_opacity(
+                view,
+                &mut output,
+                logical,
+                whole,
+                Pass::Sublayers,
+                Some(1.0),
+            );
+        }
+        output
+    };
+    // A verified empty capture must have the same generation/dependency
+    // validation as a nonempty image. Keep only a zero-byte sentinel, not
+    // the full transparent RGBA allocation, and never emit it to Metal.
+    let empty = output
+        .pixels
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .all(|pixel| pixel[3] == 0);
+    let (pixels, revision) = if empty {
+        (std::sync::Arc::new(Vec::new()), 0)
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        output.pixels.hash(&mut hasher);
+        (std::sync::Arc::new(output.pixels), hasher.finish())
+    };
+    let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
+    if content_animating {
+        captures.remove(&key);
+    } else {
+        captures.insert(
+            key,
+            NativeCapture {
+                layer: layer as usize,
+                width: crop.width as u32,
+                height: crop.height as u32,
+                crop_x: crop.x,
+                crop_y: crop.y,
+                view_generation,
+                overlay_generation,
+                ca_content_revision,
+                ca_descendant_revision,
+                excluded_view_layers,
+                plain_store,
+                pixels: std::sync::Arc::clone(&pixels),
+                revision,
+                damage,
+            },
+        );
+        // Bound cached pixel payload across all views to 256 MiB, retaining
+        // the current capture. In-progress GPU users own their own Arc.
+        let mut used: usize = captures.values().map(|entry| entry.pixels.len()).sum();
+        if used > NATIVE_CAPTURE_CACHE_LIMIT {
+            let keys: Vec<_> = captures.keys().copied().filter(|id| *id != key).collect();
+            for id in keys {
+                if used <= NATIVE_CAPTURE_CACHE_LIMIT {
+                    break;
+                }
+                if let Some(entry) = captures.remove(&id) {
+                    used = used.saturating_sub(entry.pixels.len());
+                }
+            }
+        }
+    }
+    (!empty).then_some((pixels, revision))
+}
+
+/// The AppKit event thread only publishes proposed native sources. Metal
+/// acknowledges the exact original source revision after it has committed the
+/// corresponding GPU scene. A proposed image is never proof of admission.
+static GPU_ADMITTED_NATIVE: std::sync::LazyLock<Mutex<HashMap<usize, HashMap<usize, u64>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+/// Worker-to-AppKit notification. SDL video queries and new CPU backing
+/// damage are performed by the owner pump, never under a Vulkan state lock.
+static GPU_ADMISSION_DAMAGE: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+pub fn set_native_gpu_admission(window: sdl3::Window, admitted: &[(usize, u64)]) {
+    if window.is_null() {
+        return;
+    }
+    let current: HashMap<usize, u64> = admitted.iter().copied().collect();
+    let mut registry = GPU_ADMITTED_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    // Exact GPU admission changes require an owner-thread repaint, but the
+    // lower-content underlay has no dependency on upper source revisions.
+    let unchanged = registry.get(&(window as usize)) == Some(&current);
+    registry.insert(window as usize, current);
+    drop(registry);
+    if unchanged {
+        return;
+    }
+    // Do not evict GPU_UNDERLAYS here. Its independent lower-content
+    // fingerprint is checked only when native separation is actually allowed.
+    // The owner thread will re-snapshot the now-admitted independent scene
+    // and recompute the backing source without changing the guest's store.
+    GPU_ADMISSION_DAMAGE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(window as usize);
+    crate::view::invalidate_metal_scene_for_window(window);
+}
+
+fn admitted_native_in_published_scene(
+    sdl: sdl3::Window,
+    dma_only: bool,
+) -> std::collections::HashSet<usize> {
+    let admitted = GPU_ADMITTED_NATIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let accepted = admitted.get(&(sdl as usize));
+    let mut grouped = HashMap::<usize, (usize, usize)>::new();
+    for layer in crate::view::metal_scene(sdl).unwrap_or_default() {
+        let relevant = if dma_only {
+            layer.native_dmabuf.is_some()
+        } else {
+            layer.native_pixels.is_some() || layer.native_dmabuf.is_some()
+        };
+        if !relevant {
+            continue;
+        }
+        let member = grouped.entry(layer.native_owner).or_default();
+        member.0 += 1;
+        if accepted.is_some_and(|a| a.get(&layer.layer) == Some(&layer.native_revision)) {
+            member.1 += 1;
+        }
+    }
+    // A multi-tile native view may be excluded from CPU backing only once
+    // every visible, nontransparent tile has its exact GPU revision admitted.
+    grouped
+        .into_iter()
+        .filter_map(|(owner, (total, ready))| {
+            (owner != 0 && total == ready).then_some(owner | (1usize << (usize::BITS - 1)))
+        })
+        .collect()
+}
+
+/// One immutable underlay per window, keyed only by content below the
+/// first Metal view. Changes to independently composited native foreground
+/// must not force a 4K CPU reconstruction or an unchanged GPU upload.
+struct GpuUnderlayCache {
+    fingerprint: u64,
+    pixels: std::sync::Arc<Store>,
+    // Only NSViews contributing below the first Metal layer affect this Arc.
+    // Keep identities through detach until the cache is rebuilt, so a later
+    // pointer reuse cannot resurrect an old view's pixels.
+    views: std::collections::HashSet<usize>,
+}
+static GPU_UNDERLAYS: std::sync::LazyLock<Mutex<HashMap<usize, GpuUnderlayCache>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static UNDERLAY_ANIMATING_WINDOWS: std::sync::LazyLock<Mutex<std::collections::HashSet<usize>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+#[cfg(test)]
+static GPU_UNDERLAY_RENDERS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) fn gpu_underlay_render_count_for_tests() -> usize {
+    GPU_UNDERLAY_RENDERS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The flattened backing changes for independent foregrounds as well, but
+/// only underlying view generations, placement and CA *contents* matter here.
+pub fn gpu_under_metal_cached(sdl: sdl3::Window, source: &Store) -> Option<std::sync::Arc<Store>> {
+    use std::hash::{Hash, Hasher};
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return None;
+    }
+    let placed = place_tree(window, sdl);
+    let first = placed
+        .iter()
+        .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))?;
+    if !can_separate_native(sdl, &placed, first) {
+        // A temporarily unadmitted foreground must use flattened pixels,
+        // but it does not invalidate the independently cached lower content.
+        return None;
+    }
+    let mut key = std::collections::hash_map::DefaultHasher::new();
+    (source.width, source.height, first).hash(&mut key);
+    crate::window::background_pixel(window).hash(&mut key);
+    crate::window::presentation_clip(sdl)
+        .map(|rect| (rect.x, rect.y, rect.w, rect.h))
+        .hash(&mut key);
+    crate::decor::pixels(sdl)
+        .as_ref()
+        .map(|pixels| pixels.generation)
+        .hash(&mut key);
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let overlays = OVERLAY_REVISIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut animating = false;
+    let deps: std::collections::HashSet<usize> = placed[..first]
+        .iter()
+        .map(|placed| placed.view as usize)
+        .collect();
+    for p in &placed[..first] {
+        (p.view as usize, p.rect, p.clip).hash(&mut key);
+        p.alpha.to_bits().hash(&mut key);
+        views
+            .as_ref()
+            .and_then(|all| all.get(&(p.view as usize)))
+            .map(Store::generation)
+            .hash(&mut key);
+        overlays.get(&(p.view as usize)).hash(&mut key);
+        let layer = crate::view::layer_of(p.view);
+        crate::coreanimation::native_scene_tree_revision(layer).hash(&mut key);
+        animating |= crate::coreanimation::flattened_underlay_content_animating(
+            layer,
+            darwin::mach::media_time(),
+        );
+    }
+    drop(overlays);
+    drop(views);
+    let fingerprint = key.finish();
+    if animating {
+        // The same static model revision can describe arbitrarily many
+        // presentation-opacity frames. Do not resurrect pre-animation pixels
+        // once the animation finishes with its original model value.
+        GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(sdl as usize));
+    } else {
+        if let Some(hit) = GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&(sdl as usize))
+            .filter(|entry| entry.fingerprint == fingerprint)
+        {
+            return Some(std::sync::Arc::clone(&hit.pixels));
+        }
+    }
+    let result = std::sync::Arc::new(gpu_under_metal(sdl, source)?);
+    if !animating {
+        GPU_UNDERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sdl as usize,
+                GpuUnderlayCache {
+                    fingerprint,
+                    pixels: std::sync::Arc::clone(&result),
+                    views: deps,
+                },
+            );
+    }
+    Some(result)
+}
+
+/// A flattened background animation needs fresh CPU backing pixels even if
+/// the Metal scene's own metadata is unchanged. The last tick after animation
+/// expiration must restore the model value once rather than freezing the
+/// final interpolated frame.
+pub(crate) fn underlay_animation_tick(sdl: sdl3::Window, now: f64) -> bool {
+    let window = crate::window::window_for(sdl);
+    let active = if window.is_null() {
+        false
+    } else {
+        let placed = place_tree(window, sdl);
+        let first = placed
+            .iter()
+            .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)));
+        first.is_some_and(|first| {
+            placed[..first].iter().any(|p| {
+                crate::coreanimation::flattened_underlay_content_animating(
+                    crate::view::layer_of(p.view),
+                    now,
+                )
+            })
+        })
+    };
+    let mut running = UNDERLAY_ANIMATING_WINDOWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let was = if active {
+        running.insert(sdl as usize)
+    } else {
+        running.remove(&(sdl as usize))
+    };
+    active || was
+}
+
+/// A missing native capture is not evidence of transparency. Recapture the
+/// visible pixels and accept only the validated, zero-byte negative entry.
+/// Use the same crop/tile geometry as native AppKit scene publication.
+fn native_scene_proven_empty(placed: &Placed) -> bool {
+    let visible = placed.rect.intersection(&placed.clip);
+    if visible.is_empty() {
+        return true;
+    }
+    let (Ok(width), Ok(height)) = (
+        u32::try_from(placed.rect.width),
+        u32::try_from(placed.rect.height),
+    ) else {
+        return false;
+    };
+    // Scene publication uses one capture when it fits the 64 MiB limit,
+    // otherwise independent 2048-pixel tiles.
+    let tile_edge = if native_scene_extent_supported(visible.width as u32, visible.height as u32) {
+        i64::MAX
+    } else {
+        2048
+    };
+    let mut y = visible.y;
+    while y < visible.y + visible.height {
+        let height_tile = (visible.y + visible.height - y).min(tile_edge);
+        let mut x = visible.x;
+        while x < visible.x + visible.width {
+            let width_tile = (visible.x + visible.width - x).min(tile_edge);
+            let crop = Rect {
+                x: x - placed.rect.x,
+                y: y - placed.rect.y,
+                width: width_tile,
+                height: height_tile,
+            };
+            if native_scene_pixels_cropped(placed.view, width, height, crop).is_some() {
+                return false;
+            }
+            let key = (
+                placed.view as usize,
+                crop.x,
+                crop.y,
+                width_tile as u32,
+                height_tile as u32,
+                width,
+                height,
+                false,
+                0,
+            );
+            if !NATIVE_CAPTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .is_some_and(|capture| capture.pixels.is_empty())
+            {
+                return false;
+            }
+            x += width_tile;
+        }
+        y += height_tile;
+    }
+    true
+}
+
+/// A native source belongs outside the bottom store only once its complete
+/// independent snapshot has been accepted. If any top view lacks a source,
+/// preserve the original full window path instead of silently losing it.
+fn can_separate_native(sdl: sdl3::Window, placed: &[Placed], first: usize) -> bool {
+    // Never remove native pixels from the GPU base unless the owner thread
+    // has already published a corresponding independent source for *every*
+    // visible native view above the first Metal drawable. Oversized or not-
+    // yet-ready native sources must remain visible, even if ordering cannot
+    // be fully resolved during that transitional frame.
+    let captured = admitted_native_in_published_scene(sdl, false);
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let sources = placed[first + 1..]
+        .iter()
+        .filter(|p| !crate::layer::is_metal(crate::view::layer_of(p.view)))
+        .map(|p| {
+            let has_store = views
+                .as_ref()
+                .is_some_and(|stores| stores.contains_key(&(p.view as usize)));
+            let has_overlay = overlays.iter().any(|(id, _)| *id == p.view as usize);
+            let has_dma = overlays.iter().any(|(id, entry)| {
+                *id == p.view as usize && matches!(entry.picture, Picture::Dmabuf(_))
+            });
+            (
+                p,
+                has_store
+                    || has_overlay
+                    || crate::coreanimation::has_tree(crate::view::layer_of(p.view)),
+                has_dma,
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(overlays);
+    drop(views);
+    let mut any = false;
+    for (p, drawn, has_dma) in sources {
+        if !drawn || p.clip.is_empty() {
+            continue;
+        }
+        if captured.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
+            any = true;
+            continue;
+        }
+        // DMA producers may be visible even when their CPU/CA capture is
+        // empty. An unadmitted producer must never be silently subtracted.
+        if !has_dma && native_scene_proven_empty(p) {
+            continue;
+        }
+        return false;
+    }
+    any
+}
+
+/// Window backing source excluding native views painted *above* the first
+/// Metal layer. Those views are separately retained and placed above Metal.
+/// The original full CPU store remains unmodified for non-Vulkan fallbacks.
+pub fn gpu_under_metal(sdl: sdl3::Window, source: &Store) -> Option<Store> {
+    let _owed = crate::coreanimation::defer_releases();
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return None;
+    }
+    let placed = place_tree(window, sdl);
+    let first = placed
+        .iter()
+        .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))?;
+    if !can_separate_native(sdl, &placed, first) {
+        return None;
+    }
+    let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(test)]
+    GPU_UNDERLAY_RENDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut bottom = Store::new(source.width, source.height);
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(source.width),
+        height: i64::from(source.height),
+    };
+    let background = crate::window::background_pixel(window).unwrap_or(DEFAULT_BACKGROUND);
+    for pixel in bottom.pixels.as_chunks_mut::<4>().0 {
+        *pixel = background;
+    }
+    for p in &placed[..first] {
+        let clip = p.clip.intersection(&whole);
+        use crate::coreanimation::{Pass, render};
+        render(p.view, &mut bottom, p.rect, clip, Pass::Background);
+        if let Some(source) = views
+            .as_ref()
+            .and_then(|stores| stores.get(&(p.view as usize)))
+        {
+            blend_at(&mut bottom, source, p.rect.x, p.rect.y, clip, p.alpha);
+        }
+        // CPU overlays painted below the first Metal drawable belong in its
+        // underlay; those above it are separate scene sources instead.
+        if let Some((_, overlay)) = overlays
+            .iter()
+            .find(|(id, o)| *id == p.view as usize && matches!(o.picture, Picture::Pixels(_)))
+        {
+            blend_overlay_clipped(
+                &mut bottom,
+                overlay,
+                p.rect.x.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                p.rect.y.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                p.rect.width.clamp(0, i64::from(u32::MAX)) as u32,
+                p.rect.height.clamp(0, i64::from(u32::MAX)) as u32,
+                clip,
+            );
+        }
+        render(p.view, &mut bottom, p.rect, clip, Pass::Sublayers);
+    }
+    if let Some(chrome) = crate::decor::pixels(sdl) {
+        copy_chrome(&mut bottom, &chrome);
+    }
+    Some(bottom)
+}
+
 /// Bring a window's composite up to date with its views: recompose what was
 /// drawn over, and everywhere a view appeared, moved or went away.
+#[cfg(test)]
+pub(crate) fn compose_window_for_tests(window: Id) {
+    compose_window(window);
+}
+
 fn compose_window(window: Id) {
     // First, so it drops last: after every lock below is released.
     let _owed = crate::coreanimation::defer_releases();
@@ -1430,6 +2767,12 @@ fn compose_window(window: Id) {
         copy_chrome(store, chrome);
     }
     store.touch();
+    // Only windows with independent native-over-Metal sources require this
+    // additional snapshot when CPU content changes; ordinary AppKit-only
+    // windows must not pay the hierarchy walk on every backing repaint.
+    if crate::view::native_metal_scene_active(sdl) {
+        crate::view::invalidate_metal_scene_for_window(sdl);
+    }
 }
 
 /// Put a window's chrome over the top rows of its store.
@@ -1446,6 +2789,12 @@ fn copy_chrome(store: &mut Store, chrome: &crate::decor::Pixels) {
 /// Present a window's store again at the next pump, without recomposing it:
 /// for a presenter that lost what it last showed.
 pub fn present_again(sdl: sdl3::Window) {
+    // WSI recovery can request a genuinely fresh backing publication even
+    // when the underlying view pixels have not changed.
+    GPU_UNDERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(sdl as usize));
     let mut stores = STORES.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(store) = stores
         .as_mut()
@@ -1553,6 +2902,143 @@ pub(crate) fn cpu_fallback_calls_for_tests(window: sdl3::Window) -> usize {
         .iter()
         .filter(|&&key| key == window as usize)
         .count()
+}
+
+/// Opt-in allocation/CPU benchmark for metadata-only native captures.
+/// The view is retained solely in the builtin AppKit test process, not on a
+/// host-visible desktop. Run with ROSEMARY_BENCH_NATIVE_4K=1 in release mode.
+#[test]
+fn metadata_only_4k_native_capture_reuses_immutable_pixels() {
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_4K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    let view = objc::object::create_instance(objc::class::lookup(c"NSView").expect("NSView"), 0);
+    let (w, h) = (3840u32, 2160u32);
+    set_native_view_pixels_for_tests(
+        view,
+        w,
+        h,
+        [128u8, 64, 32, 255].repeat(w as usize * h as usize),
+    );
+    let before = native_render_count_for_tests();
+    let start = std::time::Instant::now();
+    let (original, revision) = native_scene_pixels(view, w, h).unwrap();
+    let first_ms = start.elapsed().as_secs_f64() * 1e3;
+    let start = std::time::Instant::now();
+    for _ in 0..240 {
+        let (cached, again) = native_scene_pixels(view, w, h).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&original, &cached));
+        assert_eq!(again, revision);
+    }
+    let cached_us = start.elapsed().as_secs_f64() * 1e6 / 240.0;
+    assert_eq!(
+        native_render_count_for_tests() - before,
+        1,
+        "240 metadata updates allocated, rendered or hashed 4K sources again"
+    );
+    eprintln!(
+        "4K native pixel capture first_ms={first_ms:.3} metadata_cache_mean_us={cached_us:.3} bytes={} cache_renders=1",
+        original.len()
+    );
+    forget(view);
+    objc::arc::release(view);
+}
+
+/// Measures multiple 6K native sources when unrelated scene changes
+/// repeatedly resnapshot them. Opt in to avoid high allocations in CI;
+/// the emitted cache hit rate and video-thread capture time are diagnostics.
+#[test]
+fn two_large_native_views_capture_cache_pressure_benchmark() {
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_MULTI_6K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    const W: u32 = 6016;
+    const H: u32 = 3384;
+    let views: Vec<Id> = (0..2)
+        .map(|n| {
+            let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            set_native_view_pixels_for_tests(
+                view,
+                W,
+                H,
+                [32u8, 64, 128 + n as u8, 255].repeat(W as usize * H as usize),
+            );
+            view
+        })
+        .collect();
+    let mut tiles = Vec::new();
+    for y in (0..H).step_by(2048) {
+        for x in (0..W).step_by(2048) {
+            tiles.push(Rect {
+                x: i64::from(x),
+                y: i64::from(y),
+                width: i64::from((W - x).min(2048)),
+                height: i64::from((H - y).min(2048)),
+            });
+        }
+    }
+    assert_eq!(tiles.len(), 6);
+    let before = native_render_count_for_tests();
+    let first = std::time::Instant::now();
+    for view in &views {
+        for crop in &tiles {
+            assert!(native_scene_pixels_cropped(*view, W, H, *crop).is_some());
+        }
+    }
+    let warm_ms = first.elapsed().as_secs_f64() * 1000.0;
+    let after_warm = native_render_count_for_tests();
+    let loops = 4usize;
+    let refresh = std::time::Instant::now();
+    for _ in 0..loops {
+        for view in &views {
+            for crop in &tiles {
+                assert!(native_scene_pixels_cropped(*view, W, H, *crop).is_some());
+            }
+        }
+    }
+    let repeat_ms = refresh.elapsed().as_secs_f64() * 1000.0 / loops as f64;
+    let again = native_render_count_for_tests();
+    let misses = (again - after_warm) as usize;
+    let total = loops * views.len() * tiles.len();
+    let hits = total.saturating_sub(misses);
+    let cache_bytes: usize = NATIVE_CAPTURES
+        .lock()
+        .unwrap()
+        .values()
+        .map(|v| v.pixels.len())
+        .sum();
+    eprintln!(
+        "6K multi-view native capture warm_ms={warm_ms:.3} repeat_mean_ms={repeat_ms:.3} repeat_hits={hits}/{total} rerecaptures={misses} cache_bytes={cache_bytes} new_renders={}",
+        again - before
+    );
+    assert!(cache_bytes <= NATIVE_CAPTURE_CACHE_LIMIT);
+    for view in views {
+        forget(view);
+        objc::arc::release(view)
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_native_view_pixels_for_tests(view: Id, width: u32, height: u32, pixels: Vec<u8>) {
+    assert_eq!(pixels.len(), width as usize * height as usize * 4);
+    let mut store = Store::new(width, height);
+    store.pixels = pixels;
+    // A replacement fixture is a new producer generation, not the unchanged
+    // generation 0 of a newly allocated Store.
+    store.generation = VIEW_STORES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|all| all.get(&(view as usize)))
+        .map_or(1, |old| old.generation().wrapping_add(1));
+    VIEW_STORES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(HashMap::new)
+        .insert(view as usize, store);
+    crate::view::invalidate_metal_scene_for_view(view);
 }
 
 #[cfg(test)]
@@ -1782,6 +3268,58 @@ pub enum Picture {
 
 /// Keyed by the view's address, in the order the overlays were first set.
 static OVERLAYS: Mutex<Vec<(usize, Overlay)>> = Mutex::new(Vec::new());
+static OVERLAY_REVISIONS: std::sync::LazyLock<Mutex<HashMap<usize, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static NEXT_OVERLAY_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Capture the DMA-BUF identity and setter revision on the AppKit owner
+/// thread; no guest view pointer or mutable overlay crosses to the GPU worker.
+pub(crate) fn native_dma_overlay(view: Id) -> Option<(std::sync::Arc<Dmabuf>, u64)> {
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, overlay) = overlays.iter().find(|(id, overlay)| {
+        *id == view as usize && matches!(overlay.picture, Picture::Dmabuf(_))
+    })?;
+    let Picture::Dmabuf(picture) = &overlay.picture else {
+        unreachable!()
+    };
+    let revision = OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(view as usize))
+        .copied()
+        .unwrap_or(0);
+    Some((std::sync::Arc::clone(picture), revision))
+}
+
+/// Only DMA-BUF sources that have an independently retained native scene
+/// layer may be excluded from the bottom window-store overlay blending.
+pub fn native_dma_above_metal(sdl: sdl3::Window) -> Vec<usize> {
+    let window = crate::window::window_for(sdl);
+    if window.is_null() {
+        return Vec::new();
+    }
+    let placed = place_tree(window, sdl);
+    let Some(first) = placed
+        .iter()
+        .position(|p| crate::layer::is_metal(crate::view::layer_of(p.view)))
+    else {
+        return Vec::new();
+    };
+    let native = admitted_native_in_published_scene(sdl, true);
+    let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    placed[first + 1..]
+        .iter()
+        .filter_map(|p| {
+            if !native.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
+                return None;
+            }
+            overlays
+                .iter()
+                .any(|(id, o)| *id == p.view as usize && matches!(o.picture, Picture::Dmabuf(_)))
+                .then_some(p.view as usize)
+        })
+        .collect()
+}
 
 /// Show `overlay` over `view`'s rectangle from the next present on.
 ///
@@ -1794,7 +3332,15 @@ pub fn set_overlay(view: Id, overlay: Overlay) {
             None => overlays.push((view as usize, overlay)),
         }
     }
+    OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(
+            view as usize,
+            NEXT_OVERLAY_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
     mark_window_of(view);
+    crate::view::invalidate_metal_scene_for_view(view);
 }
 
 pub fn remove_overlay(view: Id) {
@@ -1805,7 +3351,12 @@ pub fn remove_overlay(view: Id) {
         overlays.len() != before
     };
     if removed {
+        OVERLAY_REVISIONS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(view as usize));
         mark_window_of(view);
+        crate::view::invalidate_metal_scene_for_view(view);
     }
 }
 
@@ -1843,6 +3394,14 @@ fn mark_window_of(view: Id) {
 /// The store with every visible pixel overlay of `window` drawn over it, or
 /// `None` when there is nothing to draw and the store can be presented as it
 /// is; and the dma-buf overlays, which only the presenter can draw.
+#[cfg(test)]
+pub(crate) fn gpu_overlay_instances_for_tests(
+    window: sdl3::Window,
+    store: &Store,
+) -> Vec<GpuOverlay> {
+    compose(window, store).1
+}
+
 fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverlay>) {
     let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     let mut composed: Option<Store> = None;
@@ -1881,6 +3440,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
         if let Picture::Dmabuf(picture) = &overlay.picture {
             gpu.push(GpuOverlay {
                 picture: picture.clone(),
+                view: view as usize,
                 // Keep original placement for texture sampling; the final
                 // Vulkan presentation masks pixels beyond the logical window.
                 rect: original,
@@ -1894,6 +3454,8 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
             dirty: false,
             // An overlay that changes damages the store under it.
             generation: store.generation,
+            changes: VecDeque::new(),
+            alpha_class: AtomicU8::new(0),
         });
         blend_overlay_clipped(
             target,
@@ -2085,17 +3647,33 @@ unsafe extern "C" fn get_rects_being_drawn(
             size: NSSize { width: 0.0, height: 0.0 },
         }) };
     }
-    let size = current_focus()
+    let rect = current_focus()
         .filter(|focus| focus.view == receiver)
-        .map_or(NSSize::default(), |focus| NSSize {
-            width: focus.width / focus.density,
-            height: focus.height / focus.density,
-        });
+        .map(|focus| {
+            let area = focus.clip.unwrap_or(Rect {
+                x: 0,
+                y: 0,
+                width: focus.width as i64,
+                height: focus.height as i64,
+            });
+            NSRect {
+                origin: NSPoint {
+                    x: area.x as f64 / focus.density,
+                    y: if focus.flipped {
+                        area.y as f64 / focus.density
+                    } else {
+                        (focus.height - (area.y + area.height) as f64) / focus.density
+                    },
+                },
+                size: NSSize {
+                    width: area.width as f64 / focus.density,
+                    height: area.height as f64 / focus.density,
+                },
+            }
+        })
+        .unwrap_or_default();
     DRAWN.with(|drawn| {
-        *drawn.borrow_mut() = NSRect {
-            origin: NSPoint { x: 0.0, y: 0.0 },
-            size,
-        };
+        *drawn.borrow_mut() = rect;
         if !rects.is_null() {
             // SAFETY: the caller's out-pointer; the rect lives as long as the
             // thread, past the `-drawRect:` it is read in.
@@ -2337,6 +3915,305 @@ pub(crate) fn install() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn opaque_native_direct_capture_matches_translucent_fallback_and_crops() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        const WIDTH: u32 = 6;
+        const HEIGHT: u32 = 4;
+        let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
+        pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+            .copy_from_slice(&[90, 80, 70, 255]);
+        set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, pixels);
+        let crop = Rect {
+            x: 3,
+            y: 1,
+            width: 2,
+            height: 2,
+        };
+        let opaque = native_scene_pixels_cropped(view, WIDTH, HEIGHT, crop)
+            .unwrap()
+            .0;
+        assert_eq!(&opaque[..4], &[12, 34, 56, 255]);
+        assert_eq!(&opaque[4..8], &[90, 80, 70, 255]);
+        set_native_view_pixels_for_tests(view, WIDTH, HEIGHT, {
+            let mut pixels = [12u8, 34, 56, 255].repeat((WIDTH * HEIGHT) as usize);
+            pixels[(1 * WIDTH as usize + 4) * 4..(1 * WIDTH as usize + 5) * 4]
+                .copy_from_slice(&[90, 80, 70, 0]);
+            pixels
+        });
+        let mixed = native_scene_pixels_cropped(view, WIDTH, HEIGHT, crop)
+            .unwrap()
+            .0;
+        assert_eq!(&mixed[..4], &[12, 34, 56, 255]);
+        assert_eq!(
+            &mixed[4..8],
+            &[0, 0, 0, 0],
+            "alpha-zero premultiplied source may never preserve nonzero RGB"
+        );
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn store_producer_damage_requires_contiguous_versions_and_full_unknown_fallback() {
+        let mut store = Store::new(32, 16);
+        assert_eq!(store.damage_since(0), None);
+        store.touch_region(Rect {
+            x: 2,
+            y: 3,
+            width: 2,
+            height: 1,
+        });
+        store.touch_region(Rect {
+            x: 8,
+            y: 5,
+            width: 3,
+            height: 2,
+        });
+        assert_eq!(
+            store.damage_since(0),
+            Some(Rect {
+                x: 2,
+                y: 3,
+                width: 9,
+                height: 4
+            })
+        );
+        assert_eq!(
+            store.damage_since(1),
+            Some(Rect {
+                x: 8,
+                y: 5,
+                width: 3,
+                height: 2
+            })
+        );
+        store.touch();
+        assert_eq!(
+            store.damage_since(0),
+            Some(Rect {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 16
+            })
+        );
+        for _ in 0..34 {
+            store.touch_region(Rect {
+                x: 9,
+                y: 7,
+                width: 1,
+                height: 1,
+            });
+        }
+        assert_eq!(
+            store.damage_since(0),
+            None,
+            "missing generations must disable partial uploads"
+        );
+        assert_eq!(
+            store.damage_since(store.generation() - 1),
+            Some(Rect {
+                x: 9,
+                y: 7,
+                width: 1,
+                height: 1
+            })
+        );
+        let before = store.generation();
+        store.resize(64, 8);
+        assert_eq!(
+            store.damage_since(before),
+            None,
+            "resize invalidates previous extent authority"
+        );
+    }
+
+    #[test]
+    fn unchanged_native_tiles_reuse_pixels_after_disjoint_producer_damage() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(8, 4);
+        store.pixels = [0, 0, 255, 255].repeat(8 * 4);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let left = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let right = Rect {
+            x: 4,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let old_left = native_scene_pixels_cropped(view, 8, 4, left).unwrap();
+        let old_right = native_scene_pixels_cropped(view, 8, 4, right).unwrap();
+        let before = native_render_count_for_tests();
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            src.pixels[(1 * 8 + 6) * 4..(1 * 8 + 6) * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
+            src.touch_region(Rect {
+                x: 6,
+                y: 1,
+                width: 1,
+                height: 1,
+            });
+        }
+        let new_left = native_scene_pixels_cropped_with_damage(view, 8, 4, left).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&old_left.0, &new_left.0));
+        assert_eq!(new_left.1, old_left.1);
+        assert_eq!(new_left.2, None);
+        assert_eq!(
+            native_render_count_for_tests(),
+            before,
+            "unaffected tile was rasterized or rehashed"
+        );
+        let new_right = native_scene_pixels_cropped_with_damage(view, 8, 4, right).unwrap();
+        assert_eq!(new_right.2.unwrap().from_revision, old_right.1);
+        assert_ne!(new_right.1, old_right.1);
+        assert_eq!(native_render_count_for_tests(), before + 1);
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn plain_view_capture_carries_exact_dirty_pixel_provenance() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(8, 6);
+        store.pixels = [255, 0, 0, 255].repeat(8 * 6);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 2,
+            y: 1,
+            width: 4,
+            height: 3,
+        };
+        let first = native_scene_pixels_cropped_with_damage(view, 8, 6, crop).unwrap();
+        assert_eq!(first.2, None);
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            let at = (2 * 8 + 4) * 4;
+            store.pixels[at..at + 4].copy_from_slice(&[0, 255, 0, 255]);
+            store.touch_region(Rect {
+                x: 4,
+                y: 2,
+                width: 1,
+                height: 1,
+            });
+        }
+        let second = native_scene_pixels_cropped_with_damage(view, 8, 6, crop).unwrap();
+        assert_eq!(
+            second.2,
+            Some(NativeCpuDamage {
+                from_revision: first.1,
+                rect: Rect {
+                    x: 2,
+                    y: 1,
+                    width: 1,
+                    height: 1
+                },
+            })
+        );
+        assert_eq!(
+            &second.0[(1 * 4 + 2) * 4..(1 * 4 + 2) * 4 + 4],
+            &[0, 255, 0, 255]
+        );
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            store.pixels.fill(0);
+            store.touch();
+        }
+        let third = native_scene_pixels_cropped_with_damage(view, 8, 6, crop);
+        assert!(
+            third.is_none(),
+            "fully transparent source is not emitted as foreground"
+        );
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn failed_dma_producer_only_disables_that_live_view_image() {
+        use std::os::fd::OwnedFd;
+        let window = 0x7d48usize as sdl3::Window;
+        let bad_view = 0x7d49usize;
+        let good_view = 0x7d50usize;
+        let picture = || {
+            std::sync::Arc::new(Dmabuf {
+                width: 2,
+                height: 2,
+                fourcc: u32::from_le_bytes(*b"AR24"),
+                modifier: 0,
+                planes: vec![DmabufPlane {
+                    fd: OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+                    offset: 0,
+                    stride: 8,
+                }],
+            })
+        };
+        let bad = picture();
+        let good = picture();
+        GPU_WINDOWS.lock().unwrap().push((window as usize, false));
+        {
+            let mut overlays = OVERLAYS.lock().unwrap();
+            overlays.push((
+                bad_view,
+                Overlay {
+                    width: 2,
+                    height: 2,
+                    picture: Picture::Dmabuf(bad.clone()),
+                },
+            ));
+            overlays.push((
+                good_view,
+                Overlay {
+                    width: 2,
+                    height: 2,
+                    picture: Picture::Dmabuf(good.clone()),
+                },
+            ));
+        }
+        assert!(shows_dmabufs_for_view(window, bad_view));
+        refuse_dmabuf_producer(window, bad_view, &bad);
+        refuse_dmabuf_producer(window, bad_view, &bad);
+        assert!(dmabuf_producer_refused(window, bad_view, &bad));
+        assert!(!shows_dmabufs_for_view(window, bad_view));
+        assert!(shows_dmabufs_for_view(window, good_view));
+        assert!(!dmabuf_producer_refused(window, good_view, &good));
+        {
+            let mut overlays = OVERLAYS.lock().unwrap();
+            let source = overlays.iter_mut().find(|(id, _)| *id == bad_view).unwrap();
+            source.1.picture = Picture::Dmabuf(good.clone());
+        }
+        assert!(
+            shows_dmabufs_for_view(window, bad_view),
+            "a new producer on the same NSView must be eligible"
+        );
+        OVERLAYS
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != bad_view && *id != good_view);
+        forget_window(window);
+        assert!(!dmabuf_producer_refused(window, bad_view, &bad));
+    }
 
     #[test]
     fn deferred_backing_store_survives_the_pump_while_another_window_progresses() {
@@ -2677,7 +4554,34 @@ mod tests {
             pixels: vec![0; width as usize * height as usize * 4],
             dirty: false,
             generation: 0,
+            changes: VecDeque::new(),
+            alpha_class: AtomicU8::new(0),
         }
+    }
+
+    #[test]
+    fn opaque_classification_is_cached_until_pixels_or_extent_change() {
+        let mut store = Store::new(32, 12);
+        let scanned = opaque_alpha_scan_count_for_tests();
+        for _ in 0..100 {
+            assert!(!store.fully_opaque());
+        }
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 1);
+        store
+            .pixels
+            .chunks_exact_mut(4)
+            .for_each(|pixel| pixel[3] = 255);
+        store.touch();
+        for _ in 0..100 {
+            assert!(store.fully_opaque());
+        }
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 2);
+        store.resize(24, 12);
+        assert!(store.fully_opaque());
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 3);
+        store.resize(33, 12);
+        assert!(!store.fully_opaque());
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scanned + 4);
     }
 
     #[test]
@@ -2694,6 +4598,7 @@ mod tests {
             density: 1.0,
             flipped: true,
             offscreen: false,
+            clip: None,
         };
         let size = NSSize {
             width: 1.0,
@@ -2923,6 +4828,7 @@ mod tests {
             density: 1.0,
             flipped: true,
             offscreen: false,
+            clip: None,
         };
         FOCUS.with(|stack| stack.borrow_mut().push(focus));
         let size = NSSize {
@@ -2950,4 +4856,77 @@ mod tests {
         assert_eq!(store.pixels, [99, 99, 227, 255]);
         FOCUS.with(|stack| stack.borrow_mut().clear());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn changing_six_k_native_store_capture_costs() {
+    if std::env::var_os("ROSEMARY_BENCH_NATIVE_CHANGED_6K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    const W: u32 = 6016;
+    const H: u32 = 3384;
+    let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+    set_native_view_pixels_for_tests(
+        view,
+        W,
+        H,
+        [48u8, 128, 196, 255].repeat(W as usize * H as usize),
+    );
+    let mut tiles = Vec::new();
+    for y in (0..H).step_by(2048) {
+        for x in (0..W).step_by(2048) {
+            tiles.push(Rect {
+                x: x as i64,
+                y: y as i64,
+                width: (W - x).min(2048) as i64,
+                height: (H - y).min(2048) as i64,
+            });
+        }
+    }
+    assert_eq!(tiles.len(), 6);
+    let mut prior = tiles
+        .iter()
+        .map(|rect| {
+            native_scene_pixels_cropped_with_damage(view, W, H, *rect)
+                .unwrap()
+                .1
+        })
+        .collect::<Vec<_>>();
+    let mut measured = Vec::new();
+    for revision in 1..=24 {
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let store = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            for rect in &tiles {
+                let x = (rect.x + rect.width / 2) as usize;
+                let y = (rect.y + rect.height / 2) as usize;
+                let at = (y * W as usize + x) * 4;
+                store.pixels[at] = revision as u8;
+                store.touch_region(Rect {
+                    x: x as i64,
+                    y: y as i64,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+        let started = std::time::Instant::now();
+        for (i, rect) in tiles.iter().enumerate() {
+            let (pixels, version, damage) =
+                native_scene_pixels_cropped_with_damage(view, W, H, *rect).unwrap();
+            assert_eq!(damage.unwrap().from_revision, prior[i]);
+            let at = ((rect.height / 2 * rect.width + rect.width / 2) * 4) as usize;
+            assert_eq!(pixels[at], revision as u8);
+            prior[i] = version;
+        }
+        measured.push(started.elapsed().as_secs_f64() * 1000.);
+    }
+    measured.sort_by(f64::total_cmp);
+    let mean = measured.iter().sum::<f64>() / measured.len() as f64;
+    let p95 = measured[measured.len() * 95 / 100];
+    eprintln!("6K changed plain native captures six tiles mean_ms={mean:.3} p95_ms={p95:.3}");
+    forget(view);
+    objc::arc::release(view);
 }
