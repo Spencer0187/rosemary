@@ -272,6 +272,36 @@ fn service_native_cpu_fallbacks() {
 static METAL_SCENE_OWNERS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<usize, Vec<usize>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+// Capture-time index. Each live owner retains its view until the next
+// capture or window teardown, so the event pump never dereferences a freed
+// Objective-C instance after a concurrent view removal.
+struct MetalSurfacePollOwner {
+    view: usize,
+}
+
+impl MetalSurfacePollOwner {
+    fn new(view: Id) -> Self {
+        objc::arc::retain(view);
+        Self {
+            view: view as usize,
+        }
+    }
+}
+
+impl Drop for MetalSurfacePollOwner {
+    fn drop(&mut self) {
+        objc::arc::release(self.view as Id);
+    }
+}
+
+static METAL_SURFACE_POLL_OWNERS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, Vec<std::sync::Arc<MetalSurfacePollOwner>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static METAL_SURFACE_POLL_VISITS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 static METAL_SCENE_WAS_ANIMATING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 static METAL_SCENE_LAST_ANIM_FRAME: std::sync::Mutex<Option<std::time::Instant>> =
@@ -346,15 +376,31 @@ fn poll_metal_surface_publications() {
     if !crate::coreanimation::has_surface_publications() {
         return;
     }
-    fn visit(view: Id, depth: usize) {
-        if depth >= 64 || !is_view(view) {
-            return;
+    let owners = METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .iter()
+        .flat_map(|(window, views)| {
+            views
+                .iter()
+                .cloned()
+                .map(|view| (*window, view))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for (window, owner) in owners {
+        let view = owner.view as Id;
+        let attached = unsafe { window_of(view) };
+        if attached.is_null() || unsafe { crate::window::sdl_window(attached) } as usize != window {
+            continue;
         }
         let layer = view_of(view).layer;
-        if !layer.is_null()
-            && crate::layer::is_metal(layer)
-            && let Some(frame) = unsafe { presentation_frame(view) }
-        {
+        if layer.is_null() || !crate::layer::is_metal(layer) {
+            continue;
+        }
+        #[cfg(test)]
+        METAL_SURFACE_POLL_VISITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Some(frame) = unsafe { presentation_frame(view) } {
             let rect = crate::backing::Rect {
                 x: i64::from(frame.x),
                 y: i64::from(frame.y),
@@ -371,19 +417,62 @@ fn poll_metal_surface_publications() {
                 crate::coreanimation::changed(layer);
             }
         }
-        let children = view_of(view).subviews;
-        if let Some(children) =
-            unsafe { corefoundation::collections::array(children as *const c_void) }
-        {
-            for &child in &children.values {
-                visit(child as Id, depth + 1);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn surface_poll_owner_count_for_test(window: sdl3::Window) -> usize {
+    METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .get(&(window as usize))
+        .map_or(0, Vec::len)
+}
+
+#[cfg(test)]
+pub(crate) fn surface_poll_visits_for_test() -> usize {
+    METAL_SURFACE_POLL_VISITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn capture_surface_poll_owners(window: sdl3::Window) {
+    let mut owners = Vec::new();
+    if crate::coreanimation::has_surface_publications() {
+        let nswindow = crate::window::window_for(window);
+        if !nswindow.is_null() {
+            fn visit(
+                view: Id,
+                depth: usize,
+                owners: &mut Vec<std::sync::Arc<MetalSurfacePollOwner>>,
+            ) {
+                if depth >= 64 || !is_view(view) {
+                    return;
+                }
+                let layer = view_of(view).layer;
+                if !layer.is_null()
+                    && crate::layer::is_metal(layer)
+                    && crate::coreanimation::metal_subtree_has_surface(layer)
+                {
+                    owners.push(std::sync::Arc::new(MetalSurfacePollOwner::new(view)));
+                }
+                let children = view_of(view).subviews;
+                if let Some(children) =
+                    unsafe { corefoundation::collections::array(children as *const c_void) }
+                {
+                    for &child in &children.values {
+                        visit(child as Id, depth + 1, owners);
+                    }
+                }
             }
+            visit(crate::window::content_view_of(nswindow), 0, &mut owners);
         }
     }
-    for window in crate::window::all() {
-        let root = crate::window::content_view_of(window);
-        visit(root, 0);
-    }
+    // Destructors release NSViews and may invalidate another scene. Drop old
+    // registry entries without holding this registry's lock.
+    let old = METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .insert(window as usize, owners);
+    drop(old);
 }
 
 /// Animation frames intentionally publish without waiting for new drawables.
@@ -816,6 +905,10 @@ fn visit_metal_scene(
             &excluded_ids,
         )
     };
+    // Retain an invisible source's identity and immutable CPU pixels so an
+    // opacity-only transition back to visible does not force a new raster.
+    // The Metal compositor excludes its zero-alpha placement from drawing
+    // and group scratch preflight, rather than dropping the source itself.
     if hidden {
         return;
     }
@@ -1163,6 +1256,7 @@ fn intersect_scene_clips(a: Frame, b: Frame) -> Frame {
 fn publish_metal_scene_at(sdl: sdl3::Window, now: f64) {
     debug_assert!(sdl3::video::is_video_thread());
     let (scene, roots) = capture_metal_scene(sdl, now).unwrap_or_default();
+    capture_surface_poll_owners(sdl);
     METAL_SCENE_OWNERS
         .lock()
         .expect("CA owner windows")
@@ -1208,6 +1302,11 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
 }
 
 pub fn forget_metal_scene(sdl: sdl3::Window) {
+    let old = METAL_SURFACE_POLL_OWNERS
+        .lock()
+        .expect("Metal IOSurface owner registry")
+        .remove(&(sdl as usize));
+    drop(old);
     METAL_SCENE_OWNERS
         .lock()
         .expect("CA owner windows")

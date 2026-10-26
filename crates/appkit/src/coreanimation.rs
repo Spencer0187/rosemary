@@ -1136,6 +1136,30 @@ pub(crate) fn has_surface_publications() -> bool {
     SURFACE_LAYERS.load(Ordering::Relaxed) > 0
 }
 
+/// Check an attached Metal owner when its scene is captured, never on the
+/// high-frequency event pump. In-place IOSurface writes still poll the owner.
+pub(crate) fn metal_subtree_has_surface(root: Id) -> bool {
+    if !has_surface_publications() || root.is_null() {
+        return false;
+    }
+    read_all_nodes(|nodes| {
+        fn visit(nodes: &HashMap<usize, Node>, id: usize, depth: usize) -> bool {
+            if depth >= 64 {
+                return false;
+            }
+            let Some(node) = nodes.get(&id) else {
+                return false;
+            };
+            iosurface::is_surface(node.contents as CFTypeRef)
+                || node
+                    .sublayers
+                    .iter()
+                    .any(|child| visit(nodes, *child, depth + 1))
+        }
+        visit(nodes, root as usize, 0)
+    })
+}
+
 #[cfg(test)]
 fn surface_contents_changed(view: Id, rect: Rect, clip: Rect) -> bool {
     !surface_contents_damage(view, rect, clip).is_empty()
@@ -2152,6 +2176,25 @@ fn fill(store: &mut Store, rect: Rect, color: [f64; 4], opacity: f64) {
 }
 
 /// [`fill`] `shape` with its corners rounded to `radius` pixels, within `clip`.
+fn rounded_coverage(shape: Rect, radius: f64, x: i64, y: i64) -> f64 {
+    let radius = radius
+        .max(0.0)
+        .min(shape.width as f64 / 2.0)
+        .min(shape.height as f64 / 2.0);
+    if radius < 0.5 {
+        return 1.0;
+    }
+    let cx = x as f64 + 0.5;
+    let cy = y as f64 + 0.5;
+    let left = shape.x as f64;
+    let top = shape.y as f64;
+    let right = left + shape.width as f64;
+    let bottom = top + shape.height as f64;
+    let dx = (left + radius - cx).max(cx - (right - radius)).max(0.0);
+    let dy = (top + radius - cy).max(cy - (bottom - radius)).max(0.0);
+    (radius - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0)
+}
+
 fn fill_rounded(
     store: &mut Store,
     shape: Rect,
@@ -2843,6 +2886,32 @@ fn draw_layer_filtered(
         true => clip.intersection(&pixels),
         false => clip,
     };
+    // CA clips descendants to the rounded outline, not merely the
+    // container's rectangular bounds. Save the already-rendered parent
+    // (including its own rounded background), then mask child contributions.
+    let rounded_radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
+    let child_mask_area = clip.intersection(&pixels).intersection(&Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    });
+    let child_before = (presented.masks_to_bounds
+        && rounded_radius >= 0.5
+        && !presented.sublayers.is_empty()
+        && !child_mask_area.is_empty())
+    .then(|| {
+        let mut saved = Vec::with_capacity(
+            child_mask_area.width as usize * child_mask_area.height as usize * 4,
+        );
+        for row in child_mask_area.y..child_mask_area.y + child_mask_area.height {
+            let offset = (row as usize * store.width as usize + child_mask_area.x as usize) * 4;
+            saved.extend_from_slice(
+                &store.pixels[offset..offset + child_mask_area.width as usize * 4],
+            );
+        }
+        saved
+    });
     let inner = NSPoint {
         x: frame.origin.x - presented.bounds_origin.x,
         y: frame.origin.y - presented.bounds_origin.y,
@@ -2861,6 +2930,32 @@ fn draw_layer_filtered(
             selected,
             gpu_groups,
         );
+    }
+    if let Some(saved) = child_before {
+        for (row, original) in saved
+            .chunks_exact(child_mask_area.width as usize * 4)
+            .enumerate()
+        {
+            let y = child_mask_area.y + row as i64;
+            let offset = (y as usize * store.width as usize + child_mask_area.x as usize) * 4;
+            let after = &mut store.pixels[offset..offset + original.len()];
+            for (column, (prior, current)) in original
+                .chunks_exact(4)
+                .zip(after.chunks_exact_mut(4))
+                .enumerate()
+            {
+                let coverage =
+                    rounded_coverage(pixels, rounded_radius, child_mask_area.x + column as i64, y);
+                if coverage < 1.0 {
+                    for channel in 0..4 {
+                        current[channel] = (f64::from(prior[channel]) * (1.0 - coverage)
+                            + f64::from(current[channel]) * coverage)
+                            .round()
+                            .clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
     }
     if let Some(before) = before {
         for (row, source) in before.chunks_exact(target.width as usize * 4).enumerate() {
@@ -2942,6 +3037,9 @@ pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize], now: f64) -> Ve
             };
             let alpha =
                 presented(&node.animations, "opacity", node.opacity, now).clamp(0.0, 1.0) as f32;
+            if alpha <= 0.0 || node.hidden {
+                return;
+            }
             // A fully CPU-owned ordinary group is handled by the existing
             // CA rasterizer. Cross-source groups need a separate GPU target.
             let isolate =
@@ -4477,6 +4575,195 @@ mod tests {
             &just_red.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4],
             &[0, 0, 128, 128]
         );
+        send::<f32, ()>(group, "setOpacity:", 0.0);
+        assert!(
+            metal_paint_steps(metal, &[], darwin::mach::media_time()).is_empty(),
+            "fully invisible ordinary CA subtrees should not request retained sources"
+        );
+        let mut invisible = Store::for_tests(8, 8);
+        for pixel in invisible.pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 255, 0, 255]);
+        }
+        render_metal_sublayers_selected(view, &mut invisible, whole, whole, &[], &[]);
+        assert_eq!(
+            &invisible.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4],
+            &[0, 255, 0, 255]
+        );
+        send::<f32, ()>(group, "setOpacity:", 0.5);
+        assert!(
+            !metal_paint_steps(metal, &[], darwin::mach::media_time()).is_empty(),
+            "a visible opacity transition must rediscover previously hidden descendants"
+        );
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn rounded_mask_on_ordinary_ca_container_clips_metal_descendants() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(object, "initWithFrame:", rect(0., 0., 12., 12.));
+        let metal_class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ca_class = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal: Id = send(metal_class, "layer", ());
+        let mask: Id = send(ca_class, "layer", ());
+        let child: Id = send(ca_class, "layer", ());
+        send::<Id, ()>(view, "setLayer:", metal);
+        for layer in [mask, child] {
+            send::<NSRect, ()>(layer, "setFrame:", rect(0., 0., 12., 12.));
+        }
+        let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+        send::<CFTypeRef, ()>(child, "setBackgroundColor:", red);
+        send::<u8, ()>(mask, "setMasksToBounds:", 1);
+        send::<f64, ()>(mask, "setCornerRadius:", 5.);
+        send::<Id, ()>(metal, "addSublayer:", mask);
+        send::<Id, ()>(mask, "addSublayer:", child);
+        let whole = Rect {
+            x: 0,
+            y: 0,
+            width: 12,
+            height: 12,
+        };
+        let render = || {
+            let mut image = Store::for_tests(12, 12);
+            for pixel in image.pixels.chunks_exact_mut(4) {
+                pixel.copy_from_slice(&[0, 255, 0, 255]);
+            }
+            render_metal_sublayers_selected(view, &mut image, whole, whole, &[], &[]);
+            image
+        };
+        let pixel = |image: &Store, x: usize, y: usize| -> [u8; 4] {
+            image.pixels[(y * 12 + x) * 4..(y * 12 + x + 1) * 4]
+                .try_into()
+                .unwrap()
+        };
+        let first = render();
+        assert_eq!(
+            pixel(&first, 0, 0),
+            [0, 255, 0, 255],
+            "rounded corner must expose the retained green Metal background"
+        );
+        assert_eq!(pixel(&first, 6, 6), [0, 0, 255, 255]);
+        let aa = pixel(&first, 0, 2);
+        assert!(
+            aa[1] > 0 && aa[1] < 255 && aa[2] > 0 && aa[2] < 255,
+            "edge must be antialiased red over green: {aa:?}"
+        );
+        send::<f64, ()>(mask, "setCornerRadius:", 0.);
+        let square = render();
+        assert_eq!(
+            pixel(&square, 0, 0),
+            [0, 0, 255, 255],
+            "radius animation/update must invalidate rounded clipping"
+        );
+        send::<f64, ()>(mask, "setCornerRadius:", 5.);
+        send::<u8, ()>(mask, "setMasksToBounds:", 0);
+        let unclipped = render();
+        assert_eq!(
+            pixel(&unclipped, 0, 0),
+            [0, 0, 255, 255],
+            "unmasked ordinary descendants must not be rounded"
+        );
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn iosurface_poll_tracks_only_owner_view_through_reparent_and_many_idle_pumps() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let pool = objc::arc::pool_push();
+        let view = |width, height| {
+            let object = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+            send::<NSRect, Id>(object, "initWithFrame:", rect(0., 0., width, height))
+        };
+        let window = |title: &'static str| {
+            let w = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+            assert!(
+                unsafe {
+                    crate::window::init_with_content_rect_for_tests(w, rect(0., 0., 64., 48.))
+                },
+                "{title}"
+            );
+            w
+        };
+        let a = window("surface owner A");
+        let b = window("unrelated idle B");
+        let a_sdl = unsafe { crate::window::sdl_window(a) };
+        let b_sdl = unsafe { crate::window::sdl_window(b) };
+        let ca_cls = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let metal_cls = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let content_a = view(64., 48.);
+        let content_b = view(64., 48.);
+        let owner_a = view(64., 48.);
+        let owner_b = view(64., 48.);
+        let metal_a: Id = send(metal_cls, "layer", ());
+        let metal_b: Id = send(metal_cls, "layer", ());
+        send::<Id, ()>(a, "setContentView:", content_a);
+        send::<Id, ()>(b, "setContentView:", content_b);
+        send::<Id, ()>(owner_a, "setLayer:", metal_a);
+        send::<Id, ()>(owner_b, "setLayer:", metal_b);
+        send::<Id, ()>(content_a, "addSubview:", owner_a);
+        send::<Id, ()>(content_b, "addSubview:", owner_b);
+        for _ in 0..128 {
+            let idle = view(3., 3.);
+            send::<Id, ()>(content_b, "addSubview:", idle);
+        }
+        let child: Id = send(ca_cls, "layer", ());
+        send::<NSRect, ()>(child, "setFrame:", rect(6., 7., 2., 1.));
+        send::<Id, ()>(metal_a, "addSublayer:", child);
+        let surface = surface();
+        publish(surface, [2, 4, 6, 255, 2, 4, 6, 255]);
+        replace_contents(child, surface as Id);
+        crate::view::flush_metal_scenes();
+        assert_eq!(crate::view::surface_poll_owner_count_for_test(a_sdl), 1);
+        assert_eq!(crate::view::surface_poll_owner_count_for_test(b_sdl), 0);
+        let started = std::time::Instant::now();
+        let visits = crate::view::surface_poll_visits_for_test();
+        for _ in 0..128 {
+            crate::view::flush_metal_scenes();
+        }
+        let delta = crate::view::surface_poll_visits_for_test() - visits;
+        assert_eq!(
+            delta, 128,
+            "idle event pumps must poll only the one registered owner, not 128 unrelated NSViews"
+        );
+        eprintln!(
+            "idle 128-pump, two-window IOSurface polling: {:?}, {delta} owners polled",
+            started.elapsed()
+        );
+
+        send::<Id, ()>(metal_b, "addSublayer:", child);
+        crate::view::flush_metal_scenes();
+        assert_eq!(crate::view::surface_poll_owner_count_for_test(a_sdl), 0);
+        assert_eq!(crate::view::surface_poll_owner_count_for_test(b_sdl), 1);
+        let previous = crate::view::metal_scene(b_sdl).unwrap();
+        let revision = previous
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap()
+            .native_revision;
+        publish(surface, [12, 24, 36, 255, 12, 24, 36, 255]);
+        crate::view::flush_metal_scenes();
+        let updated = crate::view::metal_scene(b_sdl).unwrap();
+        let source = updated
+            .iter()
+            .find(|item| item.native_pixels.is_some())
+            .unwrap();
+        assert_ne!(source.native_revision, revision);
+        assert_eq!(
+            &source.native_pixels.as_ref().unwrap()[..4],
+            &[12, 24, 36, 255]
+        );
+
+        unsafe { remove_from_superlayer(child, objc::sel::get("removeFromSuperlayer")) };
+        crate::view::flush_metal_scenes();
+        assert_eq!(crate::view::surface_poll_owner_count_for_test(a_sdl), 0);
+        assert_eq!(crate::view::surface_poll_owner_count_for_test(b_sdl), 0);
+        unsafe { corefoundation::api::CFRelease(surface) };
+        objc::arc::release(a);
+        objc::arc::release(b);
         objc::arc::pool_pop(pool);
     }
 
