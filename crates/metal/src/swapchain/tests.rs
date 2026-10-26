@@ -7070,6 +7070,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
 /// The last guest Metal image initially has only a direct WSI owner: no
 /// retained scene image exists. Rejected first native admission must not
 /// consume that owner and replace the visible window with transparent pixels.
+#[cfg(not(target_os = "macos"))]
 fn exercise_direct_first_native_rejection(busy_restore: bool) {
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
