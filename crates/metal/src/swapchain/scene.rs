@@ -2755,14 +2755,8 @@ impl Swapchain {
                 .find(|scene| scene.id == layer && scene.ready)
             {
                 let frame = scene.frame.frame();
-                if fast_direct_layer(
-                    self.present_mode,
-                    1,
-                    &frame,
-                    scene.regions.as_deref(),
-                    self.corners.is_some(),
-                    true,
-                ) && scene.opacity >= 1.0
+                if fast_direct_layer(self.present_mode, 1, &frame, scene.regions.as_deref(), true)
+                    && scene.opacity >= 1.0
                     && !self.scene_has_opacity_groups(layer)
                     && scene.opaque
                     && scene.rounded.is_empty()

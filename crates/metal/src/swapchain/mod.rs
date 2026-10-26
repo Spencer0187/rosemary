@@ -1867,6 +1867,8 @@ fn frame_slots(_mode: vk::PresentModeKHR) -> usize {
 }
 
 /// In immediate mode the compositor publishes promptly, while FIFO's longer
+/// A window with the corners pass still goes through its composite at
+/// present time; a direct layer only skips the accumulator stage.
 /// window batch gathers a full refresh's independent layer changes. Neither
 /// timer changes the guest's command-buffer ordering or source completion.
 fn compositor_batch_delay(mode: vk::PresentModeKHR, rate: f32) -> Duration {
@@ -1883,12 +1885,22 @@ fn compositor_batch_delay(mode: vk::PresentModeKHR, rate: f32) -> Duration {
 
 /// Only a full-window opaque drawable with a retained lifetime may bypass
 /// offscreen composition. FIFO retains its previous batching behavior.
+/// How many layers presenting `layer` directly would have to account for.
+/// The window's CPU store lies below every Metal layer, so it cannot show
+/// through a drawable that covers the window with no regions cut out of it.
+fn composited_layers(swapchain: &Swapchain, layer: usize) -> usize {
+    swapchain
+        .layers
+        .iter()
+        .filter(|&&known| layer == swapchain.window || known != swapchain.window)
+        .count()
+}
+
 fn fast_direct_layer(
     mode: vk::PresentModeKHR,
     layers: usize,
     frame: &appkit::view::Frame,
     regions: Option<&[Region]>,
-    corners: bool,
     owned: bool,
 ) -> bool {
     matches!(
@@ -1897,7 +1909,6 @@ fn fast_direct_layer(
     ) && layers == 1
         && frame.covers_window()
         && regions.is_none()
-        && !corners
         && owned
 }
 
@@ -1912,10 +1923,9 @@ fn fast_direct_scene(
 ) -> bool {
     fast_direct_layer(
         swapchain.present_mode,
-        swapchain.layers.len(),
+        composited_layers(swapchain, layer),
         frame,
         regions,
-        swapchain.corners.is_some(),
         owned,
     ) && !appkit::view::metal_scene_pending()
         && !swapchain
@@ -4092,7 +4102,7 @@ impl Swapchain {
             )
         };
         let (prepared, request) = self
-            .prepare_present(&frame, if direct { None } else { Some(&[]) }, false)?
+            .prepare_present(if direct { None } else { Some(&[]) }, false)?
             .ok_or("layer compositor failed to reserve present frame")?;
         Ok(PreparedComposite {
             frame,
@@ -4992,19 +5002,15 @@ impl Swapchain {
     /// state lock for the blocking image acquisition.
     fn prepare_present(
         &mut self,
-        frame: &appkit::view::Frame,
         regions: Option<&[Region]>,
         nonblocking: bool,
     ) -> Result<Option<(PreparedPresent, AcquireRequest)>, String> {
-        // One layer covering the window needs no accumulator: what it draws
-        // is the whole of what the window shows, so it goes straight into the
-        // image the presentation engine hands back.
+        // A direct layer was admitted as the whole of what the window shows
+        // (`fast_direct_scene`), so it needs no accumulator and goes straight
+        // into the image the presentation engine hands back.
         // The corners pass reads the composite, so a window with it always
         // has one.
-        let direct = self.layers.len() <= 1
-            && (frame.covers_window() || self.direct.is_some())
-            && regions.is_none()
-            && self.corners.is_none();
+        let direct = self.direct.is_some() && regions.is_none() && self.corners.is_none();
         let composite = match direct {
             true => None,
             false => Some(self.composite()?),

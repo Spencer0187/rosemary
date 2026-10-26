@@ -408,10 +408,9 @@ fn layer_compositing_batch_delay_distinguishes_wsi_modes() {
 fn single_layer_fast_path_requires_an_owned_opaque_full_window() {
     let frame = test_full_frame(std::ptr::null_mut(), 320, 240);
     for mode in [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX] {
-        assert!(fast_direct_layer(mode, 1, &frame, None, false, true));
-        assert!(!fast_direct_layer(mode, 1, &frame, None, false, false));
-        assert!(!fast_direct_layer(mode, 2, &frame, None, false, true));
-        assert!(!fast_direct_layer(mode, 1, &frame, None, true, true));
+        assert!(fast_direct_layer(mode, 1, &frame, None, true));
+        assert!(!fast_direct_layer(mode, 1, &frame, None, false));
+        assert!(!fast_direct_layer(mode, 2, &frame, None, true));
         assert!(!fast_direct_layer(
             mode,
             1,
@@ -422,14 +421,13 @@ fn single_layer_fast_path_requires_an_owned_opaque_full_window() {
                 width: 32,
                 height: 32
             }]),
-            false,
             true,
         ));
         let shifted = appkit::view::Frame { x: 1, ..frame };
-        assert!(!fast_direct_layer(mode, 1, &shifted, None, false, true));
+        assert!(!fast_direct_layer(mode, 1, &shifted, None, true));
     }
     for mode in [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::FIFO_RELAXED] {
-        assert!(!fast_direct_layer(mode, 1, &frame, None, false, true));
+        assert!(!fast_direct_layer(mode, 1, &frame, None, true));
     }
 }
 
@@ -2394,14 +2392,7 @@ fn retained_backing_source_uses_direct_wsi_and_releases_after_gpu_copy() {
     assert_eq!(state.present_mode, expected, "real WSI mode required");
     let lease = BackingImageLease::new(gpu, image);
     state.layers.push(window as usize);
-    assert!(fast_direct_layer(
-        state.present_mode,
-        1,
-        &frame,
-        None,
-        false,
-        true
-    ));
+    assert!(fast_direct_layer(state.present_mode, 1, &frame, None, true));
     for _ in 0..FRAMES_IN_FLIGHT * 2 {
         state.queue_direct(
             8,
@@ -10164,6 +10155,53 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
     assert_eq!(pixel(&state, 80, 60), [0, 255, 0, 255]);
     drop(state);
     gpu.destroy_image(green);
+    sdl3::video::destroy_window(window);
+}
+
+/// A window's CPU store that presented before its Metal layer lies below that
+/// layer, so it must not force a full-window opaque drawable through the
+/// accumulator. The store itself never goes direct over the drawable.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn occluded_window_store_keeps_full_window_drawable_direct() {
+    if isolate_vulkan_graphical_test("occluded_window_store_keeps_full_window_drawable_direct") {
+        return;
+    }
+    let Some((window, gpu, mut state, image, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    if matches!(
+        state.present_mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) {
+        let id = 405;
+        state.layers.push(window as usize);
+        state.layers.push(id);
+        state.synchronize_scene(
+            window as usize,
+            &[ScenePlacement {
+                opacity_groups: Vec::new(),
+                id,
+                frame: DirectFrame::from_frame(&whole),
+                opacity: 1.0,
+                opaque: true,
+                clip: None,
+                rounded: vec![],
+                occluded: None,
+                native: None,
+            }],
+        );
+        assert!(fast_direct_scene(&state, id, &whole, None, true));
+        assert!(!fast_direct_scene(
+            &state,
+            window as usize,
+            &whole,
+            None,
+            true
+        ));
+    }
+    drop(state);
+    gpu.destroy_image(image);
     sdl3::video::destroy_window(window);
 }
 
