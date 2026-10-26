@@ -4849,6 +4849,166 @@ mod tests {
     }
 
     #[test]
+    fn transparent_ca_sibling_is_neutral_to_admitted_native_foreground() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0.0, 0.0, 160.0, 120.0))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0.0, 0.0, 160.0, 120.0));
+        let metal_view = view(rect(0.0, 0.0, 160.0, 120.0));
+        let label = view(rect(25.0, 20.0, 30.0, 22.0));
+        let empty = view(rect(55.0, 25.0, 24.0, 16.0));
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ca_class = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { make(metal_class as *const _ as Id, objc::sel::get("layer")) };
+        let ca = unsafe { make(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let transparent = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1.0, 0.0, 0.0, 0.0) };
+        let opaque = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1.0, 0.0, 0.0, 1.0) };
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), metal);
+            set(empty, objc::sel::get("setLayer:"), ca);
+            set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id);
+            add_subview(content, objc::sel::get("addSubview:"), metal_view);
+            add_subview(content, objc::sel::get("addSubview:"), label);
+        }
+        crate::backing::set_native_view_pixels_for_tests(
+            label,
+            30,
+            22,
+            [0u8, 0, 255, 255].repeat(30 * 22),
+        );
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 2);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_none()
+        );
+        accept_published_native_for_tests(sdl);
+        let bottom =
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .expect("admitted red foreground is separated from Metal");
+        unsafe { add_subview(content, objc::sel::get("addSubview:"), empty) };
+        flush_metal_scenes();
+        let scene = metal_scene(sdl).unwrap();
+        assert_eq!(
+            scene.len(),
+            2,
+            "all-transparent CA view unexpectedly published a GPU image"
+        );
+        assert_eq!(scene[1].native_owner, label as usize);
+        assert_eq!(
+            &scene[1].native_pixels.as_ref().unwrap()[..4],
+            &[0, 0, 255, 255]
+        );
+        let visible_frame = scene[1].frame;
+        let underlay_at_label =
+            ((visible_frame.y as usize * 160 + visible_frame.x as usize) * 4) as usize;
+        assert_eq!(
+            &bottom.pixels[underlay_at_label..underlay_at_label + 4],
+            &[237, 237, 237, 255],
+            "visible native foreground was incorrectly baked into the Metal underlay"
+        );
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_some(),
+            "known-empty CA sibling blocked the admitted foreground"
+        );
+
+        // New visible pixels invalidate the negative cache, but cannot be
+        // removed from the bottom source before GPU admission.
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), opaque as Id) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 3);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_none(),
+            "an unadmitted newly opaque CA sibling was treated as empty"
+        );
+        accept_published_native_for_tests(sdl);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_some()
+        );
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 2);
+        assert!(
+            crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                .is_some()
+        );
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { remove(empty, objc::sel::get("removeFromSuperview")) };
+        flush_metal_scenes();
+        assert_eq!(metal_scene(sdl).unwrap().len(), 2);
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &bottom,
+                &crate::backing::gpu_under_metal_cached(sdl, &crate::backing::Store::new(160, 120))
+                    .unwrap()
+            ),
+            "transparent sibling changed the independently cached underlay"
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn transparent_four_k_ca_capture_is_negatively_cached_and_invalidated() {
+        crate::bootstrap();
+        let large = view(rect(0.0, 0.0, 3840.0, 2160.0));
+        let other = view(rect(0.0, 0.0, 16.0, 16.0));
+        let cls = objc::class::lookup(c"CALayer").unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let ca = unsafe { make(cls as *const _ as Id, objc::sel::get("layer")) };
+        let unrelated = unsafe { make(cls as *const _ as Id, objc::sel::get("layer")) };
+        let transparent = unsafe { crate::cgcontext::CGColorCreateGenericRGB(0.0, 0.0, 1.0, 0.0) };
+        let opaque = unsafe { crate::cgcontext::CGColorCreateGenericRGB(0.0, 0.0, 1.0, 1.0) };
+        unsafe {
+            set(large, objc::sel::get("setLayer:"), ca);
+            set(other, objc::sel::get("setLayer:"), unrelated);
+            set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id);
+        }
+        let before = crate::backing::native_render_count_for_tests();
+        assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
+        for _ in 0..24 {
+            crate::coreanimation::changed(unrelated);
+            assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
+        }
+        assert_eq!(
+            crate::backing::native_render_count_for_tests() - before,
+            1,
+            "unchanged 4K transparent CA was rasterized more than once"
+        );
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), opaque as Id) };
+        let image = crate::backing::native_scene_pixels(large, 3840, 2160)
+            .expect("a changed opaque CA layer must invalidate empty cache");
+        assert!(image.0.chunks_exact(4).any(|pixel| pixel[3] != 0));
+        assert_eq!(crate::backing::native_render_count_for_tests() - before, 2);
+        unsafe { set(ca, objc::sel::get("setBackgroundColor:"), transparent as Id) };
+        assert!(crate::backing::native_scene_pixels(large, 3840, 2160).is_none());
+        assert_eq!(crate::backing::native_render_count_for_tests() - before, 3);
+        crate::backing::forget(large);
+        crate::backing::forget(other);
+        objc::arc::release(large);
+        objc::arc::release(other);
+    }
+
+    #[test]
     fn native_cpu_pixels_are_separate_above_metal_and_underneath_below_it() {
         crate::bootstrap();
         if !sdl3::may_pump() {

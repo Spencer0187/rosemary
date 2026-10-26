@@ -1957,7 +1957,8 @@ fn native_scene_pixels_impl(
                     && hit.excluded_view_layers == excluded_view_layers
             })
     {
-        return Some((std::sync::Arc::clone(&hit.pixels), hit.revision));
+        return (!hit.pixels.is_empty())
+            .then(|| (std::sync::Arc::clone(&hit.pixels), hit.revision));
     }
     // CA animations, overlay content and sublayer rendering have their own
     // invalidation paths: only a plain source store can assert narrow damage.
@@ -1985,7 +1986,8 @@ fn native_scene_pixels_impl(
         {
             prior.view_generation = view_generation;
             prior.damage = None;
-            return Some((std::sync::Arc::clone(&prior.pixels), prior.revision));
+            return (!prior.pixels.is_empty())
+                .then(|| (std::sync::Arc::clone(&prior.pixels), prior.revision));
         }
     }
 
@@ -2110,23 +2112,22 @@ fn native_scene_pixels_impl(
         }
         output
     };
-    if output
+    // A verified empty capture must have the same generation/dependency
+    // validation as a nonempty image. Keep only a zero-byte sentinel, not
+    // the full transparent RGBA allocation, and never emit it to Metal.
+    let empty = output
         .pixels
         .as_chunks::<4>()
         .0
         .iter()
-        .all(|pixel| pixel[3] == 0)
-    {
-        NATIVE_CAPTURES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&key);
-        return None;
-    }
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    output.pixels.hash(&mut hasher);
-    let revision = hasher.finish();
-    let pixels = std::sync::Arc::new(output.pixels);
+        .all(|pixel| pixel[3] == 0);
+    let (pixels, revision) = if empty {
+        (std::sync::Arc::new(Vec::new()), 0)
+    } else {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        output.pixels.hash(&mut hasher);
+        (std::sync::Arc::new(output.pixels), hasher.finish())
+    };
     let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
     if content_animating {
         captures.remove(&key);
@@ -2165,7 +2166,7 @@ fn native_scene_pixels_impl(
             }
         }
     }
-    Some((pixels, revision))
+    (!empty).then_some((pixels, revision))
 }
 
 /// The AppKit event thread only publishes proposed native sources. Metal
@@ -2383,6 +2384,68 @@ pub(crate) fn underlay_animation_tick(sdl: sdl3::Window, now: f64) -> bool {
     active || was
 }
 
+/// A missing native capture is not evidence of transparency. Recapture the
+/// visible pixels and accept only the validated, zero-byte negative entry.
+/// Use the same crop/tile geometry as native AppKit scene publication.
+fn native_scene_proven_empty(placed: &Placed) -> bool {
+    let visible = placed.rect.intersection(&placed.clip);
+    if visible.is_empty() {
+        return true;
+    }
+    let (Ok(width), Ok(height)) = (
+        u32::try_from(placed.rect.width),
+        u32::try_from(placed.rect.height),
+    ) else {
+        return false;
+    };
+    // Scene publication uses one capture when it fits the 64 MiB limit,
+    // otherwise independent 2048-pixel tiles.
+    let tile_edge = if native_scene_extent_supported(visible.width as u32, visible.height as u32) {
+        i64::MAX
+    } else {
+        2048
+    };
+    let mut y = visible.y;
+    while y < visible.y + visible.height {
+        let height_tile = (visible.y + visible.height - y).min(tile_edge);
+        let mut x = visible.x;
+        while x < visible.x + visible.width {
+            let width_tile = (visible.x + visible.width - x).min(tile_edge);
+            let crop = Rect {
+                x: x - placed.rect.x,
+                y: y - placed.rect.y,
+                width: width_tile,
+                height: height_tile,
+            };
+            if native_scene_pixels_cropped(placed.view, width, height, crop).is_some() {
+                return false;
+            }
+            let key = (
+                placed.view as usize,
+                crop.x,
+                crop.y,
+                width_tile as u32,
+                height_tile as u32,
+                width,
+                height,
+                false,
+                0,
+            );
+            if !NATIVE_CAPTURES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+                .is_some_and(|capture| capture.pixels.is_empty())
+            {
+                return false;
+            }
+            x += width_tile;
+        }
+        y += height_tile;
+    }
+    true
+}
+
 /// A native source belongs outside the bottom store only once its complete
 /// independent snapshot has been accepted. If any top view lacks a source,
 /// preserve the original full window path instead of silently losing it.
@@ -2395,23 +2458,43 @@ fn can_separate_native(sdl: sdl3::Window, placed: &[Placed], first: usize) -> bo
     let captured = admitted_native_in_published_scene(sdl, false);
     let views = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     let overlays = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let sources = placed[first + 1..]
+        .iter()
+        .filter(|p| !crate::layer::is_metal(crate::view::layer_of(p.view)))
+        .map(|p| {
+            let has_store = views
+                .as_ref()
+                .is_some_and(|stores| stores.contains_key(&(p.view as usize)));
+            let has_overlay = overlays.iter().any(|(id, _)| *id == p.view as usize);
+            let has_dma = overlays.iter().any(|(id, entry)| {
+                *id == p.view as usize && matches!(entry.picture, Picture::Dmabuf(_))
+            });
+            (
+                p,
+                has_store
+                    || has_overlay
+                    || crate::coreanimation::has_tree(crate::view::layer_of(p.view)),
+                has_dma,
+            )
+        })
+        .collect::<Vec<_>>();
+    drop(overlays);
+    drop(views);
     let mut any = false;
-    for p in &placed[first + 1..] {
-        if crate::layer::is_metal(crate::view::layer_of(p.view)) {
+    for (p, drawn, has_dma) in sources {
+        if !drawn || p.clip.is_empty() {
             continue;
         }
-        let drawn = views
-            .as_ref()
-            .is_some_and(|stores| stores.contains_key(&(p.view as usize)))
-            || overlays.iter().any(|(id, _)| *id == p.view as usize)
-            || crate::coreanimation::has_tree(crate::view::layer_of(p.view));
-        if !drawn {
+        if captured.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
+            any = true;
             continue;
         }
-        any = true;
-        if !captured.contains(&((p.view as usize) | (1usize << (usize::BITS - 1)))) {
-            return false;
+        // DMA producers may be visible even when their CPU/CA capture is
+        // empty. An unadmitted producer must never be silently subtracted.
+        if !has_dma && native_scene_proven_empty(p) {
+            continue;
         }
+        return false;
     }
     any
 }
