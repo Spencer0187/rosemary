@@ -134,6 +134,7 @@ exports::exports! {
         "dispatch_source_set_event_handler_f" => source::set_event_handler_f,
         "dispatch_source_set_cancel_handler" => source::set_cancel_handler,
         "dispatch_source_set_cancel_handler_f" => source::set_cancel_handler_f,
+        "dispatch_source_set_timer" => source::set_timer,
         "dispatch_source_cancel" => source::cancel,
         "dispatch_source_testcancel" => source::testcancel,
         "dispatch_source_get_data" => source::get_data,
@@ -152,6 +153,7 @@ exports::exports! {
         "__dispatch_source_type_write" => source::type_write(),
         "__dispatch_source_type_signal" => source::type_signal(),
         "__dispatch_source_type_vnode" => source::type_vnode(),
+        "__dispatch_source_type_timer" => source::type_timer(),
     }
 }
 

@@ -9,11 +9,12 @@
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex, OnceLock};
 
 use super::block;
 use super::object::{self, Function, Header, Kind};
 use super::queue;
+use super::time;
 use crate::kqueue::Kevent;
 
 const EVFILT_READ: i16 = -1;
@@ -40,9 +41,10 @@ enum Type {
     Write,
     Signal,
     Vnode,
+    Timer,
 }
 
-const TYPES: [Type; 7] = [
+const TYPES: [Type; 8] = [
     Type::DataAdd,
     Type::DataOr,
     Type::DataReplace,
@@ -50,10 +52,11 @@ const TYPES: [Type; 7] = [
     Type::Write,
     Type::Signal,
     Type::Vnode,
+    Type::Timer,
 ];
 
 /// One word per type; only the addresses matter.
-static TYPE_OBJECTS: [u64; 7] = [0; 7];
+static TYPE_OBJECTS: [u64; 8] = [0; 8];
 
 fn type_object(t: Type) -> u64 {
     &TYPE_OBJECTS[t as usize] as *const u64 as u64
@@ -84,6 +87,9 @@ pub fn type_signal() -> u64 {
 pub fn type_vnode() -> u64 {
     type_object(Type::Vnode)
 }
+pub fn type_timer() -> u64 {
+    type_object(Type::Timer)
+}
 
 enum Handler {
     /// A copy this source owns.
@@ -112,7 +118,6 @@ impl Drop for Handler {
     }
 }
 
-#[derive(Default)]
 struct State {
     event: Option<std::sync::Arc<Handler>>,
     cancel: Option<Handler>,
@@ -127,6 +132,30 @@ struct State {
     scheduled: bool,
     cancelled: bool,
     cancel_queued: bool,
+    /// Timer sources: the next expiry on [`time::now`]'s clock, and the period
+    /// after it (zero for a one-shot).
+    deadline: u64,
+    interval: u64,
+    /// A timer thread is running for this source.
+    timer_running: bool,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        State {
+            event: None,
+            cancel: None,
+            suspended: 0,
+            pending: 0,
+            id: None,
+            scheduled: false,
+            cancelled: false,
+            cancel_queued: false,
+            deadline: time::FOREVER,
+            interval: 0,
+            timer_running: false,
+        }
+    }
 }
 
 /// `#[repr(C)]` with the header first, for the same reason as
@@ -142,6 +171,8 @@ pub struct Source {
     /// What `dispatch_source_get_data` answers inside the handler.
     data: AtomicU64,
     state: Mutex<State>,
+    /// Wakes a timer thread when its deadline, suspension or cancellation changes.
+    timer_changed: Condvar,
 }
 
 impl Drop for Source {
@@ -172,7 +203,7 @@ impl Source {
     fn merge(&self, value: u64) {
         let mut state = self.lock();
         state.pending = match self.kind {
-            Type::DataAdd | Type::Signal => state.pending.wrapping_add(value),
+            Type::DataAdd | Type::Signal | Type::Timer => state.pending.wrapping_add(value),
             Type::DataOr | Type::Vnode => state.pending | value,
             // Readiness reports the current amount, not a sum.
             Type::DataReplace | Type::Read | Type::Write => value,
@@ -473,6 +504,7 @@ pub unsafe extern "C" fn create(kind: u64, handle: u64, mask: u64, target: u64) 
             suspended: 1,
             ..State::default()
         }),
+        timer_changed: Condvar::new(),
     });
     Box::into_raw(source) as u64
 }
@@ -532,6 +564,7 @@ pub unsafe extern "C" fn cancel(handle: u64) {
             return;
         }
         state.cancelled = true;
+        s.timer_changed.notify_all();
         state.id.take()
     };
     if let Some(id) = id {
@@ -590,7 +623,13 @@ pub(crate) fn resume(handle: u64) -> bool {
     if state.suspended > 0 {
         return true;
     }
-    if state.id.is_none() && !state.cancelled {
+    if s.kind == Type::Timer {
+        s.timer_changed.notify_all();
+        if !state.timer_running && !state.cancelled {
+            state.timer_running = true;
+            start_timer(s);
+        }
+    } else if state.id.is_none() && !state.cancelled {
         drop(state);
         let id = monitor().arm(s);
         state = s.lock();
@@ -606,6 +645,95 @@ pub(crate) fn resume(handle: u64) -> bool {
     s.schedule(&mut state);
     s.finish_cancel(&mut state);
     true
+}
+
+/// Run `s`'s timer on a thread of its own, holding a reference until cancelled.
+///
+/// The monitor's kqueue has no `EVFILT_TIMER`, and a thread blocked on a condition
+/// variable is what lets a changed deadline take effect at once.
+fn start_timer(s: &Source) {
+    let handle = s.self_handle();
+    object::retain(handle);
+    let spawned = std::thread::Builder::new()
+        .name("dispatch-timer".into())
+        .spawn(move || {
+            // SAFETY: the reference taken above is held until this thread ends.
+            if let Some(s) = unsafe { source(handle) } {
+                run_timer(s);
+            }
+            // SAFETY: as above.
+            unsafe { object::release(handle) };
+        });
+    if spawned.is_err() {
+        // SAFETY: the reference taken above.
+        unsafe { object::release(handle) };
+    }
+}
+
+fn run_timer(s: &Source) {
+    let mut state = s.lock();
+    loop {
+        if state.cancelled {
+            return;
+        }
+        let wait = match time::remaining(state.deadline) {
+            _ if state.suspended > 0 => None,
+            Some(0) => {
+                let now = time::now();
+                // Expiries missed while busy coalesce into one delivery's count.
+                let elapsed = match state.interval {
+                    0 => 1,
+                    interval => 1 + now.saturating_sub(state.deadline) / interval,
+                };
+                state.deadline = match state.interval {
+                    0 => time::FOREVER,
+                    interval => state
+                        .deadline
+                        .saturating_add(elapsed.saturating_mul(interval)),
+                };
+                state.pending = state.pending.wrapping_add(elapsed);
+                s.schedule(&mut state);
+                continue;
+            }
+            remaining => remaining.map(std::time::Duration::from_nanos),
+        };
+        state = match wait {
+            Some(wait) => {
+                s.timer_changed
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(|e| e.into_inner())
+                    .0
+            }
+            None => s
+                .timer_changed
+                .wait(state)
+                .unwrap_or_else(|e| e.into_inner()),
+        };
+    }
+}
+
+/// `void dispatch_source_set_timer(dispatch_source_t, dispatch_time_t start,
+/// uint64_t interval, uint64_t leeway)`
+///
+/// FIXME (ACCURACY): leeway is ignored, and a `dispatch_walltime` start is read as
+/// a monotonic one.
+pub unsafe extern "C" fn set_timer(handle: u64, start: u64, interval: u64, _leeway: u64) {
+    // SAFETY: the guest holds a reference for the call.
+    let Some(s) = (unsafe { source(handle) }) else {
+        return;
+    };
+    if s.kind != Type::Timer {
+        return;
+    }
+    let mut state = s.lock();
+    state.deadline = start;
+    // A forever interval is a one-shot.
+    state.interval = if interval == time::FOREVER {
+        0
+    } else {
+        interval
+    };
+    s.timer_changed.notify_all();
 }
 
 /// `dispatch_suspend` for a source.
@@ -692,6 +820,30 @@ mod tests {
             merge_data(s, 3);
             resume(s);
             wait_for(|| ADDED.load(Ordering::Acquire) == 5);
+            cancel(s);
+            object::release(s);
+            object::release(queue);
+        }
+    }
+
+    static TICKS: AtomicU64 = AtomicU64::new(0);
+
+    unsafe extern "C" fn on_tick(context: *mut c_void) {
+        TICKS.fetch_add(unsafe { get_data(context as u64) }, Ordering::AcqRel);
+    }
+
+    /// A repeating timer keeps firing until cancelled.
+    #[test]
+    fn a_timer_repeats_until_cancelled() {
+        let queue = queue::create_serial("timer source test");
+        // SAFETY: entry points called as a guest would.
+        unsafe {
+            let s = create(type_timer(), 0, 0, queue);
+            object::set_context(s, s as *mut c_void);
+            set_event_handler_f(s, on_tick as *const () as u64);
+            set_timer(s, time::time(time::NOW, 5_000_000), 5_000_000, 0);
+            resume(s);
+            wait_for(|| TICKS.load(Ordering::Acquire) >= 3);
             cancel(s);
             object::release(s);
             object::release(queue);
