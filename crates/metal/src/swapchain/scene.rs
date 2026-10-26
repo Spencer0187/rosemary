@@ -22,7 +22,7 @@ impl Drop for EscrowBuffer {
 #[derive(Clone)]
 pub(super) struct SceneLayer {
     pub(super) id: usize,
-    frame: DirectFrame,
+    pub(super) frame: DirectFrame,
     pub(super) snapshot: Arc<BackingImageLease>,
     pub(super) spare: Vec<Arc<BackingImageLease>>,
     opacity: f32,
@@ -442,7 +442,7 @@ pub(super) struct SceneBlender {
 }
 
 impl SceneBlender {
-    fn new(gpu: &'static Gpu, window: usize) -> Result<Self, String> {
+    pub(super) fn new(gpu: &'static Gpu, window: usize) -> Result<Self, String> {
         let device = &gpu.device;
         let set_layout = gpu.descriptor_set_layout(
             &[
@@ -1348,20 +1348,51 @@ impl Swapchain {
         self.shed_scene_snapshot_spares();
     }
 
-    fn opacity_group_descriptor_count(&self, tile_edge: u32) -> Result<usize, String> {
-        let group_closures = self
+    pub(super) fn opacity_group_descriptor_count(&self, tile_edge: u32) -> Result<usize, String> {
+        let known = self
             .scene_placements
             .iter()
-            .try_fold(0usize, |total, source| {
-                total.checked_add(source.opacity_groups.len())
-            })
-            .ok_or("CA group descriptor count overflow")?;
-        self.layers
-            .len()
-            .checked_add(group_closures)
-            .and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_mul(self.scene_tiles(tile_edge).len()))
-            .ok_or_else(|| "CA group descriptor count overflow".to_string())
+            .map(|p| p.id)
+            .collect::<std::collections::HashSet<_>>();
+        let available = self
+            .scene_layers
+            .iter()
+            .map(|layer| layer.id)
+            .collect::<std::collections::HashSet<_>>();
+        let mut total = 1usize; // Dedicated damage-clear descriptor.
+        for tile in self.scene_tiles(tile_edge) {
+            let normalized = self.normalized_opacity_paths_in(Some(tile));
+            let by_id = normalized
+                .iter()
+                .map(|(id, path, _)| (*id, path.as_slice()))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut open = &[][..];
+            for id in &self.layers {
+                if !available.contains(id) {
+                    continue;
+                }
+                let wanted = match by_id.get(id) {
+                    Some(&path) => path,
+                    None if known.contains(id) => continue,
+                    // A legacy GPU-only layer is drawn as an ungrouped source.
+                    None => &[][..],
+                };
+                let common = open
+                    .iter()
+                    .zip(wanted)
+                    .take_while(|(a, b)| *a == *b)
+                    .count();
+                total = total
+                    .checked_add(open.len() - common)
+                    .and_then(|n| n.checked_add(1))
+                    .ok_or("CA tile descriptor count overflow")?;
+                open = wanted;
+            }
+            total = total
+                .checked_add(open.len())
+                .ok_or("CA descriptor count overflow")?;
+        }
+        Ok(total.max(self.layers.len().saturating_add(1)))
     }
 
     // The same scratch depth may be used for multiple sibling groups in
@@ -1372,10 +1403,6 @@ impl Swapchain {
     // its only child without any intermediate target or changed paint order.
     // Only sources with a nonempty viewport/rectangular-clip intersection
     // participate in CA isolation. Use the same bounds for scratch sizing.
-    fn visible_scene_bounds(&self, placement: &ScenePlacement) -> Option<Region> {
-        self.visible_scene_bounds_in(placement, None)
-    }
-
     fn visible_scene_bounds_in(
         &self,
         placement: &ScenePlacement,
@@ -1582,30 +1609,6 @@ impl Swapchain {
         requirements
     }
 
-    fn sparse_isolation_scene(&self) -> bool {
-        let normalized = self.normalized_opacity_paths();
-        let regions = self.opacity_group_regions(&normalized);
-        let mut largest_group = 0u64;
-        for (_, bounds) in regions {
-            largest_group = largest_group.max(bounds.width as u64 * bounds.height as u64);
-        }
-        let ids: std::collections::HashSet<_> = normalized
-            .iter()
-            .filter(|(_, path, _)| !path.is_empty())
-            .map(|(id, _, _)| *id)
-            .collect();
-        let source_area = self
-            .scene_placements
-            .iter()
-            .filter(|p| ids.contains(&p.id))
-            .filter_map(|p| self.visible_scene_bounds(p))
-            .map(|r| r.width as u64 * r.height as u64)
-            .sum::<u64>();
-        // Unlike a dense fullscreen group, disjoint tiny descendants leave
-        // large holes in the union bounding rectangle. Tile only these.
-        largest_group > source_area.saturating_mul(8)
-    }
-
     pub(super) fn prepare_opacity_group_targets(&mut self, slot: usize) -> Result<(), String> {
         let mut requirements = self.isolation_requirements(0);
         let mut depth = requirements.len();
@@ -1643,11 +1646,9 @@ impl Swapchain {
             })
             .sum::<u64>();
         if !fits_scene_budget(persistent, minimum_scratch) {
-            if !self.sparse_isolation_scene() {
-                return Err(TERMINAL_GROUP_BUDGET.into());
-            }
-            // The union rectangle is not an irreducible requirement: a
-            // bounded tile respects CA group order at each screen pixel.
+            // A union rectangle is only one representation, not a lower
+            // bound on per-pixel CA isolation. Attempt bounded tiles for
+            // *all* layouts before classifying a scene as terminal.
             let mut admitted = false;
             for edge in [512u32, 256, 128, 64] {
                 if self.scene_tiles(edge).len() > 4096 {
@@ -2138,6 +2139,9 @@ impl Swapchain {
             .as_ref()
             .ok_or("retained scene blend pipeline absent")?;
         let slot = self.frame % self.frames.len().max(1);
+        #[cfg(test)]
+        self.last_scene_dispatches
+            .store(0, std::sync::atomic::Ordering::Relaxed);
         let mask_spans = blender.write_masks(slot, &self.scene_layers)?;
         let clear = vk::ClearColorValue { float32: [0.0; 4] };
         let range = vk::ImageSubresourceRange {
@@ -2147,20 +2151,30 @@ impl Swapchain {
             base_array_layer: 0,
             layer_count: 1,
         };
-        // A source update inside an isolated group can alter pixels anywhere
-        // inside its group's overlap. Rebuild that complete group, not only
-        // the incoming source rectangle.
-        let groups_present = self
-            .normalized_opacity_paths()
+        // Only update a damaged area if it cannot intersect ANY visible
+        // isolated group. Group pixels outside that area must be preserved
+        // exactly, not blended into the accumulator a second time.
+        let global_normalized = self.normalized_opacity_paths();
+        let group_regions = self.opacity_group_regions(&global_normalized);
+        let isolated_sources = global_normalized
             .iter()
-            .any(|(_, path, _)| !path.is_empty());
-        let damage = (!groups_present)
-            .then(|| {
-                pending
-                    .and_then(|work| work.damage)
-                    .map(|frame| frame.frame())
-            })
-            .flatten();
+            .filter(|(_, path, _)| !path.is_empty())
+            .map(|(id, _, _)| *id)
+            .collect::<std::collections::HashSet<_>>();
+        let damage = pending
+            .and_then(|work| work.damage)
+            .map(|f| f.frame())
+            .filter(|frame| {
+                group_regions.iter().all(|(_, region)| {
+                    let left = i64::from(frame.x).max(i64::from(region.x));
+                    let top = i64::from(frame.y).max(i64::from(region.y));
+                    let right = (i64::from(frame.x) + i64::from(frame.width))
+                        .min(i64::from(region.x) + i64::from(region.width));
+                    let bottom = (i64::from(frame.y) + i64::from(frame.height))
+                        .min(i64::from(region.y) + i64::from(region.height));
+                    right <= left || bottom <= top
+                })
+            });
         #[cfg(test)]
         self.last_scene_repaint_pixels.store(
             damage
@@ -2197,7 +2211,7 @@ impl Swapchain {
             blender.bind(
                 command_buffer,
                 slot,
-                self.layers.len(),
+                self.opacity_group_descriptor_count(self.scene_tile_edge)? - 1,
                 &first.snapshot.image,
                 output,
             )?;
@@ -2211,6 +2225,9 @@ impl Swapchain {
                     ..damage
                 },
             );
+            #[cfg(test)]
+            self.last_scene_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             blender.draw(
                 command_buffer,
                 &crate::overlay::Placement {
@@ -2392,6 +2409,9 @@ impl Swapchain {
                 }
                 blender.bind(command_buffer, slot, *index, source, target)?;
                 *index += 1;
+                #[cfg(test)]
+                self.last_scene_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 blender.draw_at(
                     command_buffer,
                     &crate::overlay::Placement {
@@ -2442,6 +2462,12 @@ impl Swapchain {
                     by_id
                 });
             for id in &self.layers {
+                if damage.is_some() && isolated_sources.contains(id) {
+                    // All isolated group bounds were proved disjoint from
+                    // the damage rect; reuse their committed accumulator
+                    // pixels without touching their isolation buffers.
+                    continue;
+                }
                 let Some(&scene) = ready_scenes.get(id) else {
                     continue;
                 };
@@ -2535,6 +2561,9 @@ impl Swapchain {
                             vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
                         )),
                     };
+                    #[cfg(test)]
+                    self.last_scene_dispatches
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     blender.draw_at(command_buffer, &placement, target_origin);
                 };
                 if let Some(clips) = &scene.regions {

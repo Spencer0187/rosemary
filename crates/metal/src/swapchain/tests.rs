@@ -4268,9 +4268,380 @@ fn sparse_seven_level_six_k_visible_groups_render_with_bounded_tiles() {
 
 #[test]
 #[cfg(not(target_os = "macos"))]
-fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
+fn six_k_group_disjoint_damage_keeps_incremental_pixels_and_dispatches() {
     if isolate_vulkan_graphical_test(
-        "irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress",
+        "six_k_group_disjoint_damage_keeps_incremental_pixels_and_dispatches",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (6016u32, 3384u32);
+    let window =
+        sdl3::video::create_window(c"6k group disjoint damage", width as i32, height as i32, 0)
+            .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let full = test_full_frame(window, width, height);
+    let group = appkit::view::Frame {
+        x: 20,
+        y: 20,
+        width: 20,
+        height: 20,
+        ..full
+    };
+    let far = appkit::view::Frame {
+        x: 5900,
+        y: 3200,
+        width: 12,
+        height: 12,
+        ..full
+    };
+    let green = test_render_target(gpu, width, height).unwrap();
+    let red = test_render_target(gpu, 20, 20).unwrap();
+    let blue = test_render_target(gpu, 20, 20).unwrap();
+    let smallred = test_render_target(gpu, 12, 12).unwrap();
+    let smallblue = test_render_target(gpu, 12, 12).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, green.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, blue.image, [1., 0., 0., 1.]);
+        cmd_test_clear_color(device, cb, smallred.image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, smallblue.image, [1., 0., 0., 1.]);
+    })
+    .unwrap();
+    let base = test_opaque_metal_placement(0xf000, DirectFrame::from_frame(&full));
+    let mut one = test_opaque_metal_placement(0xf001, DirectFrame::from_frame(&group));
+    let mut two = test_opaque_metal_placement(0xf002, DirectFrame::from_frame(&group));
+    for item in [&mut one, &mut two] {
+        item.opacity_groups = vec![appkit::view::OpacityGroup {
+            id: 0xf100,
+            opacity: 0.5,
+        }];
+    }
+    let distant = test_opaque_metal_placement(0xf003, DirectFrame::from_frame(&far));
+    let live = vec![base.clone(), one.clone(), two.clone(), distant.clone()];
+    state.layers = live.iter().map(|p| p.id).collect();
+    state.synchronize_scene(window as usize, &live);
+    for (entry, rect, source) in [
+        (&base, &full, PresentSource::from(&green)),
+        (&one, &group, PresentSource::from(&red)),
+        (&two, &group, PresentSource::from(&blue)),
+        (&distant, &far, PresentSource::from(&smallred)),
+    ] {
+        assert_eq!(
+            state.stage_composite_source(
+                entry.id,
+                rect,
+                source,
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+    }
+    state.idle();
+    let sample = |state: &Swapchain, x: u32, y: u32| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            x,
+            y,
+        )
+    };
+    let frozen_group = sample(&state, 25, 25);
+    let mut part_calls = 0u64;
+    let mut full_calls = 0u64;
+    let mut part_ns = 0u128;
+    let mut full_ns = 0u128;
+    for n in 0..6 {
+        let incoming = if n % 2 == 0 { &smallblue } else { &smallred };
+        let start = Instant::now();
+        assert_eq!(
+            state.stage_composite_source(
+                distant.id,
+                &far,
+                PresentSource::from(incoming),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+        state.idle();
+        part_ns += start.elapsed().as_nanos();
+        let area = state.last_scene_repaint_pixels.load(Ordering::Relaxed);
+        assert_eq!(area, 144, "unrelated group forced entire 6K repaint");
+        part_calls += state.last_scene_dispatches.load(Ordering::Relaxed);
+        let partial_group = sample(&state, 25, 25);
+        let partial_far = sample(&state, 5905, 3205);
+        assert_eq!(
+            partial_group, frozen_group,
+            "group not overlapping damage was modified during incremental repaint"
+        );
+        let start = Instant::now();
+        assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+        state.idle();
+        full_ns += start.elapsed().as_nanos();
+        full_calls += state.last_scene_dispatches.load(Ordering::Relaxed);
+        assert_eq!(
+            state.last_scene_repaint_pixels.load(Ordering::Relaxed),
+            width as u64 * height as u64
+        );
+        assert_eq!(
+            sample(&state, 25, 25),
+            partial_group,
+            "group full-scene reference differs"
+        );
+        assert_eq!(
+            sample(&state, 5905, 3205),
+            partial_far,
+            "updated source full-scene reference differs"
+        );
+    }
+    assert!(
+        part_calls < full_calls,
+        "partial repaint failed to save GPU draw dispatches: {part_calls} vs {full_calls}"
+    );
+    eprintln!(
+        "6K grouped remote updates: incremental dispatch={part_calls}, full={full_calls}, incremental mean={}us, full mean={}us",
+        part_ns / 6000,
+        full_ns / 6000
+    );
+    drop(state);
+    for image in [green, red, blue, smallred, smallblue] {
+        gpu.destroy_image(image);
+    }
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn dense_six_k_seven_branching_groups_sample_small_textures_and_revise_pixels() {
+    if isolate_vulkan_graphical_test(
+        "dense_six_k_seven_branching_groups_sample_small_textures_and_revise_pixels",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (6016u32, 3384u32);
+    let window = sdl3::video::create_window(
+        c"dense six K tiny GPU sources",
+        width as i32,
+        height as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let full = test_full_frame(window, width, height);
+    let green = test_render_target(gpu, width, height).unwrap();
+    let red = test_render_target(gpu, 16, 16).unwrap();
+    let blue = test_render_target(gpu, 16, 16).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, green.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, blue.image, [1., 0., 0., 1.]);
+    })
+    .unwrap();
+    let base = test_opaque_metal_placement(0xd000, DirectFrame::from_frame(&full));
+    let mut live = vec![base.clone()];
+    for depth in 0..8 {
+        let mut item = test_opaque_metal_placement(0xd100 + depth, DirectFrame::from_frame(&full));
+        item.opacity_groups = (0..=depth)
+            .map(|n| appkit::view::OpacityGroup {
+                id: 0xd200 + n,
+                opacity: 0.5,
+            })
+            .collect();
+        live.push(item);
+    }
+    state.layers = live.iter().map(|p| p.id).collect();
+    state.synchronize_scene(window as usize, &live);
+    assert_eq!(
+        state.stage_composite_source(
+            base.id,
+            &full,
+            PresentSource::from(&green),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    for item in &live[1..] {
+        assert_eq!(
+            state.stage_composite_source(
+                item.id,
+                &full,
+                PresentSource::from(&red),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+    }
+    state.idle();
+    assert_eq!(
+        state.group_targets[0].len(),
+        7,
+        "nested branching target count"
+    );
+    assert!(
+        state.scene_tile_edge > 0,
+        "full-viewport frames must not be terminal"
+    );
+    let sample = |state: &Swapchain, x: u32, y: u32| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            x,
+            y,
+        )
+    };
+    for (x, y) in [(8, 8), (width / 2, height / 2), (width - 10, height - 10)] {
+        let p = sample(&state, x, y);
+        assert!(
+            p[0] <= 2 && (126..=129).contains(&p[1]) && (126..=129).contains(&p[2]) && p[3] == 255,
+            "full-window placement did not sample 16x16 red image: {x},{y} {p:?}"
+        );
+    }
+    assert_eq!(
+        state.stage_composite_source(
+            live[1].id,
+            &full,
+            PresentSource::from(&blue),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    let updated = sample(&state, width / 2, height / 2);
+    assert!(
+        updated[0] > 20 && updated[2] < 120 && updated[3] == 255,
+        "changed 16x16 source did not advance full-frame pixels: {updated:?}"
+    );
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+
+    // Hundreds of additional distinct visible views occupy one 512px
+    // tile, yet descriptor reservation must not multiply them by all 84
+    // screen tiles. Each shares the same immutable GPU-owned backing lease.
+    let reference = state
+        .scene_layers
+        .iter()
+        .find(|l| l.id == live[2].id)
+        .unwrap()
+        .clone();
+    let mut crowded = live.clone();
+    for n in 0..256usize {
+        let rect = appkit::view::Frame {
+            x: 16 + (n % 16) as i32 * 16,
+            y: 16 + (n / 16) as i32 * 16,
+            width: 16,
+            height: 16,
+            ..full
+        };
+        let mut placement = test_opaque_metal_placement(0xe000 + n, DirectFrame::from_frame(&rect));
+        placement.opacity_groups = (0..7)
+            .map(|i| appkit::view::OpacityGroup {
+                id: 0xd200 + i,
+                opacity: 0.5,
+            })
+            .collect();
+        let mut snapshot = reference.clone();
+        snapshot.id = placement.id;
+        snapshot.frame = DirectFrame::from_frame(&rect);
+        snapshot.ready = true;
+        state.scene_layers.push(snapshot);
+        crowded.push(placement);
+    }
+    state
+        .layers
+        .extend(crowded.iter().skip(live.len()).map(|p| p.id));
+    state.synchronize_scene(window as usize, &crowded);
+    let planned = state.opacity_group_descriptor_count(512).unwrap();
+    assert!(
+        planned < 12000,
+        "tile-local visibility inflated planned descriptors: {planned}"
+    );
+    state
+        .prepare_opacity_group_targets(state.frame % state.frames.len())
+        .unwrap();
+    let actual = state.scene_blender.as_ref().unwrap().sets[0].len();
+    assert!(
+        actual <= planned.saturating_mul(2).max(32),
+        "descriptor pool grew beyond geometric bound: {actual} vs {planned}"
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(sample(&state, width - 10, height - 10)[3] == 255);
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+    eprintln!(
+        "6K dense 256 crowded views: planned_descriptors={planned}, reserved_per_slot={actual}, scene_gpu_bytes={}",
+        state.scene_gpu_bytes()
+    );
+    drop(state);
+    gpu.destroy_image(green);
+    gpu.destroy_image(red);
+    gpu.destroy_image(blue);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn dense_six_k_group_scene_admits_tiled_plan_without_terminal_refusal() {
+    if isolate_vulkan_graphical_test(
+        "dense_six_k_group_scene_admits_tiled_plan_without_terminal_refusal",
     ) {
         return;
     }
@@ -4303,9 +4674,9 @@ fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
     .unwrap();
     let frame = DirectFrame::from_frame(&test_full_frame(window, width, height));
     let mut live = Vec::new();
-    // Each ancestor has both its own independently retained child source
-    // and the next nested group, requiring seven simultaneous 6K isolation
-    // surfaces. Unlike a unary alpha chain this is irreducible under 512 MiB.
+    // This used to be misclassified as terminal because seven whole-window
+    // isolation targets exceed the budget. Its per-pixel work is renderable
+    // with bounded tiles regardless of how dense the frame rectangles are.
     for depth in 0..8 {
         live.push(ScenePlacement {
             id: 0x7200 + depth,
@@ -4326,20 +4697,20 @@ fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
     }
     state.layers.extend(live.iter().map(|item| item.id));
     state.scene_placements = live;
-    assert_eq!(
-        state.prepare_opacity_group_targets(0).unwrap_err(),
-        TERMINAL_GROUP_BUDGET
-    );
+    state.scene_blender = Some(SceneBlender::new(gpu, state.window).unwrap());
+    state.prepare_opacity_group_targets(0).unwrap();
     assert!(
-        state.group_targets.iter().all(Vec::is_empty),
-        "terminal preflight must not leave a partially allocated group"
+        state.scene_tile_edge > 0,
+        "dense group hierarchy must be tile-admitted"
     );
-    // A different scene without seven branching levels is not poisoned by
-    // the rejected proposal; it can prepare and make forward progress.
+    assert_eq!(state.group_targets[0].len(), 7);
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+    // Collapsing to a unary group permits a non-tiled plan again.
     state.scene_placements.truncate(1);
     state.layers.truncate(1);
     state.prepare_opacity_group_targets(0).unwrap();
     assert!(state.group_targets.iter().all(Vec::is_empty));
+    assert_eq!(state.scene_tile_edge, 0);
     drop(state);
     sdl3::video::destroy_window(window);
 }
