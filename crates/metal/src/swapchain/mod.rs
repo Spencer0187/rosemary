@@ -1844,6 +1844,22 @@ fn uses_layer_compositor(mode: vk::PresentModeKHR) -> bool {
     )
 }
 
+/// FIFO image pacing can wait briefly for the next scanout. IMMEDIATE and
+/// MAILBOX must poll: the older non-FIFO presenter did not wait for a WSI
+/// image, and a 20ms acquire turns that backpressure into worker stalls.
+fn compositor_acquire_waits(mode: vk::PresentModeKHR, timeouts: u32) -> bool {
+    // Benchmark only: compare the previous all-mode bounded acquire with
+    // nonblocking IMMEDIATE/MAILBOX on the same WSI surface.
+    #[cfg(test)]
+    if std::env::var_os("ROSEMARY_BENCH_BLOCKING_ACQUIRE").is_some() {
+        return timeouts == 0;
+    }
+    matches!(
+        mode,
+        vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
+    ) && timeouts == 0
+}
+
 /// Bound source-copy work independently of WSI's own image count. A guest
 /// drawing multiple layers per frame should not wait for each WSI image.
 fn frame_slots(_mode: vk::PresentModeKHR) -> usize {
@@ -3599,6 +3615,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         let prepared = state.prepare_composite(window as sdl3::Window);
         let typed_device_loss = state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
         let gpu = state.gpu;
+        let mode = state.present_mode;
         drop(state);
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -3635,11 +3652,28 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             .take();
         #[cfg(not(test))]
         let injected: Option<vk::Result> = None;
+        let wait = compositor_acquire_waits(mode, acquire_timeouts);
         let acquired = match injected {
             Some(error) => CompositorAcquire::Terminal(error),
-            None => crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
-                acquire_compositor_image(gpu, prepared.request, acquire_timeouts == 0)
-            }),
+            None => {
+                crate::stats::count(crate::stats::Counter::PresentAcquireCalls);
+                let start = wait.then(crate::stats::timer).flatten();
+                let acquired =
+                    crate::stats::timed(crate::stats::Counter::PresentAcquireMicros, || {
+                        acquire_compositor_image(gpu, prepared.request, wait)
+                    });
+                if wait {
+                    crate::stats::count(crate::stats::Counter::PresentAcquireWaitCalls);
+                    crate::stats::finish_timer(
+                        crate::stats::Counter::PresentAcquireWaitMicros,
+                        start,
+                    );
+                }
+                if matches!(acquired, CompositorAcquire::TimedOut) {
+                    crate::stats::count(crate::stats::Counter::PresentAcquireTimeouts);
+                }
+                acquired
+            }
         };
         if matches!(acquired, CompositorAcquire::TimedOut) {
             // Retain the dirty accumulator. Only this window waits; another
@@ -3648,7 +3682,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             // time out indefinitely, and every producer needs that lock.
             acquire_timeouts = acquire_timeouts.saturating_add(1);
             drop(_presenting);
-            std::thread::sleep(compositor_acquire_backoff(acquire_timeouts));
+            std::thread::park_timeout(compositor_acquire_retry_delay(mode, acquire_timeouts));
             continue;
         }
         acquire_timeouts = 0;
@@ -5296,6 +5330,7 @@ impl Swapchain {
         self.frames[slot].backing = None;
         self.frame = self.frame.wrapping_add(1);
 
+        crate::stats::count(crate::stats::Counter::QueuePresentCalls);
         let result = crate::stats::timed(crate::stats::Counter::QueuePresentMicros, || {
             self.gpu.present(self.handle, index, blitted, present_fence)
         });
@@ -5420,6 +5455,24 @@ unsafe fn keep_top_left(
 /// acquisition in a row that found no image.
 fn compositor_acquire_backoff(timeouts: u32) -> Duration {
     Duration::from_millis(1 << timeouts.saturating_sub(1).min(5))
+}
+
+/// Avoid an idle spin, but retry low-latency WSI modes promptly while the
+/// display is temporarily full. Prolonged starvation eventually uses the
+/// same capped backoff as FIFO (e.g. a minimized window).
+fn compositor_acquire_retry_delay(mode: vk::PresentModeKHR, timeouts: u32) -> Duration {
+    if matches!(
+        mode,
+        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
+    ) {
+        match timeouts {
+            1..=3 => Duration::from_micros(500),
+            4..=6 => Duration::from_millis(1),
+            _ => compositor_acquire_backoff(timeouts - 5),
+        }
+    } else {
+        compositor_acquire_backoff(timeouts)
+    }
 }
 
 fn classify_compositor_acquire(outcome: Result<(u32, bool), vk::Result>) -> CompositorAcquire {

@@ -12859,6 +12859,150 @@ fn fifo_wsi_error_classes_do_not_retry_terminal_acquisition() {
     assert_eq!(terminal_present_failure(vk::Result::ERROR_DEVICE_LOST), 2);
 }
 
+/// Opt-in, same-host WSI stress proxy. This is not Subnautica and does
+/// not establish end-to-end guest frame latency.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn benchmark_live_immediate_acquisition_policy() {
+    if std::env::var_os("ROSEMARY_BENCH_COMPOSITOR_WSI").is_none() {
+        return;
+    }
+    if isolate_vulkan_graphical_test("benchmark_live_immediate_acquisition_policy") {
+        return;
+    }
+    let _retire_guard = AwaitTestWindowRetirements;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (640u32, 360u32);
+    let window = sdl3::video::create_window(
+        c"WSI acquisition microprofile",
+        width as i32,
+        height as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let images = [
+        test_render_target(gpu, width, height).unwrap(),
+        test_render_target(gpu, width, height).unwrap(),
+    ];
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, images[0].image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, images[1].image, [0., 1., 0., 1.]);
+    })
+    .unwrap();
+    let frame = test_full_frame(window, width, height);
+    crate::stats::tick();
+    let started = Instant::now();
+    let updates = 300;
+    let mut deferred = 0;
+    for n in 0..updates {
+        let due = started + Duration::from_micros(n as u64 * 4_000);
+        if Instant::now() < due {
+            std::thread::sleep(due - Instant::now());
+        }
+        if present(gpu, window as usize, &frame, &images[n % 2], &[]).unwrap() != true {
+            deferred += 1;
+        }
+        if n == 0 {
+            let entry = SWAPCHAINS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .get(&(window as usize))
+                .unwrap()
+                .clone();
+            ensure_layer_compositor_worker(window as usize, &entry);
+        }
+    }
+    std::thread::sleep(Duration::from_millis(250));
+    let elapsed = started.elapsed();
+    let entry = SWAPCHAINS
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(&(window as usize))
+        .unwrap()
+        .clone();
+    let state = entry.state.lock().unwrap();
+    let submitted = state.wsi_publishes;
+    let mode = state.present_mode;
+    let dirty = state.composite_dirty;
+    drop(state);
+    eprintln!(
+        "LIVE_WSI_BENCH policy={} selected_mode={mode:?} guest_updates={updates} deferred={deferred} wsi_publishes={submitted} elapsed_ms={:.2} dirty={dirty}",
+        if std::env::var_os("ROSEMARY_BENCH_BLOCKING_ACQUIRE").is_some() {
+            "bounded-wait"
+        } else {
+            "nonblocking"
+        },
+        elapsed.as_secs_f64() * 1000.
+    );
+    crate::stats::tick();
+    forget_window(window);
+    drop(entry);
+    for image in images {
+        gpu.destroy_image(image);
+    }
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+fn wsi_acquisition_pacing_is_mode_specific_and_starvation_is_bounded() {
+    for mode in [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX] {
+        for timeouts in [0, 1, 6, 64] {
+            assert!(
+                !compositor_acquire_waits(mode, timeouts),
+                "{mode:?} unexpectedly waits inside vkAcquireNextImageKHR"
+            );
+        }
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 1),
+            Duration::from_micros(500)
+        );
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 3),
+            Duration::from_micros(500)
+        );
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 4),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 6),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 7),
+            Duration::from_millis(2)
+        );
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 100),
+            Duration::from_millis(32)
+        );
+    }
+    for mode in [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::FIFO_RELAXED] {
+        assert!(compositor_acquire_waits(mode, 0));
+        assert!(!compositor_acquire_waits(mode, 1));
+        assert!(!compositor_acquire_waits(mode, 100));
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 1),
+            Duration::from_millis(1)
+        );
+        assert_eq!(
+            compositor_acquire_retry_delay(mode, 8),
+            Duration::from_millis(32)
+        );
+    }
+}
+
 #[test]
 fn a_fifo_window_that_keeps_timing_out_backs_off_to_a_bound() {
     let waits: Vec<u64> = (1..=8)

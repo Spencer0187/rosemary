@@ -199,12 +199,17 @@ impl Gpu {
             fence_info = vk::SwapchainPresentFenceInfoEXT::default().fences(&fences);
             info = info.push_next(&mut fence_info);
         }
+        let lock_timer = crate::stats::timer();
         let _commits = sdl3::video::vulkan::surface_commit_guard();
         let _wsi = self.wsi.lock().expect("Vulkan WSI");
         let queue = self.queue.lock().expect("Vulkan queue");
+        crate::stats::finish_timer(crate::stats::Counter::QueuePresentLockMicros, lock_timer);
         // SAFETY: the queue is held exclusively, every borrowed slice lives
         // across the call, and the image was acquired from this swapchain.
-        let result = unsafe { api.queue_present(*queue, &info) };
+        let result =
+            crate::stats::timed(crate::stats::Counter::QueuePresentDriverMicros, || unsafe {
+                api.queue_present(*queue, &info)
+            });
         if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
             crate::swapchain::record_device_loss(self);
         }
