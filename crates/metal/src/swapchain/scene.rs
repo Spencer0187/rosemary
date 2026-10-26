@@ -156,6 +156,8 @@ pub(super) struct SceneWork {
     /// Pre-submission membership/source state, retained only until the VkQueue
     /// accepts the new generation. Recording errors must not poison the scene.
     prior: Option<SceneLayer>,
+    /// Restore the prior accepted scene's tiling on a failed admission.
+    tile_edge_before: u32,
 }
 
 pub(super) enum ScenePrepared {
@@ -1346,7 +1348,7 @@ impl Swapchain {
         self.shed_scene_snapshot_spares();
     }
 
-    fn opacity_group_descriptor_count(&self) -> Result<usize, String> {
+    fn opacity_group_descriptor_count(&self, tile_edge: u32) -> Result<usize, String> {
         let group_closures = self
             .scene_placements
             .iter()
@@ -1358,6 +1360,7 @@ impl Swapchain {
             .len()
             .checked_add(group_closures)
             .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(self.scene_tiles(tile_edge).len()))
             .ok_or_else(|| "CA group descriptor count overflow".to_string())
     }
 
@@ -1370,6 +1373,14 @@ impl Swapchain {
     // Only sources with a nonempty viewport/rectangular-clip intersection
     // participate in CA isolation. Use the same bounds for scratch sizing.
     fn visible_scene_bounds(&self, placement: &ScenePlacement) -> Option<Region> {
+        self.visible_scene_bounds_in(placement, None)
+    }
+
+    fn visible_scene_bounds_in(
+        &self,
+        placement: &ScenePlacement,
+        tile: Option<Region>,
+    ) -> Option<Region> {
         let frame = placement.frame.frame();
         let mut x0 = i64::from(frame.x).max(0);
         let mut y0 = i64::from(frame.y).max(0);
@@ -1384,6 +1395,12 @@ impl Swapchain {
             x1 = x1.min(i64::from(clip.x) + i64::from(clip.width));
             y1 = y1.min(i64::from(clip.y) + i64::from(clip.height));
         }
+        if let Some(tile) = tile {
+            x0 = x0.max(i64::from(tile.x));
+            y0 = y0.max(i64::from(tile.y));
+            x1 = x1.min(i64::from(tile.x) + i64::from(tile.width));
+            y1 = y1.min(i64::from(tile.y) + i64::from(tile.height));
+        }
         if x1 <= x0 || y1 <= y0 || x1 > i64::from(i32::MAX) || y1 > i64::from(i32::MAX) {
             return None;
         }
@@ -1397,6 +1414,13 @@ impl Swapchain {
 
     pub(super) fn normalized_opacity_paths(
         &self,
+    ) -> Vec<(usize, Vec<appkit::view::OpacityGroup>, f32)> {
+        self.normalized_opacity_paths_in(None)
+    }
+
+    fn normalized_opacity_paths_in(
+        &self,
+        tile: Option<Region>,
     ) -> Vec<(usize, Vec<appkit::view::OpacityGroup>, f32)> {
         use appkit::view::OpacityGroup;
         #[derive(Hash, PartialEq, Eq)]
@@ -1416,7 +1440,7 @@ impl Swapchain {
                     .opacity_groups
                     .iter()
                     .all(|group| group.opacity > 0.0)
-                && self.visible_scene_bounds(placement).is_some()
+                && self.visible_scene_bounds_in(placement, tile).is_some()
         };
         for placement in self
             .scene_placements
@@ -1467,6 +1491,14 @@ impl Swapchain {
         &self,
         normalized: &[(usize, Vec<appkit::view::OpacityGroup>, f32)],
     ) -> Vec<(Vec<appkit::view::OpacityGroup>, Region)> {
+        self.opacity_group_regions_in(normalized, None)
+    }
+
+    fn opacity_group_regions_in(
+        &self,
+        normalized: &[(usize, Vec<appkit::view::OpacityGroup>, f32)],
+        tile: Option<Region>,
+    ) -> Vec<(Vec<appkit::view::OpacityGroup>, Region)> {
         let mut groups: Vec<(Vec<appkit::view::OpacityGroup>, Region)> = Vec::new();
         let mut positions = std::collections::HashMap::<Vec<(usize, u32)>, usize>::new();
         let mut by_source = std::collections::HashMap::new();
@@ -1480,7 +1512,7 @@ impl Swapchain {
             if path.is_empty() {
                 continue;
             }
-            let Some(region) = self.visible_scene_bounds(placement) else {
+            let Some(region) = self.visible_scene_bounds_in(placement, tile) else {
                 continue;
             };
             let mut key = Vec::with_capacity(path.len());
@@ -1510,23 +1542,78 @@ impl Swapchain {
         groups
     }
 
-    pub(super) fn prepare_opacity_group_targets(&mut self, slot: usize) -> Result<(), String> {
+    fn scene_tiles(&self, edge: u32) -> Vec<Region> {
+        if edge == 0 {
+            return vec![Region {
+                x: 0,
+                y: 0,
+                width: self.extent.width as i32,
+                height: self.extent.height as i32,
+            }];
+        }
+        let mut tiles = Vec::new();
+        for y in (0..self.extent.height).step_by(edge as usize) {
+            for x in (0..self.extent.width).step_by(edge as usize) {
+                tiles.push(Region {
+                    x: x as i32,
+                    y: y as i32,
+                    width: edge.min(self.extent.width - x) as i32,
+                    height: edge.min(self.extent.height - y) as i32,
+                });
+            }
+        }
+        tiles
+    }
+
+    fn isolation_requirements(&self, edge: u32) -> Vec<(u32, u32)> {
+        let mut requirements = Vec::<(u32, u32)>::new();
+        for tile in self.scene_tiles(edge) {
+            let normalized = self.normalized_opacity_paths_in(Some(tile));
+            let regions = self.opacity_group_regions_in(&normalized, Some(tile));
+            for (path, region) in regions {
+                while requirements.len() < path.len() {
+                    requirements.push((1, 1));
+                }
+                let extent = &mut requirements[path.len() - 1];
+                extent.0 = extent.0.max(region.width as u32);
+                extent.1 = extent.1.max(region.height as u32);
+            }
+        }
+        requirements
+    }
+
+    fn sparse_isolation_scene(&self) -> bool {
         let normalized = self.normalized_opacity_paths();
-        let depth = normalized
-            .iter()
-            .map(|(_, path, _)| path.len())
-            .max()
-            .unwrap_or(0);
         let regions = self.opacity_group_regions(&normalized);
+        let mut largest_group = 0u64;
+        for (_, bounds) in regions {
+            largest_group = largest_group.max(bounds.width as u64 * bounds.height as u64);
+        }
+        let ids: std::collections::HashSet<_> = normalized
+            .iter()
+            .filter(|(_, path, _)| !path.is_empty())
+            .map(|(id, _, _)| *id)
+            .collect();
+        let source_area = self
+            .scene_placements
+            .iter()
+            .filter(|p| ids.contains(&p.id))
+            .filter_map(|p| self.visible_scene_bounds(p))
+            .map(|r| r.width as u64 * r.height as u64)
+            .sum::<u64>();
+        // Unlike a dense fullscreen group, disjoint tiny descendants leave
+        // large holes in the union bounding rectangle. Tile only these.
+        largest_group > source_area.saturating_mul(8)
+    }
+
+    pub(super) fn prepare_opacity_group_targets(&mut self, slot: usize) -> Result<(), String> {
+        let mut requirements = self.isolation_requirements(0);
+        let mut depth = requirements.len();
+        let mut planned_edge = 0u32;
         if depth == 0 {
             self.group_targets[slot].clear();
+            self.scene_tile_edge = 0;
             return Ok(());
-        }
-        let mut requirements = vec![(1u32, 1u32); depth];
-        for (path, region) in &regions {
-            let extent = &mut requirements[path.len() - 1];
-            extent.0 = extent.0.max(region.width as u32);
-            extent.1 = extent.1.max(region.height as u32);
         }
         // Compare a *lower bound* on the completed scene, excluding reusable
         // scratch still referenced by earlier frame slots. This is distinct
@@ -1556,7 +1643,39 @@ impl Swapchain {
             })
             .sum::<u64>();
         if !fits_scene_budget(persistent, minimum_scratch) {
-            return Err(TERMINAL_GROUP_BUDGET.into());
+            if !self.sparse_isolation_scene() {
+                return Err(TERMINAL_GROUP_BUDGET.into());
+            }
+            // The union rectangle is not an irreducible requirement: a
+            // bounded tile respects CA group order at each screen pixel.
+            let mut admitted = false;
+            for edge in [512u32, 256, 128, 64] {
+                if self.scene_tiles(edge).len() > 4096 {
+                    break;
+                }
+                let tiled = self.isolation_requirements(edge);
+                let bytes = tiled
+                    .iter()
+                    .map(|&(width, height)| {
+                        scene_image_bytes(PresentSource {
+                            image: vk::Image::null(),
+                            width,
+                            height,
+                            format: self.format,
+                        })
+                    })
+                    .sum::<u64>();
+                if fits_scene_budget(persistent, bytes) {
+                    requirements = tiled;
+                    depth = requirements.len();
+                    planned_edge = edge;
+                    admitted = true;
+                    break;
+                }
+            }
+            if !admitted {
+                return Err(TERMINAL_GROUP_BUDGET.into());
+            }
         }
         // A completed frame slot may release its scratch, but a submitted
         // one may still read it. Never steal an in-flight image on pressure.
@@ -1658,11 +1777,12 @@ impl Swapchain {
             )?;
             self.group_targets[slot].push(target);
         }
-        let needed = self.opacity_group_descriptor_count()?;
+        let needed = self.opacity_group_descriptor_count(planned_edge)?;
         self.scene_blender
             .as_mut()
             .ok_or("scene blend pipeline missing")?
             .reserve_layers(needed)?;
+        self.scene_tile_edge = planned_edge;
         Ok(())
     }
 
@@ -1879,12 +1999,14 @@ impl Swapchain {
             previous,
             prior,
             damage,
+            tile_edge_before: self.scene_tile_edge,
         }))
     }
 
     /// Vulkan may reject a command buffer or its queue submission. The
     /// unsubmitted image must not replace the previously visible generation.
     pub(super) fn rollback_scene(&mut self, work: SceneWork) {
+        self.scene_tile_edge = work.tile_edge_before;
         if work.previous.is_some() {
             self.scene_layers
                 .retain(|scene| Some(scene.id) != work.previous);
@@ -2028,11 +2150,10 @@ impl Swapchain {
         // A source update inside an isolated group can alter pixels anywhere
         // inside its group's overlap. Rebuild that complete group, not only
         // the incoming source rectangle.
-        let groups_present = self.scene_placements.iter().any(|p| {
-            p.opacity > 0.0
-                && !p.opacity_groups.is_empty()
-                && p.opacity_groups.iter().all(|group| group.opacity > 0.0)
-        });
+        let groups_present = self
+            .normalized_opacity_paths()
+            .iter()
+            .any(|(_, path, _)| !path.is_empty());
         let damage = (!groups_present)
             .then(|| {
                 pending
@@ -2040,6 +2161,15 @@ impl Swapchain {
                     .map(|frame| frame.frame())
             })
             .flatten();
+        #[cfg(test)]
+        self.last_scene_repaint_pixels.store(
+            damage
+                .as_ref()
+                .map_or(self.extent.width as u64 * self.extent.height as u64, |r| {
+                    r.width as u64 * r.height as u64
+                }),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         if let Some(damage) = damage {
             // A scene layer submission does not invalidate the whole window:
             // clear only the source's previous bounds, then recompose every
@@ -2147,291 +2277,296 @@ impl Swapchain {
                 );
             }
         }
-        let normalized = self.normalized_opacity_paths();
-        let regions = self.opacity_group_regions(&normalized);
-        let region_index = regions
-            .iter()
-            .map(|(path, bounds)| {
-                (
-                    path.iter()
-                        .map(|g| (g.id, g.opacity.to_bits()))
-                        .collect::<Vec<_>>(),
-                    *bounds,
-                )
-            })
-            .collect::<std::collections::HashMap<_, _>>();
-        let group_bounds = |path: &[appkit::view::OpacityGroup]| -> Option<Region> {
-            let key = path
+        let mut scene_index = 0usize;
+        for tile in self.scene_tiles(self.scene_tile_edge) {
+            let normalized = self.normalized_opacity_paths_in(Some(tile));
+            let regions = self.opacity_group_regions_in(&normalized, Some(tile));
+            let region_index = regions
                 .iter()
-                .map(|g| (g.id, g.opacity.to_bits()))
-                .collect::<Vec<_>>();
-            region_index.get(&key).copied()
-        };
-        let source_index = normalized
-            .iter()
-            .map(|(id, path, alpha)| (*id, (path.as_slice(), *alpha)))
-            .collect::<std::collections::HashMap<_, _>>();
-        let invisible: std::collections::HashSet<_> = self
-            .scene_placements
-            .iter()
-            .filter(|placement| {
-                placement.opacity <= 0.0
-                    || placement
-                        .opacity_groups
-                        .iter()
-                        .any(|group| group.opacity <= 0.0)
-            })
-            .map(|placement| placement.id)
-            .collect();
-        let mask_index = mask_spans
-            .iter()
-            .map(|(id, start, _)| (*id, *start))
-            .collect::<std::collections::HashMap<_, _>>();
-        let mut scene_index = 0;
-        let mut open_groups = Vec::<appkit::view::OpacityGroup>::new();
-        let clear_group = |depth: usize| {
-            let target = &self.group_targets[slot][depth].image;
-            unsafe {
-                scene_sync(
-                    device,
-                    command_buffer,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::TRANSFER,
-                    &[(
+                .map(|(path, bounds)| {
+                    (
+                        path.iter()
+                            .map(|g| (g.id, g.opacity.to_bits()))
+                            .collect::<Vec<_>>(),
+                        *bounds,
+                    )
+                })
+                .collect::<std::collections::HashMap<_, _>>();
+            let group_bounds = |path: &[appkit::view::OpacityGroup]| -> Option<Region> {
+                let key = path
+                    .iter()
+                    .map(|g| (g.id, g.opacity.to_bits()))
+                    .collect::<Vec<_>>();
+                region_index.get(&key).copied()
+            };
+            let source_index = normalized
+                .iter()
+                .map(|(id, path, alpha)| (*id, (path.as_slice(), *alpha)))
+                .collect::<std::collections::HashMap<_, _>>();
+            let placement_ids = self
+                .scene_placements
+                .iter()
+                .map(|p| p.id)
+                .collect::<std::collections::HashSet<_>>();
+            let mask_index = mask_spans
+                .iter()
+                .map(|(id, start, _)| (*id, *start))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut open_groups = Vec::<appkit::view::OpacityGroup>::new();
+            let clear_group = |depth: usize| {
+                let target = &self.group_targets[slot][depth].image;
+                unsafe {
+                    scene_sync(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::SHADER_READ
+                                | vk::AccessFlags::SHADER_WRITE
+                                | vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                        )],
+                    );
+                    device.cmd_clear_color_image(
+                        command_buffer,
                         target.image,
-                        vk::AccessFlags::SHADER_READ
-                            | vk::AccessFlags::SHADER_WRITE
-                            | vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                    )],
-                );
-                device.cmd_clear_color_image(
-                    command_buffer,
-                    target.image,
-                    vk::ImageLayout::GENERAL,
-                    &clear,
-                    &[range],
-                );
-                scene_sync(
-                    device,
-                    command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    &[(
-                        target.image,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )],
-                );
-            }
-        };
-        let close_group = |depth: usize,
-                           path: &[appkit::view::OpacityGroup],
-                           index: &mut usize|
-         -> Result<(), String> {
-            let Some(bounds) = group_bounds(path) else {
-                return Ok(());
+                        vk::ImageLayout::GENERAL,
+                        &clear,
+                        &[range],
+                    );
+                    scene_sync(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                }
             };
-            let group = path.last().ok_or("closing empty CA opacity path")?;
-            let parent_origin = if depth == 0 {
-                (0, 0)
-            } else {
-                let parent =
-                    group_bounds(&path[..depth]).ok_or("nested CA group missing parent extent")?;
-                (parent.x, parent.y)
-            };
-            let source = &self.group_targets[slot][depth].image;
-            let target: &GpuImage = if depth == 0 {
-                output
-            } else {
-                &self.group_targets[slot][depth - 1].image
-            };
-            unsafe {
-                scene_sync(
-                    device,
+            let close_group = |depth: usize,
+                               path: &[appkit::view::OpacityGroup],
+                               index: &mut usize|
+             -> Result<(), String> {
+                let Some(bounds) = group_bounds(path) else {
+                    return Ok(());
+                };
+                let group = path.last().ok_or("closing empty CA opacity path")?;
+                let parent_origin = if depth == 0 {
+                    (0, 0)
+                } else {
+                    let parent = group_bounds(&path[..depth])
+                        .ok_or("nested CA group missing parent extent")?;
+                    (parent.x, parent.y)
+                };
+                let source = &self.group_targets[slot][depth].image;
+                let target: &GpuImage = if depth == 0 {
+                    output
+                } else {
+                    &self.group_targets[slot][depth - 1].image
+                };
+                unsafe {
+                    scene_sync(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[
+                            (
+                                source.image,
+                                vk::AccessFlags::SHADER_WRITE,
+                                vk::AccessFlags::SHADER_READ,
+                            ),
+                            (
+                                target.image,
+                                vk::AccessFlags::SHADER_WRITE,
+                                vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                            ),
+                        ],
+                    );
+                }
+                blender.bind(command_buffer, slot, *index, source, target)?;
+                *index += 1;
+                blender.draw_at(
                     command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    &[
-                        (
-                            source.image,
-                            vk::AccessFlags::SHADER_WRITE,
-                            vk::AccessFlags::SHADER_READ,
-                        ),
-                        (
+                    &crate::overlay::Placement {
+                        x: bounds.x,
+                        y: bounds.y,
+                        width: source.width,
+                        height: source.height,
+                        target_width: target.width,
+                        target_height: target.height,
+                        clip_x: bounds.x,
+                        clip_y: bounds.y,
+                        clip_width: bounds.width as u32,
+                        clip_height: bounds.height as u32,
+                        opacity: group.opacity,
+                        clear: false,
+                        round_start: 0,
+                        round_count: 0,
+                        sampled_srgb: 0,
+                    },
+                    parent_origin,
+                );
+                unsafe {
+                    scene_sync(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
                             target.image,
                             vk::AccessFlags::SHADER_WRITE,
                             vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                        ),
-                    ],
-                );
-            }
-            blender.bind(command_buffer, slot, *index, source, target)?;
-            *index += 1;
-            blender.draw_at(
-                command_buffer,
-                &crate::overlay::Placement {
-                    x: bounds.x,
-                    y: bounds.y,
-                    width: source.width,
-                    height: source.height,
-                    target_width: target.width,
-                    target_height: target.height,
-                    clip_x: bounds.x,
-                    clip_y: bounds.y,
-                    clip_width: bounds.width as u32,
-                    clip_height: bounds.height as u32,
-                    opacity: group.opacity,
-                    clear: false,
-                    round_start: 0,
-                    round_count: 0,
-                    sampled_srgb: 0,
-                },
-                parent_origin,
-            );
-            unsafe {
-                scene_sync(
-                    device,
-                    command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    &[(
-                        target.image,
-                        vk::AccessFlags::SHADER_WRITE,
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )],
-                );
-            }
-            Ok(())
-        };
-        let ready_scenes = self
-            .scene_layers
-            .iter()
-            .filter(|scene| {
-                scene.ready
-                    || pending.is_some_and(|work| {
-                        scene.id == work.current || Some(scene.id) == work.previous
-                    })
-            })
-            .fold(std::collections::HashMap::new(), |mut by_id, scene| {
-                by_id.entry(scene.id).or_insert(scene);
-                by_id
-            });
-        for id in &self.layers {
-            let Some(&scene) = ready_scenes.get(id) else {
-                continue;
+                        )],
+                    );
+                }
+                Ok(())
             };
-            // Excluded zero-alpha groups cannot draw or acquire scratch.
-            // Close any preceding visible group before moving past them.
-            let effective = source_index.get(id).copied();
-            if effective.is_none() && invisible.contains(id) {
-                for depth in (0..open_groups.len()).rev() {
+            let ready_scenes = self
+                .scene_layers
+                .iter()
+                .filter(|scene| {
+                    scene.ready
+                        || pending.is_some_and(|work| {
+                            scene.id == work.current || Some(scene.id) == work.previous
+                        })
+                })
+                .fold(std::collections::HashMap::new(), |mut by_id, scene| {
+                    by_id.entry(scene.id).or_insert(scene);
+                    by_id
+                });
+            for id in &self.layers {
+                let Some(&scene) = ready_scenes.get(id) else {
+                    continue;
+                };
+                // Noncontributing siblings are neutral within a CA opacity
+                // group: only the next *visible* sibling can close the prefix.
+                // Never present an excluded offscreen source as ungrouped.
+                let (wanted, unary_opacity) = match source_index.get(id).copied() {
+                    Some(effective) => effective,
+                    None if placement_ids.contains(id) => continue,
+                    // Legacy GPU-only scene submissions have no AppKit
+                    // metadata; do not discard their ready retained image.
+                    None => (&[][..], 1.0),
+                };
+                let common = open_groups
+                    .iter()
+                    .zip(wanted)
+                    .take_while(|(a, b)| *a == *b)
+                    .count();
+                for depth in (common..open_groups.len()).rev() {
                     close_group(depth, &open_groups[..=depth], &mut scene_index)?;
                 }
-                open_groups.clear();
-                continue;
+                for depth in common..wanted.len() {
+                    clear_group(depth);
+                }
+                open_groups = wanted.to_vec();
+                let draw_target: &GpuImage = if wanted.is_empty() {
+                    output
+                } else {
+                    &self.group_targets[slot][wanted.len() - 1].image
+                };
+                let target_origin = if wanted.is_empty() {
+                    (0, 0)
+                } else {
+                    let bounds =
+                        group_bounds(wanted).ok_or("visible CA group lacks content bounds")?;
+                    (bounds.x, bounds.y)
+                };
+                blender.bind(
+                    command_buffer,
+                    slot,
+                    scene_index,
+                    &scene.snapshot.image,
+                    draw_target,
+                )?;
+                scene_index += 1;
+                let frame = scene.frame.frame();
+                let window_clip = appkit::view::Frame {
+                    x: 0,
+                    y: 0,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    ..frame
+                };
+                let draw = |area: &appkit::view::Frame| {
+                    // Clamp dispatch dimensions to actual physical window pixels,
+                    // rather than wasting an unbounded number of GPU workgroups
+                    // for an offscreen or oversized guest layout rectangle.
+                    let clip = intersection_for_scene(area, &window_clip);
+                    let clip = intersection_for_scene(
+                        &clip,
+                        &appkit::view::Frame {
+                            x: tile.x,
+                            y: tile.y,
+                            width: tile.width as u32,
+                            height: tile.height as u32,
+                            ..frame
+                        },
+                    );
+                    let clip = scene.clip.map_or(clip, |ancestor| {
+                        intersection_for_scene(&clip, &ancestor.frame())
+                    });
+                    let clip =
+                        damage.map_or(clip, |changed| intersection_for_scene(&clip, &changed));
+                    let placement = crate::overlay::Placement {
+                        x: frame.x,
+                        y: frame.y,
+                        width: frame.width,
+                        height: frame.height,
+                        target_width: draw_target.width,
+                        target_height: draw_target.height,
+                        clip_x: clip.x,
+                        clip_y: clip.y,
+                        clip_width: clip.width,
+                        clip_height: clip.height,
+                        opacity: scene.opacity * unary_opacity,
+                        clear: false,
+                        round_start: mask_index.get(&scene.id).copied().unwrap_or(0),
+                        round_count: scene.rounded.len() as u32,
+                        sampled_srgb: u32::from(matches!(
+                            scene.snapshot.image.format,
+                            vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
+                        )),
+                    };
+                    blender.draw_at(command_buffer, &placement, target_origin);
+                };
+                if let Some(clips) = &scene.regions {
+                    for region in clips {
+                        draw(&appkit::view::Frame {
+                            x: region.x,
+                            y: region.y,
+                            width: region.width.max(0) as u32,
+                            height: region.height.max(0) as u32,
+                            ..frame
+                        });
+                    }
+                } else {
+                    draw(&frame);
+                }
+                unsafe {
+                    scene_sync(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            draw_target.image,
+                            vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                }
             }
-            let wanted = effective.map_or(&[][..], |(path, _)| path);
-            let unary_opacity = effective.map_or(1.0, |(_, alpha)| alpha);
-            let common = open_groups
-                .iter()
-                .zip(wanted)
-                .take_while(|(a, b)| *a == *b)
-                .count();
-            for depth in (common..open_groups.len()).rev() {
+            for depth in (0..open_groups.len()).rev() {
                 close_group(depth, &open_groups[..=depth], &mut scene_index)?;
             }
-            for depth in common..wanted.len() {
-                clear_group(depth);
-            }
-            open_groups = wanted.to_vec();
-            let draw_target: &GpuImage = if wanted.is_empty() {
-                output
-            } else {
-                &self.group_targets[slot][wanted.len() - 1].image
-            };
-            let target_origin = if wanted.is_empty() {
-                (0, 0)
-            } else {
-                let bounds = group_bounds(wanted).ok_or("visible CA group lacks content bounds")?;
-                (bounds.x, bounds.y)
-            };
-            blender.bind(
-                command_buffer,
-                slot,
-                scene_index,
-                &scene.snapshot.image,
-                draw_target,
-            )?;
-            scene_index += 1;
-            let frame = scene.frame.frame();
-            let window_clip = appkit::view::Frame {
-                x: 0,
-                y: 0,
-                width: self.extent.width,
-                height: self.extent.height,
-                ..frame
-            };
-            let draw = |area: &appkit::view::Frame| {
-                // Clamp dispatch dimensions to actual physical window pixels,
-                // rather than wasting an unbounded number of GPU workgroups
-                // for an offscreen or oversized guest layout rectangle.
-                let clip = intersection_for_scene(area, &window_clip);
-                let clip = scene.clip.map_or(clip, |ancestor| {
-                    intersection_for_scene(&clip, &ancestor.frame())
-                });
-                let clip = damage.map_or(clip, |changed| intersection_for_scene(&clip, &changed));
-                let placement = crate::overlay::Placement {
-                    x: frame.x,
-                    y: frame.y,
-                    width: frame.width,
-                    height: frame.height,
-                    target_width: draw_target.width,
-                    target_height: draw_target.height,
-                    clip_x: clip.x,
-                    clip_y: clip.y,
-                    clip_width: clip.width,
-                    clip_height: clip.height,
-                    opacity: scene.opacity * unary_opacity,
-                    clear: false,
-                    round_start: mask_index.get(&scene.id).copied().unwrap_or(0),
-                    round_count: scene.rounded.len() as u32,
-                    sampled_srgb: u32::from(matches!(
-                        scene.snapshot.image.format,
-                        vk::Format::R8G8B8A8_SRGB | vk::Format::B8G8R8A8_SRGB
-                    )),
-                };
-                blender.draw_at(command_buffer, &placement, target_origin);
-            };
-            if let Some(clips) = &scene.regions {
-                for region in clips {
-                    draw(&appkit::view::Frame {
-                        x: region.x,
-                        y: region.y,
-                        width: region.width.max(0) as u32,
-                        height: region.height.max(0) as u32,
-                        ..frame
-                    });
-                }
-            } else {
-                draw(&frame);
-            }
-            unsafe {
-                scene_sync(
-                    device,
-                    command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    &[(
-                        draw_target.image,
-                        vk::AccessFlags::SHADER_WRITE,
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )],
-                );
-            }
-        }
-        for depth in (0..open_groups.len()).rev() {
-            close_group(depth, &open_groups[..=depth], &mut scene_index)?;
         }
         unsafe {
             scene_sync(

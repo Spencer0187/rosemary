@@ -3795,6 +3795,479 @@ fn offscreen_previously_admitted_six_k_source_does_not_force_nested_isolation() 
 
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn omitted_invisible_sibling_preserves_shared_opacity_group_pixels() {
+    if isolate_vulkan_graphical_test(
+        "omitted_invisible_sibling_preserves_shared_opacity_group_pixels",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, underlay, full)) = v10_fifo_fixture() else {
+        return;
+    };
+    let tile = appkit::view::Frame {
+        x: 20,
+        y: 20,
+        width: 20,
+        height: 20,
+        ..full
+    };
+    let red = test_render_target(gpu, 20, 20).unwrap();
+    let blue = test_render_target(gpu, 20, 20).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, underlay.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, blue.image, [1., 0., 0., 1.]);
+    })
+    .unwrap();
+    let base = test_opaque_metal_placement(0xa100, DirectFrame::from_frame(&full));
+    let mut front = test_opaque_metal_placement(0xa101, DirectFrame::from_frame(&tile));
+    let mut hidden = test_opaque_metal_placement(0xa102, DirectFrame::from_frame(&tile));
+    let mut last = test_opaque_metal_placement(0xa103, DirectFrame::from_frame(&tile));
+    for nested in [false, true] {
+        let groups = if nested {
+            vec![
+                appkit::view::OpacityGroup {
+                    id: 0xa110,
+                    opacity: 0.75,
+                },
+                appkit::view::OpacityGroup {
+                    id: 0xa111,
+                    opacity: 0.5,
+                },
+            ]
+        } else {
+            vec![appkit::view::OpacityGroup {
+                id: 0xa110,
+                opacity: 0.5,
+            }]
+        };
+        for item in [&mut front, &mut hidden, &mut last] {
+            item.opacity_groups = groups.clone();
+        }
+        state.layers = vec![base.id, front.id, last.id];
+        state.synchronize_scene(
+            window as usize,
+            &[base.clone(), front.clone(), last.clone()],
+        );
+        assert_eq!(
+            state.stage_composite_source(
+                base.id,
+                &full,
+                PresentSource::from(&underlay),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            state.stage_composite_source(
+                front.id,
+                &tile,
+                PresentSource::from(&red),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            state.stage_composite_source(
+                last.id,
+                &tile,
+                PresentSource::from(&blue),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+        state.idle();
+        let before = read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            full.window_width,
+            full.window_height,
+            28,
+            28,
+        );
+        assert!(
+            before[0] > 10 && before[1] > 10 && before[2] < 20,
+            "grouped blue source didn't cover red: {before:?}"
+        );
+        for offscreen in [false, true] {
+            hidden.opacity = if offscreen { 1.0 } else { 0.0 };
+            hidden.frame = if offscreen {
+                DirectFrame::from_frame(&appkit::view::Frame {
+                    x: full.width as i32 + 20,
+                    ..tile
+                })
+            } else {
+                DirectFrame::from_frame(&tile)
+            };
+            state.layers = vec![base.id, front.id, hidden.id, last.id];
+            state.synchronize_scene(
+                window as usize,
+                &[base.clone(), front.clone(), hidden.clone(), last.clone()],
+            );
+            let normalized = state.normalized_opacity_paths();
+            assert!(!normalized.iter().any(|(id, _, _)| *id == hidden.id));
+            assert!(
+                normalized
+                    .iter()
+                    .find(|(id, _, _)| *id == front.id)
+                    .unwrap()
+                    .1
+                    .len()
+                    > 0
+            );
+            assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+            state.idle();
+            let after = read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                full.window_width,
+                full.window_height,
+                28,
+                28,
+            );
+            assert_eq!(
+                after, before,
+                "excluded sibling split opacity group: nested={nested} offscreen={offscreen}"
+            );
+        }
+    }
+    drop(state);
+    gpu.destroy_image(red);
+    gpu.destroy_image(blue);
+    gpu.destroy_image(underlay);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn offscreen_opacity_metadata_preserves_incremental_gpu_repaint() {
+    if isolate_vulkan_graphical_test("offscreen_opacity_metadata_preserves_incremental_gpu_repaint")
+    {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let Some((window, gpu, mut state, green, full)) = v10_fifo_fixture() else {
+        return;
+    };
+    let small = appkit::view::Frame {
+        x: 16,
+        y: 16,
+        width: 12,
+        height: 12,
+        ..full
+    };
+    let off = appkit::view::Frame {
+        x: full.width as i32 + 200,
+        y: 20,
+        width: 16,
+        height: 16,
+        ..full
+    };
+    let red = test_render_target(gpu, 12, 12).unwrap();
+    let blue = test_render_target(gpu, 12, 12).unwrap();
+    let offscreen = test_render_target(gpu, 16, 16).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, green.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, blue.image, [1., 0., 0., 1.]);
+        cmd_test_clear_color(device, cb, offscreen.image, [0., 0., 1., 1.]);
+    })
+    .unwrap();
+    let base = test_opaque_metal_placement(0xc200, DirectFrame::from_frame(&full));
+    let front = test_opaque_metal_placement(0xc201, DirectFrame::from_frame(&small));
+    let mut idle = test_opaque_metal_placement(0xc202, DirectFrame::from_frame(&off));
+    idle.opacity_groups = vec![appkit::view::OpacityGroup {
+        id: 0xc300,
+        opacity: 0.5,
+    }];
+    state.layers = vec![base.id, front.id, idle.id];
+    state.synchronize_scene(
+        window as usize,
+        &[base.clone(), front.clone(), idle.clone()],
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            base.id,
+            &full,
+            PresentSource::from(&green),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            front.id,
+            &small,
+            PresentSource::from(&red),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            idle.id,
+            &off,
+            PresentSource::from(&offscreen),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    assert!(
+        !state
+            .normalized_opacity_paths()
+            .iter()
+            .any(|(_, path, _)| !path.is_empty())
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            front.id,
+            &small,
+            PresentSource::from(&blue),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    let repainted = state.last_scene_repaint_pixels.load(Ordering::Relaxed);
+    assert!(
+        repainted <= small.width as u64 * small.height as u64,
+        "invisible group disabled incremental damage: {repainted} pixels"
+    );
+    let pixel = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        full.window_width,
+        full.window_height,
+        20,
+        20,
+    );
+    assert!(
+        pixel[0] > 240 && pixel[2] < 10,
+        "changed source not displayed {pixel:?}"
+    );
+    drop(state);
+    gpu.destroy_image(green);
+    gpu.destroy_image(red);
+    gpu.destroy_image(blue);
+    gpu.destroy_image(offscreen);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn sparse_seven_level_six_k_visible_groups_render_with_bounded_tiles() {
+    if isolate_vulkan_graphical_test(
+        "sparse_seven_level_six_k_visible_groups_render_with_bounded_tiles",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (6016u32, 3384u32);
+    let window =
+        sdl3::video::create_window(c"sparse 6K seven depth CA", width as i32, height as i32, 0)
+            .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let full = test_full_frame(window, width, height);
+    let green = test_render_target(gpu, width, height).unwrap();
+    let red = test_render_target(gpu, 16, 16).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, green.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+    })
+    .unwrap();
+    let base = test_opaque_metal_placement(0xb100, DirectFrame::from_frame(&full));
+    let mut placements = vec![base.clone()];
+    let mut tiles = Vec::new();
+    for depth in 0..8usize {
+        let (x, y) = if depth % 2 == 0 {
+            (20 + (depth / 2) * 40, 20)
+        } else {
+            (
+                width as usize - 200 + (depth / 2) * 40,
+                height as usize - 200,
+            )
+        };
+        let rect = appkit::view::Frame {
+            x: x as i32,
+            y: y as i32,
+            width: 16,
+            height: 16,
+            ..full
+        };
+        let mut source =
+            test_opaque_metal_placement(0xb110 + depth, DirectFrame::from_frame(&rect));
+        source.opacity_groups = (0..=depth)
+            .map(|n| appkit::view::OpacityGroup {
+                id: 0xb200 + n,
+                opacity: 0.5,
+            })
+            .collect();
+        placements.push(source);
+        tiles.push(rect);
+    }
+    state.layers = placements.iter().map(|p| p.id).collect();
+    state.synchronize_scene(window as usize, &placements);
+    assert_eq!(
+        state.stage_composite_source(
+            base.id,
+            &full,
+            PresentSource::from(&green),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    for (source, frame) in placements[1..].iter().zip(&tiles) {
+        assert_eq!(
+            state.stage_composite_source(
+                source.id,
+                frame,
+                PresentSource::from(&red),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+    }
+    assert!(
+        state.scene_tile_edge > 0,
+        "sparse 6K scene was not tiled to avoid false terminal budget"
+    );
+    assert!(
+        state.group_targets[0].len() <= 7,
+        "unexpected isolation depth"
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let at = |state: &Swapchain, x: u32, y: u32| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(
+        at(&state, width / 2, height / 2),
+        [0, 255, 0, 255],
+        "untouched green underlay lost during tiled rendering"
+    );
+    for (n, frame) in tiles.iter().enumerate() {
+        let pixel = at(&state, frame.x as u32 + 5, frame.y as u32 + 5);
+        let opacity = 0.5f32.powi(n as i32 + 1);
+        assert!(
+            (pixel[2] as f32 - 255. * opacity).abs() <= 3.0,
+            "tile source {n} expected alpha {opacity}, got {pixel:?}"
+        );
+    }
+    // An aborted GPU recording cannot poison the previous tiled scene's
+    // isolation plan, image generations or retained pixels.
+    let old_edge = state.scene_tile_edge;
+    state.injected_post_scene_record_error = Some(vk::Result::ERROR_OUT_OF_HOST_MEMORY);
+    let failed = state.stage_composite_source(
+        placements[1].id,
+        &tiles[0],
+        PresentSource::from(&red),
+        None,
+        &mut SourceOwner(None),
+        false,
+        true,
+    );
+    assert!(
+        failed
+            .unwrap_err()
+            .contains("injected post-scene recording failure")
+    );
+    assert_eq!(
+        state.scene_tile_edge, old_edge,
+        "rollback lost tiled scene plan"
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .find(|s| s.id == placements[1].id)
+            .unwrap()
+            .ready
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!((at(&state, 25, 25)[2] as f32 - 127.5).abs() <= 3.0);
+
+    // Source geometry revision with no new source memory must still advance.
+    let mut changed = placements.clone();
+    changed[1].frame = DirectFrame::from_frame(&appkit::view::Frame {
+        x: 300,
+        y: 100,
+        ..tiles[0]
+    });
+    assert!(state.synchronize_scene(window as usize, &changed));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(at(&state, 25, 25), [0, 255, 0, 255]);
+    assert!(at(&state, 305, 105)[2] > 100);
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+    drop(state);
+    gpu.destroy_image(green);
+    gpu.destroy_image(red);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
     if isolate_vulkan_graphical_test(
         "irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress",

@@ -264,6 +264,11 @@ struct Swapchain {
     /// Fence-slot-local isolated Core Animation group targets. Never shared
     /// across in-flight GPU command buffers.
     group_targets: Vec<Vec<Arc<BackingImageLease>>>,
+    /// Zero normally; nonzero uses bounded, ordered screen tiles when
+    /// distant visible CA children make union-rectangle isolation wasteful.
+    scene_tile_edge: u32,
+    #[cfg(test)]
+    last_scene_repaint_pixels: std::sync::atomic::AtomicU64,
     /// The previous layer's frame is needed when its contents must first be
     /// captured out of a single-layer accumulator when another layer joins.
     scene_frames: Vec<(usize, DirectFrame)>,
@@ -4428,6 +4433,9 @@ impl Swapchain {
             scene_placements: Vec::new(),
             scene_blender: None,
             group_targets: (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
+            scene_tile_edge: 0,
+            #[cfg(test)]
+            last_scene_repaint_pixels: std::sync::atomic::AtomicU64::new(0),
             scene_frames: Vec::new(),
             scene_repaint_needed: false,
             scene_restore_pending: false,
