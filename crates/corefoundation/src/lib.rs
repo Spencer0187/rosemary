@@ -116,6 +116,7 @@ exports::exports! {
         "CFArrayCreateMutable" => api::CFArrayCreateMutable,
         "CFArrayAppendValue" => api::CFArrayAppendValue,
         "CFArrayExchangeValuesAtIndices" => api::CFArrayExchangeValuesAtIndices,
+        "CFArraySortValues" => api::CFArraySortValues,
         "CFArrayCreateCopy" => api::CFArrayCreateCopy,
         "CFArrayInsertValueAtIndex" => api::CFArrayInsertValueAtIndex,
         "CFArrayRemoveValueAtIndex" => api::CFArrayRemoveValueAtIndex,

@@ -1362,6 +1362,79 @@ pub unsafe extern "C" fn CFArrayExchangeValuesAtIndices(array: CFTypeRef, a: CFI
     }
 }
 
+/// `CFComparatorFunction`; negative, zero or positive as `a` sorts before, with or
+/// after `b`.
+pub type ComparatorFunction = unsafe extern "C" fn(CFTypeRef, CFTypeRef, *mut c_void) -> CFIndex;
+
+/// Stable merge sort. A comparator is guest code and may not be a total order,
+/// which `slice::sort_by` is allowed to panic over.
+fn merge_sort(values: &mut Vec<CFTypeRef>, less_or_equal: &impl Fn(CFTypeRef, CFTypeRef) -> bool) {
+    if values.len() < 2 {
+        return;
+    }
+    let mut right = values.split_off(values.len() / 2);
+    merge_sort(values, less_or_equal);
+    merge_sort(&mut right, less_or_equal);
+    let left = std::mem::take(values);
+    let (mut l, mut r) = (left.into_iter().peekable(), right.into_iter().peekable());
+    while let (Some(&a), Some(&b)) = (l.peek(), r.peek()) {
+        values.push(
+            if less_or_equal(a, b) {
+                l.next()
+            } else {
+                r.next()
+            }
+            .unwrap(),
+        );
+    }
+    values.extend(l);
+    values.extend(r);
+}
+
+/// `void CFArraySortValues(CFMutableArrayRef, CFRange, CFComparatorFunction, void *context)`
+///
+/// `CFRange` is passed as its two fields, as in [`CFArrayApplyFunction`]. The range
+/// is copied out and written back, so the comparator never sees a half-sorted array.
+pub unsafe extern "C" fn CFArraySortValues(
+    array: CFTypeRef,
+    range_location: CFIndex,
+    range_length: CFIndex,
+    comparator: Option<ComparatorFunction>,
+    context: *mut c_void,
+) {
+    let Some(comparator) = comparator else {
+        return;
+    };
+    let (Ok(start), Some(end)) = (
+        usize::try_from(range_location),
+        range_location
+            .checked_add(range_length)
+            .and_then(|end| usize::try_from(end).ok()),
+    ) else {
+        return;
+    };
+    let Some(a) = (unsafe { collections::array(array) }) else {
+        return;
+    };
+    if !a.mutable {
+        return;
+    }
+    let Some(mut values) = a.values.get(start..end).map(ToOwned::to_owned) else {
+        return;
+    };
+    // SAFETY: `comparator` is supplied by the caller with this signature.
+    merge_sort(
+        &mut values,
+        &|x, y| unsafe { comparator(x, y, context) } <= 0,
+    );
+    if let Some(a) = unsafe { collections::array(array) }
+        && let Some(slot) = a.values.get_mut(start..end)
+        && slot.len() == values.len()
+    {
+        slot.copy_from_slice(&values);
+    }
+}
+
 /// The function called by [`CFArrayApplyFunction`] for each value in its range.
 pub type ArrayApplierFunction = unsafe extern "C" fn(CFTypeRef, *mut c_void);
 
