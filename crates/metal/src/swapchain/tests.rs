@@ -14,6 +14,74 @@ fn test_opaque_metal_placement(id: usize, frame: DirectFrame) -> ScenePlacement 
     }
 }
 
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn many_sibling_nested_opacity_groups_plan_with_indexed_membership() {
+    if isolate_vulkan_graphical_test(
+        "many_sibling_nested_opacity_groups_plan_with_indexed_membership",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, image, full)) = v10_fifo_fixture() else {
+        return;
+    };
+    let mut timings = Vec::new();
+    for groups in [128usize, 512, 2048] {
+        let mut placements = Vec::with_capacity(groups * 2);
+        for g in 0..groups {
+            for child in 0..2 {
+                let mut source = test_opaque_metal_placement(
+                    0x10_0000 + g * 2 + child,
+                    DirectFrame::from_frame(&full),
+                );
+                source.opacity_groups = vec![
+                    appkit::view::OpacityGroup {
+                        id: 0x20000 + g,
+                        opacity: 0.8,
+                    },
+                    appkit::view::OpacityGroup {
+                        id: 0x40000 + g,
+                        opacity: 0.5,
+                    },
+                ];
+                placements.push(source);
+            }
+        }
+        state.layers = placements.iter().map(|placement| placement.id).collect();
+        state.scene_placements = placements;
+        let mut fastest = std::time::Duration::MAX;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            let normalized = state.normalized_opacity_paths();
+            let regions = state.opacity_group_regions(&normalized);
+            fastest = fastest.min(start.elapsed());
+            assert_eq!(normalized.len(), groups * 2);
+            assert_eq!(regions.len(), groups);
+            for (_, path, inherited) in normalized.iter().take(4) {
+                assert_eq!(path.len(), 1);
+                assert!((path[0].opacity - 0.4).abs() < 1e-6);
+                assert_eq!(*inherited, 1.0);
+            }
+        }
+        timings.push(fastest.as_secs_f64() * 1e6);
+        eprintln!(
+            "indexed CA opacity planner: {groups} sibling groups, {} sources, {:.1}us ({:.3}us/group)",
+            groups * 2,
+            timings.last().unwrap(),
+            timings.last().unwrap() / groups as f64
+        );
+    }
+    // An order-of-magnitude input growth must not exhibit old all-pairs
+    // group scanning. Be generous about noisy/shared CI hardware.
+    assert!(
+        timings[2] <= timings[0] * 80.0 + 1000.0,
+        "quadratic group-planning regression: {timings:?}"
+    );
+    drop(state);
+    gpu.destroy_image(image);
+    sdl3::video::destroy_window(window);
+}
+
 fn test_full_frame(window: sdl3::Window, width: u32, height: u32) -> appkit::view::Frame {
     appkit::view::Frame {
         window,

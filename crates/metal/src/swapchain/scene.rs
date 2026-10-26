@@ -1367,14 +1367,21 @@ impl Swapchain {
     // An isolation boundary matters only if it must composite two distinct
     // immediate children. Through a unary chain, alpha can be forwarded to
     // its only child without any intermediate target or changed paint order.
-    fn normalized_opacity_paths(&self) -> Vec<(usize, Vec<appkit::view::OpacityGroup>, f32)> {
+    pub(super) fn normalized_opacity_paths(
+        &self,
+    ) -> Vec<(usize, Vec<appkit::view::OpacityGroup>, f32)> {
         use appkit::view::OpacityGroup;
-        #[derive(PartialEq)]
+        #[derive(Hash, PartialEq, Eq)]
         enum Child {
             Source(usize),
-            Group(Vec<OpacityGroup>),
+            Group(usize, u32),
         }
-        let mut children: Vec<(Vec<OpacityGroup>, Vec<Child>)> = Vec::new();
+        // Each prefix owns its distinct immediate children. Hashing by
+        // hierarchical id and opacity avoids searching all other groups
+        // for every retained source in large sibling-heavy CA hierarchies.
+        let mut children =
+            std::collections::HashMap::<Vec<(usize, u32)>, std::collections::HashSet<Child>>::new();
+        let active: std::collections::HashSet<_> = self.layers.iter().copied().collect();
         let contributes = |placement: &ScenePlacement| {
             placement.opacity > 0.0
                 && placement
@@ -1385,41 +1392,33 @@ impl Swapchain {
         for placement in self
             .scene_placements
             .iter()
-            .filter(|entry| self.layers.contains(&entry.id) && contributes(entry))
+            .filter(|entry| active.contains(&entry.id) && contributes(entry))
         {
             let path = &placement.opacity_groups;
-            for depth in 0..path.len() {
-                let prefix = &path[..=depth];
+            let mut prefix = Vec::with_capacity(path.len());
+            for (depth, group) in path.iter().enumerate() {
+                prefix.push((group.id, group.opacity.to_bits()));
                 let next = if depth + 1 == path.len() {
                     Child::Source(placement.id)
                 } else {
-                    Child::Group(path[..=depth + 1].to_vec())
+                    let nested = path[depth + 1];
+                    Child::Group(nested.id, nested.opacity.to_bits())
                 };
-                if let Some((_, members)) = children
-                    .iter_mut()
-                    .find(|(key, _)| key.as_slice() == prefix)
-                {
-                    if !members.contains(&next) {
-                        members.push(next);
-                    }
-                } else {
-                    children.push((prefix.to_vec(), vec![next]));
-                }
+                children.entry(prefix.clone()).or_default().insert(next);
             }
         }
         self.scene_placements
             .iter()
-            .filter(|entry| self.layers.contains(&entry.id) && contributes(entry))
+            .filter(|entry| active.contains(&entry.id) && contributes(entry))
             .map(|placement| {
                 let mut path = Vec::new();
+                let mut prefix = Vec::with_capacity(placement.opacity_groups.len());
                 let mut inherited = 1.0_f32;
-                for depth in 0..placement.opacity_groups.len() {
-                    let prefix = &placement.opacity_groups[..=depth];
-                    let own = placement.opacity_groups[depth];
+                for &own in &placement.opacity_groups {
+                    prefix.push((own.id, own.opacity.to_bits()));
                     let unary = children
-                        .iter()
-                        .find(|(key, _)| key.as_slice() == prefix)
-                        .is_some_and(|(_, members)| members.len() == 1);
+                        .get(&prefix)
+                        .is_some_and(|members| members.len() == 1);
                     if unary {
                         inherited *= own.opacity;
                     } else {
@@ -1435,14 +1434,18 @@ impl Swapchain {
             .collect()
     }
 
-    fn opacity_group_regions(
+    pub(super) fn opacity_group_regions(
         &self,
         normalized: &[(usize, Vec<appkit::view::OpacityGroup>, f32)],
     ) -> Vec<(Vec<appkit::view::OpacityGroup>, Region)> {
         let mut groups: Vec<(Vec<appkit::view::OpacityGroup>, Region)> = Vec::new();
+        let mut positions = std::collections::HashMap::<Vec<(usize, u32)>, usize>::new();
+        let mut by_source = std::collections::HashMap::new();
+        for (id, path, _) in normalized {
+            by_source.entry(*id).or_insert(path);
+        }
         for placement in &self.scene_placements {
-            let Some((_, path, _)) = normalized.iter().find(|(id, _, _)| *id == placement.id)
-            else {
+            let Some(&path) = by_source.get(&placement.id) else {
                 continue;
             };
             if path.is_empty() {
@@ -1476,11 +1479,12 @@ impl Swapchain {
                 width: (x1 - x0) as i32,
                 height: (y1 - y0) as i32,
             };
+            let mut key = Vec::with_capacity(path.len());
             for depth in 0..path.len() {
-                let path = &path[..=depth];
-                if let Some((_, current)) =
-                    groups.iter_mut().find(|(key, _)| key.as_slice() == path)
-                {
+                let own = path[depth];
+                key.push((own.id, own.opacity.to_bits()));
+                if let Some(&position) = positions.get(&key) {
+                    let current = &mut groups[position].1;
                     let left = current.x.min(region.x);
                     let top = current.y.min(region.y);
                     let right = (i64::from(current.x) + i64::from(current.width))
@@ -1494,7 +1498,8 @@ impl Swapchain {
                         height: (bottom - i64::from(top)) as i32,
                     };
                 } else {
-                    groups.push((path.to_vec(), region));
+                    positions.insert(key.clone(), groups.len());
+                    groups.push((path[..=depth].to_vec(), region));
                 }
             }
         }
@@ -2140,12 +2145,44 @@ impl Swapchain {
         }
         let normalized = self.normalized_opacity_paths();
         let regions = self.opacity_group_regions(&normalized);
+        let region_index = regions
+            .iter()
+            .map(|(path, bounds)| {
+                (
+                    path.iter()
+                        .map(|g| (g.id, g.opacity.to_bits()))
+                        .collect::<Vec<_>>(),
+                    *bounds,
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
         let group_bounds = |path: &[appkit::view::OpacityGroup]| -> Option<Region> {
-            regions
+            let key = path
                 .iter()
-                .find(|(key, _)| key.as_slice() == path)
-                .map(|(_, region)| *region)
+                .map(|g| (g.id, g.opacity.to_bits()))
+                .collect::<Vec<_>>();
+            region_index.get(&key).copied()
         };
+        let source_index = normalized
+            .iter()
+            .map(|(id, path, alpha)| (*id, (path.as_slice(), *alpha)))
+            .collect::<std::collections::HashMap<_, _>>();
+        let invisible: std::collections::HashSet<_> = self
+            .scene_placements
+            .iter()
+            .filter(|placement| {
+                placement.opacity <= 0.0
+                    || placement
+                        .opacity_groups
+                        .iter()
+                        .any(|group| group.opacity <= 0.0)
+            })
+            .map(|placement| placement.id)
+            .collect();
+        let mask_index = mask_spans
+            .iter()
+            .map(|(id, start, _)| (*id, *start))
+            .collect::<std::collections::HashMap<_, _>>();
         let mut scene_index = 0;
         let mut open_groups = Vec::<appkit::view::OpacityGroup>::new();
         let clear_group = |depth: usize| {
@@ -2263,37 +2300,35 @@ impl Swapchain {
             }
             Ok(())
         };
+        let ready_scenes = self
+            .scene_layers
+            .iter()
+            .filter(|scene| {
+                scene.ready
+                    || pending.is_some_and(|work| {
+                        scene.id == work.current || Some(scene.id) == work.previous
+                    })
+            })
+            .fold(std::collections::HashMap::new(), |mut by_id, scene| {
+                by_id.entry(scene.id).or_insert(scene);
+                by_id
+            });
         for id in &self.layers {
-            let Some(scene) = self.scene_layers.iter().find(|scene| {
-                scene.id == *id
-                    && (scene.ready
-                        || pending.is_some_and(|work| {
-                            scene.id == work.current || Some(scene.id) == work.previous
-                        }))
-            }) else {
+            let Some(&scene) = ready_scenes.get(id) else {
                 continue;
             };
             // Excluded zero-alpha groups cannot draw or acquire scratch.
             // Close any preceding visible group before moving past them.
-            let effective = normalized.iter().find(|(source, _, _)| source == id);
-            if effective.is_none()
-                && self.scene_placements.iter().any(|placement| {
-                    placement.id == *id
-                        && (placement.opacity <= 0.0
-                            || placement
-                                .opacity_groups
-                                .iter()
-                                .any(|group| group.opacity <= 0.0))
-                })
-            {
+            let effective = source_index.get(id).copied();
+            if effective.is_none() && invisible.contains(id) {
                 for depth in (0..open_groups.len()).rev() {
                     close_group(depth, &open_groups[..=depth], &mut scene_index)?;
                 }
                 open_groups.clear();
                 continue;
             }
-            let wanted = effective.map_or(&[][..], |(_, path, _)| path.as_slice());
-            let unary_opacity = effective.map_or(1.0, |(_, _, alpha)| *alpha);
+            let wanted = effective.map_or(&[][..], |(path, _)| path);
+            let unary_opacity = effective.map_or(1.0, |(_, alpha)| alpha);
             let common = open_groups
                 .iter()
                 .zip(wanted)
@@ -2355,10 +2390,7 @@ impl Swapchain {
                     clip_height: clip.height,
                     opacity: scene.opacity * unary_opacity,
                     clear: false,
-                    round_start: mask_spans
-                        .iter()
-                        .find(|(id, _, _)| *id == scene.id)
-                        .map_or(0, |(_, first, _)| *first),
+                    round_start: mask_index.get(&scene.id).copied().unwrap_or(0),
                     round_count: scene.rounded.len() as u32,
                     sampled_srgb: u32::from(matches!(
                         scene.snapshot.image.format,
