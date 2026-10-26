@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 use foundation::geometry::{NSPoint, NSRect, NSSize};
 use objc::object::Id;
@@ -10,7 +10,12 @@ use objc::sel::Sel;
 
 use crate::define::{class_methods, methods};
 
+static NEXT_STORE_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct Store {
+    /// Monotonic identity for full replacements. An allocated view address
+    /// and a reused generation number never authenticate prior CPU pixels.
+    instance: u64,
     pub width: u32,
     pub height: u32,
     /// Premultiplied B, G, R, A, top row first.
@@ -36,6 +41,7 @@ impl Store {
     /// Allocate an initially clean premultiplied-BGRA backing store.
     pub fn new(width: u32, height: u32) -> Self {
         Store {
+            instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width,
             height,
             pixels: vec![0; width as usize * height as usize * 4],
@@ -81,14 +87,15 @@ impl Store {
         }
     }
 
-    /// Only consecutive producer-verified versions may authorize partial work.
-    /// A missing generation, replaced Store, or wraparound fails closed.
-    fn damage_since(&self, generation: u64) -> Option<Rect> {
+    /// Only consecutive producer-verified versions authorize localized
+    /// work. Preserve disjoint rectangles: unioning six 1px changes at
+    /// distant 6K positions would needlessly dirty megabytes of pixels.
+    fn damage_regions_since(&self, generation: u64) -> Option<Vec<Rect>> {
         if generation >= self.generation {
             return None;
         }
         let mut expected = generation.checked_add(1)?;
-        let mut union = None;
+        let mut regions = Vec::new();
         for &(at, rect) in &self.changes {
             if at < expected {
                 continue;
@@ -96,12 +103,18 @@ impl Store {
             if at != expected {
                 return None;
             }
-            union = Some(union.map_or(rect, |prev: Rect| prev.union(&rect)));
+            if !rect.is_empty() {
+                regions.push(rect);
+            }
             expected = expected.checked_add(1)?;
         }
-        (expected == self.generation.checked_add(1)?)
-            .then_some(union?)
-            .filter(|rect| !rect.is_empty())
+        (expected == self.generation.checked_add(1)? && !regions.is_empty()).then_some(regions)
+    }
+    /// Conservative union for consumers that still accept one damage rect.
+    fn damage_since(&self, generation: u64) -> Option<Rect> {
+        self.damage_regions_since(generation)?
+            .into_iter()
+            .reduce(|a, b| a.union(&b))
     }
 
     fn fully_opaque(&self) -> bool {
@@ -137,6 +150,7 @@ impl Store {
             pixels[to..to + columns * 4].copy_from_slice(&self.pixels[from..from + columns * 4]);
         }
         *self = Store {
+            instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width,
             height,
             pixels,
@@ -299,6 +313,337 @@ struct NativeCapture {
     damage: Option<NativeCpuDamage>,
 }
 type CaptureKey = (usize, i64, i64, u32, u32, u32, u32, bool, u64);
+/// Immutable CPU-owned row bands; cloning a new generation clones only
+/// Arc descriptors and the bands intersecting producer-attested damage.
+/// GPU readers can retain any previous generation without a full-frame memcpy.
+#[derive(Clone)]
+pub struct NativePixelTiles {
+    pub width: u32,
+    pub height: u32,
+    pub revision: u64,
+    bands: Vec<std::sync::Arc<Vec<u8>>>,
+    hashes: Vec<u64>,
+}
+
+const NATIVE_TILE_ROWS: usize = 32;
+const MIN_TILED_CAPTURE_BYTES: u64 = 1024 * 1024;
+
+impl NativePixelTiles {
+    pub fn copy_rect_to(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+        dst: &mut [u8],
+    ) -> Option<()> {
+        let right = x.checked_add(width)?;
+        let bottom = y.checked_add(height)?;
+        if right > self.width || bottom > self.height {
+            return None;
+        }
+        let row_bytes = usize::try_from(width).ok()?.checked_mul(4)?;
+        if dst.len() != row_bytes.checked_mul(usize::try_from(height).ok()?)? {
+            return None;
+        }
+        let stride = usize::try_from(self.width).ok()?.checked_mul(4)?;
+        for row in 0..height as usize {
+            let global_row = y as usize + row;
+            let band_index = global_row / NATIVE_TILE_ROWS;
+            let band_row = global_row % NATIVE_TILE_ROWS;
+            let start = band_row.checked_mul(stride)?.checked_add(x as usize * 4)?;
+            let source = self.bands.get(band_index)?.get(start..start + row_bytes)?;
+            dst.get_mut(row * row_bytes..(row + 1) * row_bytes)?
+                .copy_from_slice(source);
+        }
+        Some(())
+    }
+    pub fn len(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+    pub fn is_empty(&self) -> bool {
+        self.bands.is_empty()
+    }
+    pub fn retained_bytes(&self) -> usize {
+        self.bands.iter().map(|b| b.len()).sum()
+    }
+    /// Build an independently owned opaque snapshot from tightly packed BGRA.
+    pub fn from_opaque_bgra(width: u32, height: u32, pixels: &[u8]) -> Option<Self> {
+        let stride = (width as usize).checked_mul(4)?;
+        let expected = stride.checked_mul(height as usize)?;
+        if width == 0
+            || height == 0
+            || pixels.len() != expected
+            || pixels.chunks_exact(4).any(|p| p[3] != 255)
+        {
+            return None;
+        }
+        let mut bands = Vec::new();
+        let mut hashes = Vec::new();
+        for band in pixels.chunks(stride * NATIVE_TILE_ROWS) {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            band.hash(&mut h);
+            hashes.push(h.finish());
+            bands.push(std::sync::Arc::new(band.to_vec()));
+        }
+        let revision = opaque_capture_revision(&hashes, expected);
+        Some(Self {
+            width,
+            height,
+            revision,
+            bands,
+            hashes,
+        })
+    }
+    fn new_from_opaque_store(source: &Store, crop: Rect) -> Option<Self> {
+        let width = usize::try_from(crop.width).ok()?;
+        let height = usize::try_from(crop.height).ok()?;
+        let stride = width.checked_mul(4)?;
+        let mut bands = Vec::with_capacity(height.div_ceil(NATIVE_TILE_ROWS));
+        let mut hashes = Vec::with_capacity(bands.capacity());
+        for row0 in (0..height).step_by(NATIVE_TILE_ROWS) {
+            let rows = (height - row0).min(NATIVE_TILE_ROWS);
+            let mut data = Vec::with_capacity(stride * rows);
+            for y in row0..row0 + rows {
+                let offset = ((crop.y as usize + y) * source.width as usize + crop.x as usize) * 4;
+                data.extend_from_slice(source.pixels.get(offset..offset + stride)?);
+            }
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            data.hash(&mut hasher);
+            hashes.push(hasher.finish());
+            bands.push(std::sync::Arc::new(data));
+        }
+        let revision = opaque_capture_revision(&hashes, stride * height);
+        Some(Self {
+            width: crop.width as u32,
+            height: crop.height as u32,
+            bands,
+            hashes,
+            revision,
+        })
+    }
+    fn patched_regions(&self, source: &Store, crop: Rect, regions: &[Rect]) -> Option<Self> {
+        if regions.is_empty() {
+            return None;
+        }
+        let mut next = self.clone();
+        let width = usize::try_from(crop.width).ok()?;
+        let stride = width.checked_mul(4)?;
+        let mut touched = vec![false; next.bands.len()];
+        for &dirty in regions {
+            let start_y = usize::try_from(dirty.y - crop.y).ok()?;
+            let end_y = start_y.checked_add(usize::try_from(dirty.height).ok()?)?;
+            let start_x = usize::try_from(dirty.x - crop.x).ok()?;
+            let columns = usize::try_from(dirty.width).ok()?;
+            if end_y > crop.height as usize || start_x.checked_add(columns)? > width {
+                return None;
+            }
+            for band_index in start_y / NATIVE_TILE_ROWS..=(end_y - 1) / NATIVE_TILE_ROWS {
+                let band_start = band_index * NATIVE_TILE_ROWS;
+                let from = start_y.max(band_start);
+                let to = end_y.min(band_start + NATIVE_TILE_ROWS);
+                let pixels = std::sync::Arc::make_mut(next.bands.get_mut(band_index)?);
+                for row in from..to {
+                    let src_at = ((crop.y as usize + row) * source.width as usize
+                        + crop.x as usize
+                        + start_x)
+                        .checked_mul(4)?;
+                    let dst_at = (row - band_start)
+                        .checked_mul(stride)?
+                        .checked_add(start_x.checked_mul(4)?)?;
+                    pixels
+                        .get_mut(dst_at..dst_at + columns * 4)?
+                        .copy_from_slice(source.pixels.get(src_at..src_at + columns * 4)?);
+                }
+                touched[band_index] = true;
+            }
+        }
+        for (band, changed) in touched.into_iter().enumerate() {
+            if changed {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                next.bands[band].hash(&mut h);
+                next.hashes[band] = h.finish();
+            }
+        }
+        next.revision = opaque_capture_revision(&next.hashes, next.len());
+        Some(next)
+    }
+}
+
+struct NativeTiledCache {
+    layer: usize,
+    store_instance: u64,
+    view_generation: u64,
+    ca_revision: u64,
+    descendant_revision: u64,
+    overlay_revision: u64,
+    tiles: std::sync::Arc<NativePixelTiles>,
+}
+static NATIVE_TILED_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeTiledCache>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Publication path for large plain opaque NSView backing stores. The scene
+/// owns a row-banded value snapshot, never a borrowed mutable Store pointer.
+/// Any uncertain damage or alpha proof falls back to the existing full capture.
+pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
+    view: Id,
+    width: u32,
+    height: u32,
+    crop: Rect,
+) -> Option<(
+    std::sync::Arc<NativePixelTiles>,
+    u64,
+    Option<NativeCpuDamage>,
+)> {
+    if crop.x < 0
+        || crop.y < 0
+        || crop.is_empty()
+        || crop.x.checked_add(crop.width)? > width as i64
+        || crop.y.checked_add(crop.height)? > height as i64
+        || !native_scene_extent_supported(crop.width as u32, crop.height as u32)
+        || (crop.width as u64)
+            .checked_mul(crop.height as u64)?
+            .checked_mul(4)?
+            < MIN_TILED_CAPTURE_BYTES
+    {
+        return None;
+    }
+    let layer = crate::view::layer_of(view);
+    if crate::coreanimation::has_tree(layer)
+        || crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time())
+    {
+        return None;
+    }
+    let stores = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    let source = stores.as_ref()?.get(&(view as usize))?;
+    if source.width != width || source.height != height {
+        return None;
+    }
+    let overlay = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    if overlay
+        .iter()
+        .any(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
+    {
+        return None;
+    }
+    let overlay_revision = OVERLAY_REVISIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&(view as usize))
+        .copied()
+        .unwrap_or(0);
+    let ca_revision = crate::coreanimation::native_scene_content_revision(layer);
+    let descendant_revision = crate::coreanimation::native_scene_descendant_revision(layer);
+    let key: CaptureKey = (
+        view as usize,
+        crop.x,
+        crop.y,
+        crop.width as u32,
+        crop.height as u32,
+        width,
+        height,
+        false,
+        0,
+    );
+    let mut cache = NATIVE_TILED_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = cache.get_mut(&key) {
+        if old.layer == layer as usize
+            && old.store_instance == source.instance
+            && old.ca_revision == ca_revision
+            && old.descendant_revision == descendant_revision
+            && old.overlay_revision == overlay_revision
+        {
+            if old.view_generation == source.generation() {
+                return Some((std::sync::Arc::clone(&old.tiles), old.tiles.revision, None));
+            }
+            if let Some(all) = source.damage_regions_since(old.view_generation) {
+                let regions = all
+                    .into_iter()
+                    .map(|r| r.intersection(&crop))
+                    .filter(|r| !r.is_empty())
+                    .collect::<Vec<_>>();
+                if regions.is_empty() {
+                    old.view_generation = source.generation();
+                    return Some((std::sync::Arc::clone(&old.tiles), old.tiles.revision, None));
+                }
+                // All previously accepted unchanged pixels were verified
+                // opaque; newly authored regions alone need an alpha check.
+                let opaque = regions.iter().all(|r| {
+                    (r.y..r.y + r.height).all(|row| {
+                        let offset = ((row as usize) * width as usize + r.x as usize) * 4;
+                        source.pixels[offset..offset + r.width as usize * 4]
+                            .chunks_exact(4)
+                            .all(|pixel| pixel[3] == 255)
+                    })
+                });
+                if opaque {
+                    let next = old.tiles.patched_regions(source, crop, &regions)?;
+                    let prior = old.tiles.revision;
+                    let revision = next.revision;
+                    // Preserve exact dirty rectangles for CPU patch work,
+                    // keep the old single-box GPU ABI conservative for now.
+                    let union = regions.iter().copied().reduce(|a, b| a.union(&b))?;
+                    let damage = (prior != revision).then_some(NativeCpuDamage {
+                        from_revision: prior,
+                        rect: Rect {
+                            x: union.x - crop.x,
+                            y: union.y - crop.y,
+                            width: union.width,
+                            height: union.height,
+                        },
+                    });
+                    old.view_generation = source.generation();
+                    old.tiles = std::sync::Arc::new(next);
+                    return Some((std::sync::Arc::clone(&old.tiles), revision, damage));
+                }
+            }
+        }
+    }
+    // Cold capture and unknown mutation history require full alpha proof.
+    if !source.fully_opaque() {
+        cache.remove(&key);
+        return None;
+    }
+    let tiles = std::sync::Arc::new(NativePixelTiles::new_from_opaque_store(source, crop)?);
+    let revision = tiles.revision;
+    cache.insert(
+        key,
+        NativeTiledCache {
+            layer: layer as usize,
+            store_instance: source.instance,
+            view_generation: source.generation(),
+            ca_revision,
+            descendant_revision,
+            overlay_revision,
+            tiles: std::sync::Arc::clone(&tiles),
+        },
+    );
+    // Cap retained AppKit-side tile-cache storage, excluding GPU-owned old
+    // generations whose lifetime belongs to the receiving worker.
+    let mut used: usize = cache.values().map(|c| c.tiles.retained_bytes()).sum();
+    if used > NATIVE_CAPTURE_CACHE_LIMIT {
+        let keys: Vec<_> = cache
+            .keys()
+            .copied()
+            .filter(|other| *other != key)
+            .collect();
+        for entry in keys {
+            if used <= NATIVE_CAPTURE_CACHE_LIMIT {
+                break;
+            }
+            if let Some(removed) = cache.remove(&entry) {
+                used = used.saturating_sub(removed.tiles.retained_bytes());
+            }
+        }
+    }
+    Some((tiles, revision, None))
+}
+
 const NATIVE_HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 fn opaque_capture_hashes(pixels: &[u8]) -> Vec<u64> {
@@ -1366,6 +1711,10 @@ pub(crate) fn forget(view: Id) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(owner, _, _, _, _, _, _, _, _), _| *owner != key);
+    NATIVE_TILED_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(owner, _, _, _, _, _, _, _, _), _| *owner != key);
     crate::view::forget_native_tile_ids(view);
     NEEDS_DISPLAY
         .lock()
@@ -2222,6 +2571,7 @@ fn native_scene_pixels_impl(
             pixels.extend_from_slice(&src.pixels[offset..offset + crop.width as usize * 4]);
         }
         Store {
+            instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width: crop.width as u32,
             height: crop.height as u32,
             pixels,
@@ -3642,6 +3992,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
             continue;
         }
         let target = composed.get_or_insert_with(|| Store {
+            instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width: store.width,
             height: store.height,
             pixels: store.pixels.clone(),
@@ -4281,6 +4632,138 @@ mod tests {
     }
 
     #[test]
+    fn native_tiled_cache_distinguishes_replaced_store_with_reused_generation() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        const W: u32 = 512;
+        const H: u32 = 512;
+        let mut red = Store::new(W, H);
+        red.pixels = [0u8, 0, 255, 255].repeat((W * H) as usize);
+        red.touch();
+        let old_generation = red.generation;
+        let old_instance = red.instance;
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, red);
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: W as i64,
+            height: H as i64,
+        };
+        let first = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        let mut first_sample = [0u8; 4];
+        first
+            .0
+            .copy_rect_to(40, 23, 1, 1, &mut first_sample)
+            .unwrap();
+        assert_eq!(first_sample, [0, 0, 255, 255]);
+        let mut blue = Store::new(W, H);
+        blue.pixels = [255u8, 0, 0, 255].repeat((W * H) as usize);
+        blue.touch();
+        assert_eq!(blue.generation, old_generation);
+        assert_ne!(blue.instance, old_instance);
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(view as usize, blue);
+        let second = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        let mut sample = [0u8; 4];
+        second.0.copy_rect_to(40, 23, 1, 1, &mut sample).unwrap();
+        assert_eq!(sample, [255, 0, 0, 255]);
+        assert_ne!(second.1, first.1);
+        let mut old_sample = [0u8; 4];
+        first.0.copy_rect_to(40, 23, 1, 1, &mut old_sample).unwrap();
+        assert_eq!(old_sample, [0, 0, 255, 255]);
+        assert!(second.2.is_none(), "replacement is a new complete source");
+        drop(first);
+        drop(second);
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn native_row_bands_preserve_unmodified_chunks_and_full_content_identity() {
+        let width = 128;
+        let height = 100;
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let mut producer = Store::new(width as u32, height as u32);
+        producer.pixels = [11u8, 22, 33, 255].repeat(width as usize * height as usize);
+        producer.touch();
+        let old = NativePixelTiles::new_from_opaque_store(&producer, crop).unwrap();
+        assert_eq!(old.bands.len(), 4);
+        assert!(old.bands.iter().all(|b| b.len() <= 128 * 32 * 4));
+        for (x, y, blue) in [(7usize, 2usize, 60u8), (75, 77, 90)] {
+            let offset = (y * width as usize + x) * 4;
+            producer.pixels[offset] = blue;
+            producer.touch_region(Rect {
+                x: x as i64,
+                y: y as i64,
+                width: 1,
+                height: 1,
+            });
+        }
+        let changes = producer.damage_regions_since(1).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert_eq!(
+            changes[0],
+            Rect {
+                x: 7,
+                y: 2,
+                width: 1,
+                height: 1
+            }
+        );
+        assert_eq!(
+            changes[1],
+            Rect {
+                x: 75,
+                y: 77,
+                width: 1,
+                height: 1
+            }
+        );
+        let updated = old.patched_regions(&producer, crop, &changes).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&old.bands[1], &updated.bands[1]));
+        assert!(!std::sync::Arc::ptr_eq(&old.bands[0], &updated.bands[0]));
+        assert!(!std::sync::Arc::ptr_eq(&old.bands[2], &updated.bands[2]));
+        assert!(std::sync::Arc::ptr_eq(&old.bands[3], &updated.bands[3]));
+        let full = NativePixelTiles::new_from_opaque_store(&producer, crop).unwrap();
+        assert_eq!(full.revision, updated.revision);
+        let mut copied = vec![0; updated.len()];
+        updated
+            .copy_rect_to(0, 0, width as u32, height as u32, &mut copied)
+            .unwrap();
+        assert_eq!(copied, producer.pixels);
+        let mut unchanged = vec![0; old.len()];
+        old.copy_rect_to(0, 0, width as u32, height as u32, &mut unchanged)
+            .unwrap();
+        assert_eq!(unchanged[(2 * 128 + 7) * 4], 11);
+        assert_eq!(unchanged[(77 * 128 + 75) * 4], 11);
+        assert_eq!(full.bands.len(), 4);
+        let no_change = updated.patched_regions(&producer, crop, &changes).unwrap();
+        assert_eq!(no_change.revision, updated.revision);
+        assert_eq!(
+            producer.damage_since(1).unwrap(),
+            Rect {
+                x: 7,
+                y: 2,
+                width: 69,
+                height: 76
+            }
+        );
+    }
+
+    #[test]
     fn incremental_plain_capture_keeps_gpu_readers_immutable_and_hashes_only_damage() {
         crate::bootstrap();
         let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
@@ -4915,6 +5398,7 @@ mod tests {
 
     fn store_of(width: u32, height: u32) -> Store {
         Store {
+            instance: NEXT_STORE_ID.fetch_add(1, Ordering::Relaxed),
             width,
             height,
             pixels: vec![0; width as usize * height as usize * 4],
@@ -5222,6 +5706,85 @@ mod tests {
         assert_eq!(store.pixels, [99, 99, 227, 255]);
         FOCUS.with(|stack| stack.borrow_mut().clear());
     }
+}
+
+#[cfg(test)]
+#[test]
+fn changing_six_k_native_row_bands_are_granular() {
+    if std::env::var_os("ROSEMARY_BENCH_TILED_NATIVE_CHANGED_6K").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    const W: u32 = 6016;
+    const H: u32 = 3384;
+    let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+    set_native_view_pixels_for_tests(
+        view,
+        W,
+        H,
+        [1u8, 120, 200, 255].repeat(W as usize * H as usize),
+    );
+    let mut regions = Vec::new();
+    for y in (0..H).step_by(2048) {
+        for x in (0..W).step_by(2048) {
+            regions.push(Rect {
+                x: x as i64,
+                y: y as i64,
+                width: (W - x).min(2048) as i64,
+                height: (H - y).min(2048) as i64,
+            });
+        }
+    }
+    assert_eq!(regions.len(), 6);
+    let mut old = regions
+        .iter()
+        .map(|r| native_scene_tiled_pixels_cropped_with_damage(view, W, H, *r).unwrap())
+        .collect::<Vec<_>>();
+    let mut held = Vec::new();
+    let mut timings = Vec::new();
+    for rev in 2u8..=25 {
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            for rect in &regions {
+                let x = (rect.x + rect.width / 2) as usize;
+                let y = (rect.y + rect.height / 2) as usize;
+                src.pixels[(y * W as usize + x) * 4] = rev;
+                src.touch_region(Rect {
+                    x: x as i64,
+                    y: y as i64,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+        held.clear();
+        held.extend(old.iter().map(|(tiles, _, _)| std::sync::Arc::clone(tiles)));
+        let started = std::time::Instant::now();
+        for (i, rect) in regions.iter().enumerate() {
+            let (now, revision, damage) =
+                native_scene_tiled_pixels_cropped_with_damage(view, W, H, *rect).unwrap();
+            assert_eq!(damage.unwrap().from_revision, old[i].1);
+            let (x, y) = ((rect.width / 2) as u32, (rect.height / 2) as u32);
+            let (mut previous, mut current) = ([0u8; 4], [0u8; 4]);
+            held[i].copy_rect_to(x, y, 1, 1, &mut previous).unwrap();
+            now.copy_rect_to(x, y, 1, 1, &mut current).unwrap();
+            assert_eq!(previous[0], rev - 1);
+            assert_eq!(current, [rev, 120, 200, 255]);
+            old[i] = (now, revision, damage);
+        }
+        timings.push(started.elapsed().as_secs_f64() * 1000.);
+    }
+    timings.sort_by(f64::total_cmp);
+    let mean = timings.iter().sum::<f64>() / timings.len() as f64;
+    let p95 = timings[timings.len() * 95 / 100];
+    eprintln!(
+        "6K row-banded native captures six tiles held GPU readers mean_ms={mean:.3} p95_ms={p95:.3}"
+    );
+    drop(old);
+    drop(held);
+    forget(view);
+    objc::arc::release(view);
 }
 
 #[cfg(test)]

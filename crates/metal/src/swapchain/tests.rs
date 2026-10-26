@@ -5040,6 +5040,7 @@ fn nsview_parent_alpha_groups_two_opaque_metal_children() {
                 occluded: Some(vec![]),
                 native: native_scene_source(
                     item.native_pixels,
+                    item.native_tiles,
                     item.native_dmabuf,
                     item.native_revision,
                     item.frame.width,
@@ -5721,6 +5722,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
     let red: Vec<u8> =
         [0u8, 0, 128, 128].repeat((native_frame.width * native_frame.height) as usize);
     let native_source = scene::NativeCpuSceneSource {
+        tiles: None,
         cpu_capture: None,
         bytes: Arc::new(red),
         revision: 1,
@@ -5828,6 +5830,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         opacity_groups: Vec::new(),
         frame: DirectFrame::from_frame(&resized_frame),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(
                 [0u8, 0, 128, 128].repeat((resized_frame.width * resized_frame.height) as usize),
@@ -6140,6 +6143,137 @@ fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
 /// seams and later static-Metal membership changes.
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image() {
+    if isolate_vulkan_graphical_test(
+        "immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (128u32, 96u32);
+    let window =
+        sdl3::video::create_window(c"immutable CPU native rows", width as i32, height as i32, 0)
+            .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let frame = test_full_frame(window, width, height);
+    let make = |tiles: std::sync::Arc<appkit::backing::NativePixelTiles>, damage| {
+        let mut p = test_opaque_metal_placement(0x9caf, DirectFrame::from_frame(&frame));
+        p.opaque = false;
+        p.native = Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            tiles: Some(std::sync::Arc::clone(&tiles)),
+            revision: tiles.revision,
+            cpu_capture: Some(appkit::backing::NativeCpuCapture {
+                revision: tiles.revision,
+                damage,
+            }),
+            dmabuf: None,
+            dma_sample: None,
+        });
+        p
+    };
+    let first_pixels = [0u8, 0, 255, 255].repeat((width * height) as usize);
+    let before = std::sync::Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &first_pixels).unwrap(),
+    );
+    let first = make(std::sync::Arc::clone(&before), None);
+    state.synchronize_scene(window as usize, &[first.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &first), Ok(true));
+    let old_gpu = Arc::clone(
+        &state
+            .scene_layers
+            .iter()
+            .find(|item| item.id == first.id)
+            .unwrap()
+            .snapshot,
+    );
+    let old = read_scene_pixel(gpu, old_gpu.image.image, width, height, 77, 40);
+    assert_eq!(old, [0, 0, 255, 255]);
+    let mut next_pixels = first_pixels.clone();
+    let at = ((40 * width + 77) * 4) as usize;
+    next_pixels[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+    let after = std::sync::Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &next_pixels).unwrap(),
+    );
+    let proof = appkit::backing::NativeCpuDamage {
+        from_revision: before.revision,
+        rect: appkit::backing::Rect {
+            x: 77,
+            y: 40,
+            width: 1,
+            height: 1,
+        },
+    };
+    let second = make(after, Some(proof));
+    assert_ne!(
+        first.native.as_ref().unwrap().revision,
+        second.native.as_ref().unwrap().revision
+    );
+    state.synchronize_scene(window as usize, &[second.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &second), Ok(true));
+    let accepted = &state
+        .scene_layers
+        .iter()
+        .find(|item| item.id == second.id)
+        .unwrap()
+        .snapshot;
+    assert!(!Arc::ptr_eq(accepted, &old_gpu));
+    assert_eq!(
+        read_scene_pixel(gpu, accepted.image.image, width, height, 77, 40),
+        [255, 0, 0, 255],
+        "dirty CPU texel did not reach native GPU image"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, accepted.image.image, width, height, 7, 8),
+        [0, 0, 255, 255],
+        "untouched pixel was destroyed by partial GPU upload"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, old_gpu.image.image, width, height, 77, 40),
+        [0, 0, 255, 255],
+        "old GPU generation was mutated before rollback lease release"
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            77,
+            40
+        ),
+        [0, 0, 255, 255],
+        "new scene did not present dirty CPU texel (RGBA accumulator)"
+    );
+    drop(old_gpu);
+    drop(state);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
     if isolate_vulkan_graphical_test(
         "fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal",
@@ -6233,6 +6367,7 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
                 rounded: vec![],
                 occluded: Some(vec![]),
                 native: Some(scene::NativeCpuSceneSource {
+                    tiles: None,
                     cpu_capture: None,
                     bytes: Arc::new([0u8, 0, 128, 128].repeat(tw as usize * th as usize)),
                     revision: 91 + tile_no as u64,
@@ -6340,6 +6475,7 @@ fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new([0u8, 0, 255, 255].repeat(20 * 18)),
                 revision: 1,
@@ -6485,6 +6621,7 @@ fn twelve_transaction_pinned_gpu_generations_count_toward_scene_budget() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 1,
@@ -6556,6 +6693,7 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(
                 [0u8, 0, 128, 128].repeat((child_frame.width * child_frame.height) as usize),
@@ -6625,6 +6763,7 @@ fn rounded_native_opaque_overlay_preserves_metal_corners() {
         }],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat((whole.width * whole.height) as usize)),
             revision: 1,
@@ -6675,12 +6814,21 @@ fn large_native_dma_source_requires_no_event_thread_pixel_allocation() {
         modifier: 0,
         planes: vec![],
     });
-    let admitted = native_scene_source(None, Some(Arc::clone(&picture)), 7, 6016, 3384, None, None)
-        .expect("6K DMA-BUF-only sources must bypass the 64 MiB CPU cap");
+    let admitted = native_scene_source(
+        None,
+        None,
+        Some(Arc::clone(&picture)),
+        7,
+        6016,
+        3384,
+        None,
+        None,
+    )
+    .expect("6K DMA-BUF-only sources must bypass the 64 MiB CPU cap");
     assert!(admitted.bytes.is_empty());
     assert!(Arc::ptr_eq(admitted.dmabuf.as_ref().unwrap(), &picture));
     assert_eq!(admitted.revision, 7);
-    assert!(native_scene_source(None, Some(picture), 7, 9000, 9000, None, None).is_none());
+    assert!(native_scene_source(None, None, Some(picture), 7, 9000, 9000, None, None).is_none());
 }
 
 #[cfg(target_os = "linux")]
@@ -6881,6 +7029,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
                 rounded: vec![],
                 occluded: Some(vec![]),
                 native: Some(scene::NativeCpuSceneSource {
+                    tiles: None,
                     cpu_capture: producer_damage.then_some(appkit::backing::NativeCpuCapture {
                         revision: 7 + count as u64,
                         damage: None,
@@ -7211,6 +7360,7 @@ fn many_offscreen_six_k_dma_views_stage_in_bounded_visible_gpu_budget() {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new(Vec::new()),
                 revision: n as u64 + 1,
@@ -7284,8 +7434,9 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
     ));
     let picture = real_gbm_picture_with_pixels(width, height, |_, _| [0, 0, 255, 255]);
     unsafe {
-        let native_source = native_scene_source(None, Some(picture), 1, width, height, None, None)
-            .expect("a 6K DMA-only layer must enter retained composition");
+        let native_source =
+            native_scene_source(None, None, Some(picture), 1, width, height, None, None)
+                .expect("a 6K DMA-only layer must enter retained composition");
         assert!(native_source.bytes.is_empty());
         gpu.one_shot(|device, cb| {
             cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
@@ -7412,6 +7563,7 @@ fn linear_dma_fallback_maps_only_far_visible_rows_and_keeps_texel_offsets() {
         rounded: vec![],
         occluded: None,
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 1,
@@ -7567,6 +7719,7 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 1,
@@ -7683,6 +7836,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 11,
@@ -7782,6 +7936,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     let cpu = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 128, 128].repeat(30 * 25)),
             revision: 12,
@@ -7797,6 +7952,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     let second_invalid = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 13,
@@ -7976,6 +8132,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 71,
@@ -8001,6 +8158,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
                 ..bframe
             }),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
                 revision: 72,
@@ -8197,6 +8355,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 11,
@@ -8224,6 +8383,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         id: earlier_id,
         frame: DirectFrame::from_frame(&earlier_frame),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 9,
@@ -8268,6 +8428,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     let earlier = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
             revision: 10,
@@ -8385,6 +8546,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     let real = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 12,
@@ -8466,6 +8628,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 7,
@@ -8519,6 +8682,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
             radius: 9.0,
         }],
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 8,
@@ -8646,6 +8810,7 @@ fn pinned_scene_generation_budget_defers_dma_and_recovers_after_retirement() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 11,
@@ -8851,6 +9016,7 @@ fn appkit_moving_six_k_dma_source_updates_static_metal_window_pixels() {
         occluded: Some(vec![]),
         native: native_scene_source(
             item.native_pixels,
+            item.native_tiles,
             item.native_dmabuf,
             item.native_revision,
             item.frame.width,
@@ -8942,6 +9108,7 @@ fn moving_static_large_dma_source_changes_retained_gpu_pixels() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 42,
@@ -9064,6 +9231,7 @@ fn replacing_obsolete_native_gpu_generations_makes_forward_progress() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(2048 * 2048)),
             revision: 2,
@@ -9200,6 +9368,7 @@ fn same_native_id_near_scene_budget_replaces_real_dma_pixels() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255, 0, 0, 255].repeat(2048 * 2048)),
             revision: 2,
@@ -9337,6 +9506,7 @@ fn atomic_scene_replacement_peak_reports_nonprogressing_physical_pressure() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(vec![0u8; 16 * 1024 * 1024]),
             revision: 2,
@@ -9402,6 +9572,7 @@ fn temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0, 0, 255, 255].repeat((48 * 44) as usize)),
             revision: 1,
@@ -9501,6 +9672,7 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new([index as u8, 0, 255, 255].repeat(4096 * 4096)),
                 revision: index as u64 + 1,
@@ -9797,6 +9969,7 @@ fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: capture.0,
             revision: capture.1,
@@ -9907,6 +10080,7 @@ fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
         native: None,
     };
     let native_source = scene::NativeCpuSceneSource {
+        tiles: None,
         cpu_capture: None,
         bytes: Arc::new([0u8, 0, 255, 255].repeat((frame.width * frame.height) as usize)),
         revision: 1,
@@ -14186,6 +14360,7 @@ fn rejected_linear_dma_worker_commits_original_publication() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 17,
@@ -14293,6 +14468,7 @@ fn native_upload_failed_fence_wait_retains_gpu_resources_until_completion() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 32)),
             revision: 1,
@@ -14367,6 +14543,7 @@ fn native_dma_failed_fence_wait_keeps_descriptor_and_import_alive() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 32)),
             revision: 1,
@@ -14567,6 +14744,7 @@ fn native_cpu_producer_damage_reuses_only_exact_gpu_base_and_rolls_back_on_faile
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(old_pixels.clone()),
             revision: 1,
             cpu_capture: Some(appkit::backing::NativeCpuCapture {
@@ -14758,6 +14936,7 @@ fn extra_native_window_crop_invalidates_damage_before_mixed_dma_gpu_upload() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(pixels.clone()),
             revision: 7,
             cpu_capture: Some(appkit::backing::NativeCpuCapture {
@@ -14875,6 +15054,7 @@ fn transient_native_dma_import_retries_new_gpu_only_producer_without_window_blac
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 17,
             cpu_capture: None,
@@ -15119,6 +15299,7 @@ fn compositor_worker_retries_same_dma_revision_after_temporary_import_failure() 
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 63,
             cpu_capture: None,
@@ -15218,6 +15399,7 @@ fn cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 89,
             cpu_capture: None,
@@ -15363,6 +15545,7 @@ fn unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 92,
             cpu_capture: None,
@@ -15443,6 +15626,7 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 18,
             cpu_capture: None,
@@ -15469,6 +15653,7 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
         opacity_groups: Vec::new(),
         id: native.id + 1,
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 19,
             cpu_capture: None,
@@ -15797,6 +15982,7 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
                 occluded: Some(vec![]),
                 native: native_scene_source(
                     item.native_pixels,
+                    item.native_tiles,
                     item.native_dmabuf,
                     item.native_revision,
                     item.frame.width,
@@ -16452,6 +16638,7 @@ fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
                 rounded: vec![],
                 occluded: Some(vec![]),
                 native: Some(scene::NativeCpuSceneSource {
+                    tiles: None,
                     bytes: Arc::clone(&pixel),
                     revision: 7,
                     cpu_capture: None,
