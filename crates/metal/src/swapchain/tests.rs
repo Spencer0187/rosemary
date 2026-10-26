@@ -2242,24 +2242,59 @@ fn ninth_dma_overlay_cannot_be_accepted_without_its_last_pixel() {
         picture: blue,
         rect: overlays[0].rect,
     });
-    let before = crate::overlay::over_capacity_blend_refusals_for_test();
-    while crate::overlay::over_capacity_blend_refusals_for_test() == before {
-        assert!(
-            Instant::now() < deadline,
-            "ninth DMA overlay was not evaluated"
-        );
-        assert_ne!(
-            crate::present::present_store_synchronous(window, &store, &[], &overlays),
-            appkit::backing::PresentOutcome::Displayed,
-            "ninth overlay was silently omitted"
-        );
-        sdl3::video::vulkan::service_surface_requests();
-        std::thread::sleep(Duration::from_millis(2));
+    let old_pixel = read_scene_pixel(old.gpu, old.image.image, 80, 64, 40, 30);
+    assert_eq!(old_pixel, [255, 0, 0, 255]);
+    // Nine overlays must reach the GPU as two ordered descriptor passes,
+    // not defer forever or acknowledge only the first eight sources.
+    loop {
+        match crate::present::present_store_synchronous(window, &store, &[], &overlays) {
+            appkit::backing::PresentOutcome::Displayed => break,
+            appkit::backing::PresentOutcome::Deferred => {
+                assert!(
+                    Instant::now() < deadline,
+                    "nine DMA overlays never displayed"
+                );
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            other => panic!("unexpected nine-overlay result: {other:?}"),
+        }
     }
+    let completed = crate::present::backing_store_blended_for_test(window)
+        .expect("completed nine-source target");
+    assert_eq!(
+        read_scene_pixel(completed.gpu, completed.image.image, 80, 64, 40, 30),
+        [0, 0, 255, 255],
+        "ninth source was not included in final GPU pixels"
+    );
     assert_eq!(
         read_scene_pixel(old.gpu, old.image.image, 80, 64, 40, 30),
+        old_pixel,
+        "a previously accepted GPU image was modified in place"
+    );
+    drop(completed);
+    // Returning below the eight-descriptor boundary must also make progress.
+    overlays.truncate(8);
+    loop {
+        match crate::present::present_store_synchronous(window, &store, &[], &overlays) {
+            appkit::backing::PresentOutcome::Displayed => break,
+            appkit::backing::PresentOutcome::Deferred => {
+                assert!(
+                    Instant::now() < deadline,
+                    "eight-overlay recovery never displayed"
+                );
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            other => panic!("unexpected recovery: {other:?}"),
+        }
+    }
+    let recovered = crate::present::backing_store_blended_for_test(window).unwrap();
+    assert_eq!(
+        read_scene_pixel(recovered.gpu, recovered.image.image, 80, 64, 40, 30),
         [255, 0, 0, 255]
     );
+    drop(recovered);
     assert!(!appkit::backing::dmabuf_import_refused(window));
     drop(old);
     crate::present::forget_backing_store_for_test(window);
@@ -3100,6 +3135,387 @@ fn opacity_group_composites_metal_drawable_before_applying_root_alpha() {
         gpu.destroy_image(image);
     }
     sdl3::video::destroy_window(window);
+}
+
+/// A large grouped window must not allocate a full-window scratch image for
+/// all eight frame slots. Every image is a real Vulkan/WSI-backed allocation.
+#[cfg(not(target_os = "macos"))]
+fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, depth: usize) {
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(
+        c"high-resolution CA scratch rotation",
+        width as i32,
+        height as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let background = test_render_target(gpu, width, height).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, background.image, [0., 1., 0., 1.]);
+    })
+    .unwrap();
+    let image = test_render_target(gpu, 16, 16).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, image.image, [0., 0., 1., 1.]);
+    })
+    .unwrap();
+    let frame = appkit::view::Frame {
+        width: 16,
+        height: 16,
+        ..test_full_frame(window, width, height)
+    };
+    let background_id = 0x6529usize;
+    let full = test_full_frame(window, width, height);
+    let base = test_opaque_metal_placement(background_id, DirectFrame::from_frame(&full));
+    let layer = 0x652ausize;
+    let mut placement = ScenePlacement {
+        opacity_groups: (0..depth)
+            .map(|n| appkit::view::OpacityGroup {
+                id: 0x6000 + n,
+                opacity: 0.5,
+            })
+            .collect(),
+        id: layer,
+        frame: DirectFrame::from_frame(&frame),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: vec![],
+        occluded: Some(vec![]),
+        native: None,
+    };
+    state.layers.extend([background_id, layer]);
+    state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            background_id,
+            &full,
+            PresentSource::from(&background),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            layer,
+            &frame,
+            PresentSource::from(&image),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    let before = state.frame;
+    let mut samples = Vec::<f64>::new();
+    for iteration in 0..(FRAMES_IN_FLIGHT * 3 + 3) {
+        let opacity = if iteration % 2 == 0 { 0.5 } else { 0.6 };
+        placement.opacity_groups[depth - 1].opacity = opacity;
+        state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
+        let started = Instant::now();
+        assert_eq!(
+            state.redisplay_scene(window as usize),
+            Ok(true),
+            "frame {iteration} of {width}x{height}, depth {depth} stuck"
+        );
+        // Test a completed producer/consumer fence before revisiting the
+        // oldest slot, without destroying the window or its retained source.
+        state.idle();
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(
+            state.scene_gpu_bytes() <= 512 * 1024 * 1024,
+            true,
+            "scene images exceeded committed 512 MiB budget"
+        );
+    }
+    assert!(state.frame >= before + (FRAMES_IN_FLIGHT * 3 + 3));
+    samples.sort_by(f64::total_cmp);
+    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
+    let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
+    println!(
+        "group metadata repaint {}x{} depth={} static Metal background, 27 updates: mean={mean:.3}ms p95={p95:.3}ms; fence-completed producer-side only",
+        width, height, depth
+    );
+    let pixel = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        width,
+        height,
+        8,
+        8,
+    );
+    let expected_alpha = (255.0 * 0.5f32 * (0.5f32).powi(depth as i32 - 1)).round() as u8;
+    assert!(pixel[0] <= 1 && pixel[3] == 255);
+    assert!(
+        pixel[1].abs_diff(255 - expected_alpha) <= 2,
+        "static opaque green Metal background did not survive group opacity"
+    );
+    assert!(
+        pixel[2].abs_diff(expected_alpha) <= 2,
+        "wrong final group pixel: {pixel:?}"
+    );
+    drop(state);
+    gpu.destroy_image(image);
+    gpu.destroy_image(background);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn six_k_group_progresses_through_more_than_eight_submitted_frames() {
+    if isolate_vulkan_graphical_test(
+        "six_k_group_progresses_through_more_than_eight_submitted_frames",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(6016, 3384, 1);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn four_k_nested_groups_progress_through_more_than_eight_submitted_frames() {
+    if isolate_vulkan_graphical_test(
+        "four_k_nested_groups_progress_through_more_than_eight_submitted_frames",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(3840, 2160, 2);
+}
+
+/// The source order comes from a real AppKit hierarchy rather than a
+/// hand-constructed group. Parent NSView alphaValue must attenuate the
+/// opaque blue Metal child *after* it hides the opaque red Metal child.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn nsview_parent_alpha_groups_two_opaque_metal_children() {
+    if isolate_vulkan_graphical_test("nsview_parent_alpha_groups_two_opaque_metal_children") {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    crate::bootstrap();
+    use foundation::geometry::{NSPoint, NSRect, NSSize};
+    use objc::object::Id;
+    let rect = |width, height| NSRect {
+        origin: NSPoint { x: 0., y: 0. },
+        size: NSSize { width, height },
+    };
+    let window = objc::object::create_instance(
+        objc::class::lookup(c"NSWindow").unwrap(),
+        appkit::window::INSTANCE_SIZE,
+    );
+    let initialize: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect, usize, usize, u8) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    assert_eq!(
+        unsafe {
+            initialize(
+                window,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect(80., 60.),
+                0,
+                0,
+                0,
+            )
+        },
+        window
+    );
+    let make_view = || {
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let init: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { init(view, objc::sel::get("initWithFrame:"), rect(80., 60.)) }
+    };
+    let make_layer = |class: &str| {
+        let class = objc::class::lookup(std::ffi::CString::new(class).unwrap().as_c_str()).unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { make(class as *const _ as Id, objc::sel::get("layer")) }
+    };
+    let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let set_alpha: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let parent = make_view();
+    let lower_view = make_view();
+    let upper_view = make_view();
+    let lower = make_layer("CAMetalLayer");
+    let upper = make_layer("CAMetalLayer");
+    unsafe {
+        set(window, objc::sel::get("setContentView:"), parent);
+        set(lower_view, objc::sel::get("setLayer:"), lower);
+        set(upper_view, objc::sel::get("setLayer:"), upper);
+        set(parent, objc::sel::get("addSubview:"), lower_view);
+        set(parent, objc::sel::get("addSubview:"), upper_view);
+        set_alpha(parent, objc::sel::get("setAlphaValue:"), 0.5);
+    }
+    let sdl = unsafe { appkit::window::sdl_window(window) };
+    appkit::event::pump(std::ptr::null_mut());
+    let observed = appkit::view::metal_scene(sdl).unwrap();
+    assert_eq!(
+        observed
+            .iter()
+            .map(|source| source.layer)
+            .collect::<Vec<_>>(),
+        [lower as usize, upper as usize]
+    );
+    assert!(observed.iter().all(|source| source.opacity == 1.0
+        && source.opacity_groups
+            == [appkit::view::OpacityGroup {
+                id: parent as usize,
+                opacity: 0.5
+            }]));
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    sdl3::video::presentation_window(sdl).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(sdl, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        sdl,
+        vk::Extent2D {
+            width: 80,
+            height: 60,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let red = test_render_target(gpu, 80, 60).unwrap();
+    let blue = test_render_target(gpu, 80, 60).unwrap();
+    for (image, rgba) in [(&red, [0., 0., 1., 1.]), (&blue, [1., 0., 0., 1.])] {
+        gpu.one_shot(|device, cb| unsafe {
+            cmd_test_clear_color(device, cb, image.image, rgba);
+        })
+        .unwrap();
+    }
+    let proposal = |items: Vec<appkit::view::MetalSceneLayer>| {
+        items
+            .into_iter()
+            .map(|item| ScenePlacement {
+                id: item.layer,
+                frame: DirectFrame::from_frame(&item.frame),
+                opacity_groups: item.opacity_groups,
+                opacity: item.opacity,
+                opaque: item.opaque,
+                clip: item.clip.map(|clip| DirectFrame::from_frame(&clip)),
+                rounded: vec![],
+                occluded: Some(vec![]),
+                native: native_scene_source(
+                    item.native_pixels,
+                    item.native_dmabuf,
+                    item.native_revision,
+                    item.frame.width,
+                    item.frame.height,
+                    item.native_cpu_capture,
+                    item.native_dma_sample,
+                ),
+            })
+            .collect::<Vec<_>>()
+    };
+    let initial = proposal(observed);
+    state.layers.extend([lower as usize, upper as usize]);
+    state.synchronize_scene(sdl as usize, &initial);
+    let whole = test_full_frame(sdl, 80, 60);
+    for (id, image) in [(lower as usize, &red), (upper as usize, &blue)] {
+        assert_eq!(
+            state.stage_composite_layer(id, &whole, image, None, &mut SourceOwner(None), false),
+            Ok(Some(true))
+        );
+    }
+    state.synchronize_scene(sdl as usize, &initial);
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    let sample = |state: &Swapchain| {
+        read_scene_pixel(gpu, state.composite.as_ref().unwrap().image, 80, 60, 40, 30)
+    };
+    assert!(
+        sample(&state)
+            .iter()
+            .zip([128u8, 0, 0, 128])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "lower opaque red Metal child bled through blue upper child: {:?}",
+        sample(&state)
+    );
+    unsafe {
+        set_alpha(parent, objc::sel::get("setAlphaValue:"), 0.25);
+    }
+    appkit::event::pump(std::ptr::null_mut());
+    let quarter = proposal(appkit::view::metal_scene(sdl).unwrap());
+    assert!(state.synchronize_scene(sdl as usize, &quarter));
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    assert!(
+        sample(&state)
+            .iter()
+            .zip([64u8, 0, 0, 64])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "metadata-only NSView alpha update failed to update static Metal sources"
+    );
+    // A zero-opacity ancestor still closes an isolated subtree; children
+    // must not render simply because a 0% alpha failed the fractional check.
+    unsafe {
+        set_alpha(parent, objc::sel::get("setAlphaValue:"), 0.0);
+    }
+    appkit::event::pump(std::ptr::null_mut());
+    let zero = proposal(appkit::view::metal_scene(sdl).unwrap());
+    assert!(zero.iter().all(|source| source.opacity_groups
+        == [appkit::view::OpacityGroup {
+            id: parent as usize,
+            opacity: 0.0
+        }]));
+    assert!(state.synchronize_scene(sdl as usize, &zero));
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    assert_eq!(sample(&state), [0, 0, 0, 0]);
+    unsafe {
+        set_alpha(parent, objc::sel::get("setAlphaValue:"), 1.0);
+    }
+    appkit::event::pump(std::ptr::null_mut());
+    let opaque = proposal(appkit::view::metal_scene(sdl).unwrap());
+    assert!(opaque.iter().all(|source| source.opacity_groups.is_empty()));
+    assert!(state.synchronize_scene(sdl as usize, &opaque));
+    assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+    state.idle();
+    assert_eq!(sample(&state), [255, 0, 0, 255]);
+
+    drop(state);
+    gpu.destroy_image(red);
+    gpu.destroy_image(blue);
+    objc::arc::release(window);
 }
 
 /// A single *partial* CAMetalLayer cannot use the FIFO flattened path:
@@ -13434,6 +13850,48 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         [255, 0, 0, 255]
     );
 
+    // A partially transparent NSView may own one Metal drawable plus
+    // ordinary CA descendants even with no subviews. Its alphaValue must
+    // still fade the *completed* group once, including exact-zero opacity.
+    let alpha_of_metal_view: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    for (alpha, expected) in [
+        (0.5, [128u8, 0, 0, 128]),
+        (0.0, [0u8, 0, 0, 0]),
+        (1.0, [255u8, 0, 0, 255]),
+    ] {
+        unsafe {
+            alpha_of_metal_view(metal_view, objc::sel::get("setAlphaValue:"), alpha);
+        }
+        appkit::event::pump(std::ptr::null_mut());
+        let proposed = make_scene(appkit::view::metal_scene(sdl).unwrap());
+        if alpha < 1.0 {
+            assert!(proposed.iter().all(|source| source.opacity_groups
+                == [appkit::view::OpacityGroup {
+                    id: metal_view as usize,
+                    opacity: alpha as f32
+                }]));
+        }
+        for native in proposed.iter().filter(|source| source.native.is_some()) {
+            assert_eq!(stage_native_scene_source(&mut state, native), Ok(true));
+        }
+        state.synchronize_scene(sdl as usize, &proposed);
+        assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+        state.idle();
+        let actual = read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            120,
+            90,
+            old_point.0,
+            old_point.1,
+        );
+        assert!(
+            actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+            "NSView alpha {alpha} failed over Metal + CALayer with no child NSViews: {actual:?}"
+        );
+    }
+
     // Move a CALayer-only overlay after the Metal image was last submitted.
     unsafe {
         set_frame(child, objc::sel::get("setFrame:"), rect(64., 40., 24., 20.));
@@ -13512,6 +13970,52 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         [0, 255, 0, 255],
         "ordinary CALayer above NSView-backed layer was not topmost"
     );
+    // A parent NSView's alphaValue isolates its retained Metal drawable,
+    // ordinary CPU CALayer, and independently backed child. The foremost
+    // opaque CPU layer covers both lower sources before group attenuation.
+    let set_view_alpha: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let hide_child: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        hide_child(c, objc::sel::get("setHidden:"), 1);
+        set_view_alpha(metal_view, objc::sel::get("setAlphaValue:"), 0.5);
+    }
+    repaint(&mut state);
+    let alpha_sources = appkit::view::metal_scene(sdl).unwrap();
+    assert!(alpha_sources.iter().all(|source| source.opacity_groups
+        == [appkit::view::OpacityGroup {
+            id: metal_view as usize,
+            opacity: 0.5
+        }]
+        && source.opacity == 1.0));
+    let half_view = sample(&state);
+    assert!(
+        half_view
+            .iter()
+            .zip([0u8, 0, 128, 128])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "NSView ancestor alpha leaked opaque underlay through child: {half_view:?}"
+    );
+    unsafe {
+        set_view_alpha(metal_view, objc::sel::get("setAlphaValue:"), 0.25);
+    }
+    repaint(&mut state);
+    let quarter_view = sample(&state);
+    assert!(
+        quarter_view
+            .iter()
+            .zip([0u8, 0, 64, 64])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "NSView metadata-only alpha did not recomposite child: {quarter_view:?}"
+    );
+    unsafe {
+        set_view_alpha(metal_view, objc::sel::get("setAlphaValue:"), 1.0);
+        hide_child(c, objc::sel::get("setHidden:"), 0);
+    }
+    repaint(&mut state);
+    assert_eq!(sample(&state), [0, 255, 0, 255]);
+
     // The same retained frame also contains a mixed CA/NSView group:
     // native red A, NSView-backed opaque blue B, and ordinary green C.
     // Their enclosing alpha must not be applied to each source separately.

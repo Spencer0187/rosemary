@@ -2659,6 +2659,7 @@ fn stage_native_scene_source_effective(
             &output.image,
             &overlay,
             init,
+            true,
             owned,
         );
         if let Some(failure) = blended_result?.into_iter().next() {

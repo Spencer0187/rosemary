@@ -2494,10 +2494,6 @@ pub(crate) fn present_store_synchronous(
     {
         return Deferred;
     }
-    if let Err(reason) = crate::overlay::check_overlay_capacity(overlays.len()) {
-        gpu::trace_once(reason);
-        return Deferred;
-    }
     // SAFETY: the Metal framework's exported constructor, which has no
     // preconditions.
     let device = unsafe { crate::MTLCreateSystemDefaultDevice() };
@@ -2831,25 +2827,34 @@ fn blend_overlays(
         _ => {}
     }
     let blended = entry.blended.as_ref().expect("reserved before upload");
-    let refusals = crate::overlay::blend_with_store_init_owned(
-        entry.gpu,
-        &entry.image,
-        &blended.image,
-        overlays,
-        None,
-        (
-            std::sync::Arc::clone(&entry.image),
-            std::sync::Arc::clone(blended),
-        ),
-    )
-    .map_err(|reason| {
-        gpu::trace(format!("blending overlays failed: {reason}"));
-        BlendFailure::Retryable
-    })?;
-    for refused in &refusals {
-        gpu::trace(format!("DMA overlay import refused: {}", refused.reason));
+    // Descriptor sets are reused after their GPU fence has completed.
+    // Each batch keeps the preceding target intact; the first alone copies
+    // the store. Never admit this target unless every batch succeeded.
+    for (index, batch) in overlays
+        .chunks(crate::overlay::overlay_batch_capacity())
+        .enumerate()
+    {
+        let refusals = crate::overlay::blend_with_store_init_owned(
+            entry.gpu,
+            &entry.image,
+            &blended.image,
+            batch,
+            None,
+            index == 0,
+            (
+                std::sync::Arc::clone(&entry.image),
+                std::sync::Arc::clone(blended),
+            ),
+        )
+        .map_err(|reason| {
+            gpu::trace(format!("blending overlays failed: {reason}"));
+            BlendFailure::Retryable
+        })?;
+        for refused in &refusals {
+            gpu::trace(format!("DMA overlay import refused: {}", refused.reason));
+        }
+        blend_refusal(&refusals)?;
     }
-    blend_refusal(&refusals)?;
     #[cfg(test)]
     TEST_ACCEPTED_DMA_BLENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(std::sync::Arc::clone(blended))

@@ -819,21 +819,38 @@ fn visit_metal_scene(
     if hidden {
         return;
     }
-    let has_isolated_metal_group = !layer.is_null()
-        && crate::layer::is_metal(layer)
-        && own_layer_opacity > 0.0
+    let descendants = unsafe { children(view) };
+    let backed_descendants = !descendants.is_empty();
+    // Both NSView alphaValue and CALayer opacity attenuate their *completed*
+    // subtree. A scalar applied separately to retained children leaks the
+    // lower opaque child through an opaque higher child.
+    let own_view_alpha = alpha_of(view) as f32;
+    let has_view_group = own_view_alpha < 1.0
+        && (backed_descendants
+            || !layer.is_null()
+                && crate::layer::is_metal(layer)
+                && crate::coreanimation::has_renderable_sublayers(layer));
+    let has_layer_group = !layer.is_null()
         && own_layer_opacity < 1.0
-        && (crate::coreanimation::has_renderable_sublayers(layer)
-            || !unsafe { children(view) }.is_empty());
+        && (backed_descendants
+            || crate::layer::is_metal(layer)
+                && crate::coreanimation::has_renderable_sublayers(layer));
     let mut opacity_groups = inherited_groups.to_vec();
-    if has_isolated_metal_group {
+    if has_view_group {
+        opacity_groups.push(OpacityGroup {
+            id: view as usize,
+            opacity: own_view_alpha,
+        });
+    }
+    if has_layer_group {
         opacity_groups.push(OpacityGroup {
             id: layer as usize,
             opacity: own_layer_opacity,
         });
     }
+    let source_view_alpha = if has_view_group { 1.0 } else { own_view_alpha };
     let layer_opacity = inherited_layer_opacity
-        * if has_isolated_metal_group {
+        * if has_layer_group {
             1.0
         } else {
             own_layer_opacity
@@ -894,7 +911,7 @@ fn visit_metal_scene(
                     opacity_groups: opacity_groups.clone(),
                     layer: layer as usize,
                     frame,
-                    opacity: (effective_alpha(view) as f32) * layer_opacity,
+                    opacity: source_view_alpha * layer_opacity,
                     opaque: crate::layer::opaque_of(layer),
                     clip: ca_clip,
                     rounded: rounded.clone(),
@@ -953,7 +970,7 @@ fn visit_metal_scene(
                         &isolated_ids,
                         ca_clip,
                         &rounded,
-                        (effective_alpha(view) as f32) * layer_opacity,
+                        source_view_alpha * layer_opacity,
                         &combined,
                         &mut tile,
                         scene,
@@ -1081,7 +1098,7 @@ fn visit_metal_scene(
                                 layer: native_tile_id(view, index),
                                 native_owner: view as usize,
                                 frame: part,
-                                opacity: (effective_alpha(view) as f32) * layer_opacity,
+                                opacity: source_view_alpha * layer_opacity,
                                 opaque: false,
                                 clip: ca_clip,
                                 rounded: rounded.clone(),
@@ -5121,7 +5138,15 @@ mod tests {
         let ca_hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
             unsafe { std::mem::transmute(objc::msg::entry()) };
         unsafe { ca_opacity(parent_layer, objc::sel::get("setOpacity:"), 0.4) };
-        assert!((metal_scene(sdl).unwrap()[1].opacity - 0.2).abs() < 0.0001);
+        let grouped = metal_scene(sdl).unwrap();
+        assert_eq!(
+            grouped[1].opacity_groups,
+            [OpacityGroup {
+                id: parent_layer as usize,
+                opacity: 0.4
+            }]
+        );
+        assert!((grouped[1].opacity - 0.5).abs() < 0.0001);
         unsafe { ca_hidden(parent_layer, objc::sel::get("setHidden:"), 1) };
         assert_eq!(ids(sdl), [first as usize]);
         unsafe { ca_hidden(parent_layer, objc::sel::get("setHidden:"), 0) };
@@ -5130,10 +5155,28 @@ mod tests {
         let ca_add: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
             unsafe { std::mem::transmute(objc::msg::entry()) };
         unsafe { ca_add(parent_layer, objc::sel::get("addSublayer:"), second) };
-        assert!((metal_scene(sdl).unwrap()[1].opacity - 0.2).abs() < 0.0001);
+        assert_eq!(
+            metal_scene(sdl).unwrap()[1].opacity_groups,
+            [OpacityGroup {
+                id: parent_layer as usize,
+                opacity: 0.4
+            }]
+        );
         // NSView alpha remains independent from the ordinary CA opacity.
         unsafe { set_alpha_value(container, objc::sel::get("setAlphaValue:"), 0.5) };
-        assert!((metal_scene(sdl).unwrap()[1].opacity - 0.1).abs() < 0.0001);
+        assert_eq!(
+            metal_scene(sdl).unwrap()[1].opacity_groups,
+            [
+                OpacityGroup {
+                    id: container as usize,
+                    opacity: 0.5
+                },
+                OpacityGroup {
+                    id: parent_layer as usize,
+                    opacity: 0.4
+                }
+            ]
+        );
         unsafe { ca_opacity(parent_layer, objc::sel::get("setOpacity:"), 1.0) };
         let before_container_move = metal_scene(sdl).unwrap()[1].frame;
         unsafe {

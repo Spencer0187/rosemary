@@ -1369,7 +1369,33 @@ impl Swapchain {
                 (target.image.width, target.image.height, target.image.format)
                     == (description.width, description.height, description.format)
             });
+            // An isolation surface is scratch, not a retained scene
+            // snapshot. Recycle idle frame-slot images first: at 6K eight
+            // independent full-window targets cannot fit the scene ceiling.
             while self.group_targets[slot].len() < depth {
+                let recycled = (0..self.group_targets.len())
+                    .filter(|&other| other != slot)
+                    .find(|&other| {
+                        !self.group_targets[other].is_empty()
+                            && (!self.frames[other].submitted
+                                || self
+                                    .gpu
+                                    .fence_signaled(self.frames[other].done)
+                                    .unwrap_or(false))
+                    });
+                if let Some(other) = recycled {
+                    if let Some(image) = self.group_targets[other].pop() {
+                        if (image.image.width, image.image.height, image.image.format)
+                            == (description.width, description.height, description.format)
+                        {
+                            self.group_targets[slot].push(image);
+                            continue;
+                        }
+                        // Different-size scratch is no longer compatible;
+                        // its last frame has completed so it may retire now.
+                        drop(image);
+                    }
+                }
                 let bytes = scene_image_bytes(PresentSource {
                     image: vk::Image::null(),
                     width: description.width,
@@ -1916,7 +1942,52 @@ impl Swapchain {
                 );
             }
         };
-        let close_group = |depth: usize, opacity: f32, index: &mut usize| -> Result<(), String> {
+        let close_group = |depth: usize,
+                           group: &appkit::view::OpacityGroup,
+                           index: &mut usize|
+         -> Result<(), String> {
+            // The scratch allocation covers the window, but the completed
+            // opacity group cannot affect pixels outside its children. Bound
+            // the final compute dispatch to their clipped union, not 6K.
+            let mut bounds: Option<(i64, i64, i64, i64)> = None;
+            for placement in self.scene_placements.iter().filter(|placement| {
+                self.layers.contains(&placement.id)
+                    && placement.opacity_groups.get(depth) == Some(group)
+                    && self.scene_layers.iter().any(|layer| {
+                        layer.id == placement.id
+                            && (layer.ready
+                                || pending.is_some_and(|work| {
+                                    layer.id == work.current || Some(layer.id) == work.previous
+                                }))
+                    })
+            }) {
+                let frame = placement.frame.frame();
+                let mut left = i64::from(frame.x).max(0);
+                let mut top = i64::from(frame.y).max(0);
+                let mut right =
+                    (i64::from(frame.x) + i64::from(frame.width)).min(i64::from(self.extent.width));
+                let mut bottom = (i64::from(frame.y) + i64::from(frame.height))
+                    .min(i64::from(self.extent.height));
+                if let Some(clip) = placement.clip {
+                    let clip = clip.frame();
+                    left = left.max(i64::from(clip.x));
+                    top = top.max(i64::from(clip.y));
+                    right = right.min(i64::from(clip.x) + i64::from(clip.width));
+                    bottom = bottom.min(i64::from(clip.y) + i64::from(clip.height));
+                }
+                if right <= left || bottom <= top {
+                    continue;
+                }
+                bounds = Some(match bounds {
+                    Some((x0, y0, x1, y1)) => {
+                        (x0.min(left), y0.min(top), x1.max(right), y1.max(bottom))
+                    }
+                    None => (left, top, right, bottom),
+                });
+            }
+            let Some((x0, y0, x1, y1)) = bounds else {
+                return Ok(());
+            };
             let source = &self.group_targets[slot][depth].image;
             let target: &GpuImage = if depth == 0 {
                 output
@@ -1954,11 +2025,11 @@ impl Swapchain {
                     height: self.extent.height,
                     target_width: self.extent.width,
                     target_height: self.extent.height,
-                    clip_x: 0,
-                    clip_y: 0,
-                    clip_width: self.extent.width,
-                    clip_height: self.extent.height,
-                    opacity,
+                    clip_x: x0 as i32,
+                    clip_y: y0 as i32,
+                    clip_width: (x1 - x0) as u32,
+                    clip_height: (y1 - y0) as u32,
+                    opacity: group.opacity,
                     clear: false,
                     round_start: 0,
                     round_count: 0,
@@ -2001,7 +2072,7 @@ impl Swapchain {
                 .take_while(|(a, b)| *a == *b)
                 .count();
             for depth in (common..open_groups.len()).rev() {
-                close_group(depth, open_groups[depth].opacity, &mut scene_index)?;
+                close_group(depth, &open_groups[depth], &mut scene_index)?;
             }
             for depth in common..wanted.len() {
                 clear_group(depth);
@@ -2090,7 +2161,7 @@ impl Swapchain {
             }
         }
         for depth in (0..open_groups.len()).rev() {
-            close_group(depth, open_groups[depth].opacity, &mut scene_index)?;
+            close_group(depth, &open_groups[depth], &mut scene_index)?;
         }
         unsafe {
             scene_sync(

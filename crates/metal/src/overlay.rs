@@ -26,19 +26,12 @@ const GROUP: u32 = 8;
 /// The most overlays in one blend pass; one descriptor set each.
 const MOST: usize = 8;
 
-#[cfg(test)]
-static TEST_TOO_MANY_OVERLAYS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-#[cfg(test)]
-pub(crate) fn over_capacity_blend_refusals_for_test() -> usize {
-    TEST_TOO_MANY_OVERLAYS.load(std::sync::atomic::Ordering::Relaxed)
+pub(crate) const fn overlay_batch_capacity() -> usize {
+    MOST
 }
 
 pub(crate) fn check_overlay_capacity(count: usize) -> Result<(), String> {
     if count > MOST {
-        #[cfg(test)]
-        TEST_TOO_MANY_OVERLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Err(format!(
             "DMA blend requires {count} overlays, but this pass supports {MOST}"
         ));
@@ -806,6 +799,7 @@ pub(crate) fn blend_with_store_init_owned<R: Send + 'static>(
     target: &GpuImage,
     overlays: &[GpuOverlay],
     base: Option<StoreInit>,
+    initialize_target: bool,
     retained: R,
 ) -> Result<Vec<ImportRefusal>, String> {
     // Never accept a partial scene: descriptor sets only cover MOST sources.
@@ -942,62 +936,78 @@ pub(crate) fn blend_with_store_init_owned<R: Send + 'static>(
                         ),
                     }
                 }
-                // The store's upload lands, and the last present's read of the
-                // target is done, before the copy.
-                general_barrier(
-                    device,
-                    command_buffer,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::PipelineStageFlags::TRANSFER,
-                    &[
-                        (
-                            store.image,
-                            vk::AccessFlags::MEMORY_WRITE,
-                            vk::AccessFlags::TRANSFER_READ,
-                        ),
-                        (
-                            target.image,
-                            vk::AccessFlags::empty(),
-                            vk::AccessFlags::TRANSFER_WRITE,
-                        ),
-                    ],
-                );
-                let whole = vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                };
-                let corner = vk::Offset3D {
-                    x: width as i32,
-                    y: height as i32,
-                    z: 1,
-                };
-                let region = vk::ImageBlit::default()
-                    .src_subresource(whole)
-                    .src_offsets([vk::Offset3D::default(), corner])
-                    .dst_subresource(whole)
-                    .dst_offsets([vk::Offset3D::default(), corner]);
-                device.cmd_blit_image(
-                    command_buffer,
-                    store.image,
-                    vk::ImageLayout::GENERAL,
-                    target.image,
-                    vk::ImageLayout::GENERAL,
-                    &[region],
-                    vk::Filter::NEAREST,
-                );
-                general_barrier(
-                    device,
-                    command_buffer,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    &[(
+                // Each later descriptor batch continues blending into the
+                // already completed target; recopying the CPU store here
+                // would erase all prior overlays.
+                if initialize_target {
+                    // The store's upload lands before the target copy.
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        &[
+                            (
+                                store.image,
+                                vk::AccessFlags::MEMORY_WRITE,
+                                vk::AccessFlags::TRANSFER_READ,
+                            ),
+                            (
+                                target.image,
+                                vk::AccessFlags::empty(),
+                                vk::AccessFlags::TRANSFER_WRITE,
+                            ),
+                        ],
+                    );
+                    let whole = vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    };
+                    let corner = vk::Offset3D {
+                        x: width as i32,
+                        y: height as i32,
+                        z: 1,
+                    };
+                    let region = vk::ImageBlit::default()
+                        .src_subresource(whole)
+                        .src_offsets([vk::Offset3D::default(), corner])
+                        .dst_subresource(whole)
+                        .dst_offsets([vk::Offset3D::default(), corner]);
+                    device.cmd_blit_image(
+                        command_buffer,
+                        store.image,
+                        vk::ImageLayout::GENERAL,
                         target.image,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                    )],
-                );
+                        vk::ImageLayout::GENERAL,
+                        &[region],
+                        vk::Filter::NEAREST,
+                    );
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::TRANSFER_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                } else {
+                    general_barrier(
+                        device,
+                        command_buffer,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        &[(
+                            target.image,
+                            vk::AccessFlags::MEMORY_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        )],
+                    );
+                }
                 let acquire: Vec<_> = placed
                     .iter()
                     .map(|(_, image, _)| ownership(*image, external, gpu.queue_family, true))
