@@ -26,6 +26,7 @@ pub mod accounts;
 #[cfg(not(target_os = "macos"))]
 pub mod acl;
 pub mod appmailbox;
+mod asl;
 mod atomics;
 pub mod attrlist;
 pub mod audit;
@@ -392,6 +393,8 @@ static NONPORTABLE_MODULES: &[exports::Module] = &[
     backtrace::MODULE,
     #[cfg(target_arch = "x86_64")]
     printf_l::MODULE,
+    #[cfg(target_arch = "x86_64")]
+    asl::MODULE,
     acl::MODULE,
     fmtcheck::MODULE,
     langinfo::MODULE,
