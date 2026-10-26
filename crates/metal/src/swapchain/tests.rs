@@ -3099,7 +3099,9 @@ fn opacity_group_composites_metal_drawable_before_applying_root_alpha() {
     state.idle();
     native_pixel(pixel(&state), [127, 64, 64, 255]);
     assert!(state.committed_scene_bytes() <= 512 * 1024 * 1024);
-    assert_eq!(state.group_targets.iter().map(Vec::len).max(), Some(2));
+    // A unary inner boundary folds into its parent group; only the
+    // actual two-child branch needs a separate GPU isolation target.
+    assert_eq!(state.group_targets.iter().map(Vec::len).max(), Some(1));
 
     let mut quarter_root = root.clone();
     let mut quarter_red = red.clone();
@@ -3140,7 +3142,17 @@ fn opacity_group_composites_metal_drawable_before_applying_root_alpha() {
 /// A large grouped window must not allocate a full-window scratch image for
 /// all eight frame slots. Every image is a real Vulkan/WSI-backed allocation.
 #[cfg(not(target_os = "macos"))]
-fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, depth: usize) {
+fn long_lived_large_group_reuses_completed_scratch(
+    width: u32,
+    height: u32,
+    depth: usize,
+    idle_each: bool,
+    origin: (i32, i32),
+    clipped: bool,
+    full_source: bool,
+    ancestor_alpha: f32,
+    overlapping_sources: bool,
+) {
     let gpu = crate::vulkan::adapters()
         .unwrap()
         .first()
@@ -3172,14 +3184,31 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
         cmd_test_clear_color(device, cb, background.image, [0., 1., 0., 1.]);
     })
     .unwrap();
-    let image = test_render_target(gpu, 16, 16).unwrap();
+    let source_extent = if full_source {
+        (width, height)
+    } else {
+        (16, 16)
+    };
+    let image = test_render_target(gpu, source_extent.0, source_extent.1).unwrap();
     gpu.one_shot(|device, cb| unsafe {
         cmd_test_clear_color(device, cb, image.image, [0., 0., 1., 1.]);
     })
     .unwrap();
+    let second = if overlapping_sources {
+        let source = test_render_target(gpu, source_extent.0, source_extent.1).unwrap();
+        gpu.one_shot(|device, cb| unsafe {
+            cmd_test_clear_color(device, cb, source.image, [1., 0., 0., 1.]);
+        })
+        .unwrap();
+        Some(source)
+    } else {
+        None
+    };
     let frame = appkit::view::Frame {
-        width: 16,
-        height: 16,
+        x: origin.0,
+        y: origin.1,
+        width: source_extent.0,
+        height: source_extent.1,
         ..test_full_frame(window, width, height)
     };
     let background_id = 0x6529usize;
@@ -3190,20 +3219,43 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
         opacity_groups: (0..depth)
             .map(|n| appkit::view::OpacityGroup {
                 id: 0x6000 + n,
-                opacity: 0.5,
+                opacity: ancestor_alpha,
             })
             .collect(),
         id: layer,
         frame: DirectFrame::from_frame(&frame),
         opacity: 1.0,
         opaque: true,
-        clip: None,
+        clip: clipped.then(|| {
+            DirectFrame::from_frame(&appkit::view::Frame {
+                x: frame.x + 4,
+                y: frame.y + 4,
+                width: 8,
+                height: 8,
+                ..frame
+            })
+        }),
         rounded: vec![],
         occluded: Some(vec![]),
         native: None,
     };
-    state.layers.extend([background_id, layer]);
-    state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
+    let under_id = layer + 1;
+    let live = |current: &ScenePlacement| {
+        let mut items = vec![base.clone()];
+        if overlapping_sources {
+            let mut underneath = current.clone();
+            underneath.id = under_id;
+            items.push(underneath);
+        }
+        items.push(current.clone());
+        items
+    };
+    state.layers.push(background_id);
+    if overlapping_sources {
+        state.layers.push(under_id);
+    }
+    state.layers.push(layer);
+    state.synchronize_scene(window as usize, &live(&placement));
     assert_eq!(
         state.stage_composite_source(
             background_id,
@@ -3216,6 +3268,20 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
         ),
         Ok(Some(true))
     );
+    if let Some(second) = &second {
+        assert_eq!(
+            state.stage_composite_source(
+                under_id,
+                &frame,
+                PresentSource::from(second),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+    }
     assert_eq!(
         state.stage_composite_source(
             layer,
@@ -3230,19 +3296,40 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
     );
     let before = state.frame;
     let mut samples = Vec::<f64>::new();
+    let mut overlapping_slots = 0;
     for iteration in 0..(FRAMES_IN_FLIGHT * 3 + 3) {
         let opacity = if iteration % 2 == 0 { 0.5 } else { 0.6 };
         placement.opacity_groups[depth - 1].opacity = opacity;
-        state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
+        state.synchronize_scene(window as usize, &live(&placement));
         let started = Instant::now();
-        assert_eq!(
-            state.redisplay_scene(window as usize),
-            Ok(true),
-            "frame {iteration} of {width}x{height}, depth {depth} stuck"
-        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match state.redisplay_scene(window as usize) {
+                Ok(true) => break,
+                Ok(false) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "frame {iteration} of {width}x{height}, depth {depth} never advanced"
+                    );
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+                Err(reason) => {
+                    panic!("frame {iteration} of {width}x{height}, depth {depth}: {reason}")
+                }
+            }
+        }
         // Test a completed producer/consumer fence before revisiting the
         // oldest slot, without destroying the window or its retained source.
-        state.idle();
+        if idle_each {
+            state.idle();
+        } else {
+            let busy = state
+                .frames
+                .iter()
+                .filter(|frame| frame.submitted && !gpu.fence_signaled(frame.done).unwrap_or(true))
+                .count();
+            overlapping_slots = overlapping_slots.max(busy);
+        }
         samples.push(started.elapsed().as_secs_f64() * 1000.0);
         assert_eq!(
             state.scene_gpu_bytes() <= 512 * 1024 * 1024,
@@ -3251,6 +3338,35 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
         );
     }
     assert!(state.frame >= before + (FRAMES_IN_FLIGHT * 3 + 3));
+    if !idle_each {
+        println!("overlapping unretired Vulkan frame slots at peak: {overlapping_slots}");
+        state.idle();
+        assert!(
+            overlapping_slots >= 2,
+            "test never exercised overlapping GPU scene submissions"
+        );
+    }
+    for slot in &state.group_targets {
+        if full_source && !overlapping_sources {
+            assert!(
+                slot.is_empty(),
+                "unary nested group retained unnecessary full-window scratch"
+            );
+        }
+        if full_source && overlapping_sources {
+            assert!(
+                slot.len() <= 1,
+                "unary ancestor isolation was not coalesced"
+            );
+        }
+        for target in slot {
+            assert!(
+                (full_source || target.image.width <= if clipped { 8 } else { 16 })
+                    && (full_source || target.image.height <= if clipped { 8 } else { 16 }),
+                "small grouped element allocated a full-window scratch image"
+            );
+        }
+    }
     samples.sort_by(f64::total_cmp);
     let mean = samples.iter().sum::<f64>() / samples.len() as f64;
     let p95 = samples[(samples.len() * 95 / 100).min(samples.len() - 1)];
@@ -3263,10 +3379,25 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
         state.composite.as_ref().unwrap().image,
         width,
         height,
-        8,
-        8,
+        (frame.x + 8) as u32,
+        (frame.y + 8) as u32,
     );
-    let expected_alpha = (255.0 * 0.5f32 * (0.5f32).powi(depth as i32 - 1)).round() as u8;
+    if clipped {
+        let outside = read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            (frame.x + 2) as u32,
+            (frame.y + 2) as u32,
+        );
+        assert_eq!(
+            outside,
+            [0, 255, 0, 255],
+            "ancestor clip did not preserve static Metal background"
+        );
+    }
+    let expected_alpha = (255.0 * 0.5f32 * ancestor_alpha.powi(depth as i32 - 1)).round() as u8;
     assert!(pixel[0] <= 1 && pixel[3] == 255);
     assert!(
         pixel[1].abs_diff(255 - expected_alpha) <= 2,
@@ -3278,6 +3409,9 @@ fn long_lived_large_group_reuses_completed_scratch(width: u32, height: u32, dept
     );
     drop(state);
     gpu.destroy_image(image);
+    if let Some(second) = second {
+        gpu.destroy_image(second);
+    }
     gpu.destroy_image(background);
     sdl3::video::destroy_window(window);
 }
@@ -3293,7 +3427,137 @@ fn six_k_group_progresses_through_more_than_eight_submitted_frames() {
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
-    long_lived_large_group_reuses_completed_scratch(6016, 3384, 1);
+    long_lived_large_group_reuses_completed_scratch(
+        6016,
+        3384,
+        1,
+        true,
+        (0, 0),
+        false,
+        false,
+        0.5,
+        false,
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn six_k_six_nested_small_groups_retain_pixels_during_overlapping_submissions() {
+    if isolate_vulkan_graphical_test(
+        "six_k_six_nested_small_groups_retain_pixels_during_overlapping_submissions",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(
+        6016,
+        3384,
+        6,
+        false,
+        (0, 0),
+        false,
+        false,
+        0.5,
+        false,
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn twenty_four_nested_groups_fit_in_small_window_without_depth_refusal() {
+    if isolate_vulkan_graphical_test(
+        "twenty_four_nested_groups_fit_in_small_window_without_depth_refusal",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(
+        128,
+        96,
+        24,
+        false,
+        (0, 0),
+        false,
+        false,
+        0.5,
+        false,
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn clipped_offset_group_at_six_k_retains_static_background_and_forward_progress() {
+    if isolate_vulkan_graphical_test(
+        "clipped_offset_group_at_six_k_retains_static_background_and_forward_progress",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(
+        6016,
+        3384,
+        5,
+        false,
+        (719, 433),
+        true,
+        false,
+        0.5,
+        false,
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn full_six_k_unary_twenty_four_level_ca_chain_makes_progress_without_scratch() {
+    if isolate_vulkan_graphical_test(
+        "full_six_k_unary_twenty_four_level_ca_chain_makes_progress_without_scratch",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(
+        6016,
+        3384,
+        24,
+        false,
+        (0, 0),
+        false,
+        true,
+        0.95,
+        false,
+    );
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn two_overlapping_full_six_k_sources_inside_twenty_four_ancestors_progress() {
+    if isolate_vulkan_graphical_test(
+        "two_overlapping_full_six_k_sources_inside_twenty_four_ancestors_progress",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    long_lived_large_group_reuses_completed_scratch(
+        6016,
+        3384,
+        24,
+        false,
+        (0, 0),
+        false,
+        true,
+        0.95,
+        true,
+    );
 }
 
 #[test]
@@ -3307,7 +3571,17 @@ fn four_k_nested_groups_progress_through_more_than_eight_submitted_frames() {
     if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
         return;
     }
-    long_lived_large_group_reuses_completed_scratch(3840, 2160, 2);
+    long_lived_large_group_reuses_completed_scratch(
+        3840,
+        2160,
+        2,
+        true,
+        (0, 0),
+        false,
+        false,
+        0.5,
+        false,
+    );
 }
 
 /// The source order comes from a real AppKit hierarchy rather than a

@@ -1325,11 +1325,15 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
         );
     }
 
-    let placement = b.type_struct([
+    let mut placement_types = vec![
         int, int, uint, uint, uint, uint, int, int, uint, uint, float, uint, uint, uint, uint,
-    ]);
+    ];
+    if scene {
+        placement_types.extend_from_slice(&[int, int]);
+    }
+    let placement = b.type_struct(placement_types);
     b.decorate(placement, Decoration::Block, []);
-    for member in 0..15 {
+    for member in 0..if scene { 17 } else { 15 } {
         b.member_decorate(
             placement,
             member,
@@ -1395,6 +1399,14 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let round_start = member(&mut b, 12, uint_pointer, uint)?;
     let round_count = member(&mut b, 13, uint_pointer, uint)?;
     let sampled_srgb = member(&mut b, 14, uint_pointer, uint)?;
+    let target_origin = if scene {
+        (
+            member(&mut b, 15, int_pointer, int)?,
+            member(&mut b, 16, int_pointer, int)?,
+        )
+    } else {
+        (zero_int, zero_int)
+    };
     let target_width = b.bitcast(int, None, target_width)?;
     let target_height = b.bitcast(int, None, target_height)?;
     let global = b.load(uvec3, None, id, None, [])?;
@@ -1404,13 +1416,15 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     let at_x = b.i_add(int, None, clip_x, at_x)?;
     let at_y = b.bitcast(int, None, row)?;
     let at_y = b.i_add(int, None, clip_y, at_y)?;
+    let target_x = b.i_sub(int, None, at_x, target_origin.0)?;
+    let target_y = b.i_sub(int, None, at_y, target_origin.1)?;
     let mut inside = b.u_less_than(boolean, None, column, clip_width)?;
     for condition in [
         b.u_less_than(boolean, None, row, clip_height)?,
-        b.s_greater_than_equal(boolean, None, at_x, zero_int)?,
-        b.s_greater_than_equal(boolean, None, at_y, zero_int)?,
-        b.s_less_than(boolean, None, at_x, target_width)?,
-        b.s_less_than(boolean, None, at_y, target_height)?,
+        b.s_greater_than_equal(boolean, None, target_x, zero_int)?,
+        b.s_greater_than_equal(boolean, None, target_y, zero_int)?,
+        b.s_less_than(boolean, None, target_x, target_width)?,
+        b.s_less_than(boolean, None, target_y, target_height)?,
     ] {
         inside = b.logical_and(boolean, None, inside, condition)?;
     }
@@ -1430,7 +1444,7 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     b.selection_merge(complete, spirv::SelectionControl::NONE)?;
     b.branch_conditional(is_clear, clearing, blending, [])?;
     b.begin_block(Some(clearing))?;
-    let at = b.composite_construct(ivec2, None, [at_x, at_y])?;
+    let at = b.composite_construct(ivec2, None, [target_x, target_y])?;
     let image = b.load(storage, None, target, None, [])?;
     let transparent = b.constant_composite(vec4, [zero, zero, zero, zero]);
     b.image_write(image, at, transparent, None, [])?;
@@ -1603,7 +1617,7 @@ fn build_shader(scene: bool) -> Result<Vec<u32>, rspirv::dr::Error> {
     } else {
         over
     };
-    let at = b.composite_construct(ivec2, None, [at_x, at_y])?;
+    let at = b.composite_construct(ivec2, None, [target_x, target_y])?;
     let image = b.load(storage, None, target, None, [])?;
     let under = b.image_read(vec4, None, image, at, None, [])?;
     let alpha = b.composite_extract(float, None, over, [3])?;
