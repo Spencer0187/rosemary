@@ -1,5 +1,74 @@
 use super::*;
 
+fn test_opaque_metal_placement(id: usize, frame: DirectFrame) -> ScenePlacement {
+    ScenePlacement {
+        id,
+        frame,
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: Vec::new(),
+        occluded: Some(Vec::new()),
+        native: None,
+    }
+}
+
+fn test_full_frame(window: sdl3::Window, width: u32, height: u32) -> appkit::view::Frame {
+    appkit::view::Frame {
+        window,
+        x: 0,
+        y: 0,
+        width,
+        height,
+        window_width: width,
+        window_height: height,
+    }
+}
+
+// All test colors are applied through an identical full-image color range.
+// Keep submission and fence ownership inside each actual regression.
+unsafe fn cmd_test_clear_color(
+    device: &ash::Device,
+    cb: vk::CommandBuffer,
+    image: vk::Image,
+    rgba: [f32; 4],
+) {
+    unsafe {
+        device.cmd_clear_color_image(
+            cb,
+            image,
+            vk::ImageLayout::GENERAL,
+            &vk::ClearColorValue { float32: rgba },
+            &[vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            }],
+        );
+    }
+}
+
+// Most graphical regressions use the same four-channel render target. Keep
+// nonstandard formats and memory-usage cases explicit in their tests.
+fn test_render_target(gpu: &'static Gpu, width: u32, height: u32) -> Result<GpuImage, String> {
+    gpu.create_image(&ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width,
+        height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    })
+}
+
 #[test]
 fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
     let frame = DirectFrame {
@@ -267,15 +336,7 @@ fn layer_compositing_batch_delay_distinguishes_wsi_modes() {
 
 #[test]
 fn single_layer_fast_path_requires_an_owned_opaque_full_window() {
-    let frame = appkit::view::Frame {
-        window: std::ptr::null_mut(),
-        x: 0,
-        y: 0,
-        width: 320,
-        height: 240,
-        window_width: 320,
-        window_height: 240,
-    };
+    let frame = test_full_frame(std::ptr::null_mut(), 320, 240);
     for mode in [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX] {
         assert!(fast_direct_layer(mode, 1, &frame, None, false, true));
         assert!(!fast_direct_layer(mode, 1, &frame, None, false, false));
@@ -304,9 +365,6 @@ fn single_layer_fast_path_requires_an_owned_opaque_full_window() {
 
 #[test]
 fn mailbox_presentation_is_preferred_when_available() {
-    if isolate_vulkan_graphical_test("mailbox_presentation_is_preferred_when_available") {
-        return;
-    }
     assert_eq!(
         choose_present_mode(&[vk::PresentModeKHR::FIFO, vk::PresentModeKHR::MAILBOX]),
         vk::PresentModeKHR::MAILBOX
@@ -362,15 +420,7 @@ fn a_window_is_presented_to_through_its_swapchain() {
     sdl3::video::show_window(window);
     let (width, height) =
         sdl3::video::window_size_in_pixels(window).expect("a window SDL just made");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: width as u32,
-        height: height as u32,
-        window_width: width as u32,
-        window_height: height as u32,
-    };
+    let frame = test_full_frame(window, width as u32, height as u32);
     assert!(frame.covers_window());
     // The window is converted by the first presentation and not before.
     assert_eq!(
@@ -379,22 +429,7 @@ fn a_window_is_presented_to_through_its_swapchain() {
         "the window was a Vulkan window before anything presented to it"
     );
 
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: frame.width,
-            height: frame.height,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("a colour image");
+    let source = test_render_target(gpu, frame.width, frame.height).expect("a colour image");
 
     // More frames than the swapchain has images times the frames in
     // flight, so that every fence, every acquisition semaphore and every
@@ -495,31 +530,8 @@ fn two_composited_windows_present_on_independent_workers() {
         .expect("X11 test window");
         sdl3::video::show_window(window);
         let (w, h) = sdl3::video::window_size_in_pixels(window).expect("window size");
-        let source = gpu
-            .create_image(&ImageDescription {
-                image_type: vk::ImageType::TYPE_2D,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: vk::Format::B8G8R8A8_UNORM,
-                width: w as u32,
-                height: h as u32,
-                depth: 1,
-                levels: 1,
-                layers: 1,
-                samples: 1,
-                usage: gpu::USAGE_RENDER_TARGET,
-                cube: false,
-                components: vk::ComponentMapping::default(),
-            })
-            .expect("source image");
-        let frame = appkit::view::Frame {
-            window,
-            x: 0,
-            y: 0,
-            width: w as u32,
-            height: h as u32,
-            window_width: w as u32,
-            window_height: h as u32,
-        };
+        let source = test_render_target(gpu, w as u32, h as u32).expect("source image");
+        let frame = test_full_frame(window, w as u32, h as u32);
         assert_eq!(
             present(gpu, window as usize, &frame, &source, &[]),
             Ok(true)
@@ -557,15 +569,7 @@ fn two_composited_windows_present_on_independent_workers() {
     let second = &windows[1];
     let make_frame = |window: sdl3::Window| {
         let (w, h) = sdl3::video::window_size_in_pixels(window).expect("window size");
-        appkit::view::Frame {
-            window,
-            x: 0,
-            y: 0,
-            width: w as u32,
-            height: h as u32,
-            window_width: w as u32,
-            window_height: h as u32,
-        }
+        test_full_frame(window, w as u32, h as u32)
     };
     let window_key = first.0 as usize;
     let snapshot = sdl3::video::presentation_window(first.0).expect("main-thread video snapshot");
@@ -824,31 +828,8 @@ fn slow_window_initialization_does_not_block_other_windows_or_teardown() {
             .expect("host SDL window");
         sdl3::video::show_window(window);
         let _ = sdl3::video::presentation_window(window).expect("video snapshot");
-        let source = gpu
-            .create_image(&ImageDescription {
-                image_type: vk::ImageType::TYPE_2D,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: vk::Format::B8G8R8A8_UNORM,
-                width: 240,
-                height: 180,
-                depth: 1,
-                levels: 1,
-                layers: 1,
-                samples: 1,
-                usage: gpu::USAGE_RENDER_TARGET,
-                cube: false,
-                components: vk::ComponentMapping::default(),
-            })
-            .expect("source");
-        let frame = appkit::view::Frame {
-            window,
-            x: 0,
-            y: 0,
-            width: 240,
-            height: 180,
-            window_width: 240,
-            window_height: 180,
-        };
+        let source = test_render_target(gpu, 240, 180).expect("source");
+        let frame = test_full_frame(window, 240, 180);
         created.push((window, source, frame));
     }
     let a = &created[0];
@@ -908,31 +889,8 @@ fn idle_compositor_worker_exits_on_device_loss_without_new_frames() {
         sdl3::video::create_window(c"idle FIFO worker loss", 160, 120, 0).expect("SDL window");
     sdl3::video::show_window(window);
     let _ = sdl3::video::presentation_window(window).expect("SDL owner snapshot");
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("layer source");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let source = test_render_target(gpu, 160, 120).expect("layer source");
+    let frame = test_full_frame(window, 160, 120);
     assert_eq!(
         present(gpu, window as usize, &frame, &source, &[]),
         Ok(true)
@@ -1062,31 +1020,8 @@ fn device_loss_before_swapchain_create_cleans_pending_initializer() {
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).expect("SDL video-thread metadata");
     let key = window as usize;
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 170,
-        height: 120,
-        window_width: 170,
-        window_height: 120,
-    };
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 170,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("test GPU image");
+    let frame = test_full_frame(window, 170, 120);
+    let source = test_render_target(gpu, 170, 120).expect("test GPU image");
     TEST_SLOW_INITIALIZER_STARTED.store(false, Ordering::Release);
     TEST_SLOW_INITIALIZER.store(key, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -1215,31 +1150,8 @@ fn minimized_window_retries_transient_initialization_after_restore() {
     let window = sdl3::video::create_window(c"minimized Vulkan recovery", 240, 180, 0).unwrap();
     sdl3::video::show_window(window);
     let _ = sdl3::video::presentation_window(window).unwrap();
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 240,
-        height: 180,
-        window_width: 240,
-        window_height: 180,
-    };
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 240,
-            height: 180,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let frame = test_full_frame(window, 240, 180);
+    let source = test_render_target(gpu, 240, 180).unwrap();
     sdl3::video::minimize_window(window);
     TEST_FAIL_FIRST_CREATE_WINDOW.store(window as usize, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -1364,31 +1276,8 @@ fn unsubmitted_unsignaled_fifo_fence_does_not_stall_next_frame() {
         instance,
     )
     .expect("Vulkan swapchain");
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("source image");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let source = test_render_target(gpu, 160, 120).expect("source image");
+    let frame = test_full_frame(window, 160, 120);
     let slot = 0;
     // SAFETY: the new frame's fence is unused and belongs to this GPU.
     unsafe { gpu.device.reset_fences(&[swapchain.frames[slot].done]) }
@@ -1483,31 +1372,8 @@ fn fifo_acquire_submit_failure_consumes_semaphore_and_retires_image() {
         sdl3::video::destroy_window(window);
         return;
     }
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("GPU image");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let source = test_render_target(gpu, 160, 120).expect("GPU image");
+    let frame = test_full_frame(window, 160, 120);
     assert_eq!(
         state.stage_composite(&frame, &source, None, &mut SourceOwner(None), false),
         Ok(Some(true))
@@ -1614,31 +1480,8 @@ fn v10_fifo_fixture() -> Option<(
         sdl3::video::destroy_window(window);
         return None;
     }
-    let image = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("Metal content source");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let image = test_render_target(gpu, 160, 120).expect("Metal content source");
+    let frame = test_full_frame(window, 160, 120);
     Some((window, gpu, state, image, frame))
 }
 
@@ -2669,31 +2512,8 @@ fn device_loss_during_swapchain_initialization_does_not_relock_registry() {
     let window = sdl3::video::create_window(c"device lost in initializer", 190, 130, 0).unwrap();
     sdl3::video::show_window(window);
     let _ = sdl3::video::presentation_window(window).unwrap();
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 190,
-        height: 130,
-        window_width: 190,
-        window_height: 130,
-    };
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 190,
-            height: 130,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let frame = test_full_frame(window, 190, 130);
+    let source = test_render_target(gpu, 190, 130).unwrap();
     TEST_FAIL_DEVICE_CREATE_WINDOW.store(window as usize, Ordering::Release);
     let deadline = Instant::now() + Duration::from_secs(3);
     while !gpu.lost.load(Ordering::Acquire) {
@@ -2772,21 +2592,7 @@ fn native_gpu_escrow_restores_exact_bytes() {
     };
     let old = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            old.image.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [1.0, 0.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, old.image.image, [1.0, 0.0, 0.0, 1.0]);
     })
     .unwrap();
     let escrow = scene::NativeGpuEscrow::capture(&mut state, &old)
@@ -2937,40 +2743,13 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
     let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
         return;
     };
-    let foreground = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 40,
-            height: 30,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("40x30 source image");
+    let foreground = test_render_target(gpu, 40, 30).expect("40x30 source image");
     for (image, rgba) in [
         (&background, [0.0, 0.0, 1.0, 1.0]),
         (&foreground, [0.0, 1.0, 0.0, 1.0]),
     ] {
         gpu.one_shot(|device, cb| unsafe {
-            device.cmd_clear_color_image(
-                cb,
-                image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue { float32: rgba },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, image.image, rgba);
         })
         .expect("paint source image");
     }
@@ -3175,53 +2954,10 @@ fn more_than_32_retained_layers_preserve_topmost_pixels() {
     let Some((window, gpu, mut state, blue, whole)) = v10_fifo_fixture() else {
         return;
     };
-    let small = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 8,
-            height: 8,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("test overlay image");
+    let small = test_render_target(gpu, 8, 8).expect("test overlay image");
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            blue.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 0.0, 1.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
-        device.cmd_clear_color_image(
-            cb,
-            small.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, blue.image, [0.0, 0.0, 1.0, 1.0]);
+        cmd_test_clear_color(device, cb, small.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .expect("seed two colors");
     state.layers.push(1);
@@ -3284,21 +3020,7 @@ fn more_than_32_retained_layers_preserve_topmost_pixels() {
     // clearing/composition with >32 layer descriptors. Other snapshots and
     // the full-window backing image must retain their previous pixels.
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            small.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [1.0, 0.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, small.image, [1.0, 0.0, 0.0, 1.0]);
     })
     .expect("repaint small foreground");
     let affected = appkit::view::Frame {
@@ -3357,21 +3079,7 @@ fn fifo_flattened_static_drawable_recomposes_after_ca_mask_change() {
         return;
     }
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            source.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, source.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .expect("green FIFO source");
     let id = 613;
@@ -3479,20 +3187,11 @@ fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
         };
     }
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
+        cmd_test_clear_color(
+            device,
             cb,
             bottom.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [10.0 / 255.0, 50.0 / 255.0, 180.0 / 255.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
+            [10.0 / 255.0, 50.0 / 255.0, 180.0 / 255.0, 1.0],
         );
         device.cmd_copy_buffer_to_image(
             cb,
@@ -3604,21 +3303,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let metal_id = 900usize;
@@ -3639,16 +3324,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         dmabuf: None,
         dma_sample: None,
     };
-    let metal_placement = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let metal_placement = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     let native_placement = ScenePlacement {
         id: native_id,
         frame: DirectFrame::from_frame(&native_frame),
@@ -3898,51 +3574,14 @@ fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
         instance,
     )
     .unwrap();
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 120,
-            height: 90,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let source = test_render_target(gpu, 120, 90).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            source.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        )
+        cmd_test_clear_color(device, cb, source.image, [0.0, 1.0, 0.0, 1.0])
     })
     .unwrap();
     let initial = appkit::view::metal_scene(sdl).expect("static Metal published");
     let metal_id = metal_layer as usize;
-    let physical = appkit::view::Frame {
-        window: sdl,
-        x: 0,
-        y: 0,
-        width: 120,
-        height: 90,
-        window_width: 120,
-        window_height: 90,
-    };
+    let physical = test_full_frame(sdl, 120, 90);
     let scene_from_ca = || {
         let entry = appkit::view::metal_scene(sdl)
             .unwrap()
@@ -4135,60 +3774,14 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
     )
     .expect("real 6K Vulkan WSI surface");
     assert!(uses_layer_compositor(state.present_mode));
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: WIDTH,
-            height: HEIGHT,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let source = test_render_target(gpu, WIDTH, HEIGHT).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            source.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        )
+        cmd_test_clear_color(device, cb, source.image, [0.0, 1.0, 0.0, 1.0])
     })
     .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: WIDTH,
-        height: HEIGHT,
-        window_width: WIDTH,
-        window_height: HEIGHT,
-    };
+    let whole = test_full_frame(window, WIDTH, HEIGHT);
     let metal_id = 301usize;
-    let base = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let base = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     state.layers.push(metal_id);
     state.synchronize_scene(window as usize, &[base.clone()]);
     assert_eq!(
@@ -4300,34 +3893,11 @@ fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        )
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0])
     })
     .unwrap();
     let metal_id = 905usize;
-    let background = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let background = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     state.layers.push(metal_id);
     state.synchronize_scene(window as usize, &[background.clone()]);
     assert_eq!(
@@ -4542,34 +4112,11 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            green.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, green.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let metal_id = 991usize;
-    let metal_placement = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let metal_placement = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     state.layers.push(metal_id);
     state.synchronize_scene(window as usize, &[metal_placement.clone()]);
     state.queue_direct(
@@ -4612,16 +4159,7 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
     state.synchronize_scene(
         window as usize,
         &[
-            ScenePlacement {
-                id: metal_id,
-                frame: DirectFrame::from_frame(&whole),
-                opacity: 1.0,
-                opaque: true,
-                clip: None,
-                rounded: vec![],
-                occluded: Some(vec![]),
-                native: None,
-            },
+            test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole)),
             native,
         ],
     );
@@ -4657,35 +4195,12 @@ fn rounded_native_opaque_overlay_preserves_metal_corners() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .expect("static green metal source");
     let metal_layer = 0x313;
     let native_layer = (1usize << (usize::BITS - 1)) | 0x314;
-    let bottom = ScenePlacement {
-        id: metal_layer,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let bottom = test_opaque_metal_placement(metal_layer, DirectFrame::from_frame(&whole));
     let native = ScenePlacement {
         id: native_layer,
         frame: DirectFrame::from_frame(&whole),
@@ -4909,59 +4424,13 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
         instance,
     )
     .unwrap();
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: WIDTH,
-            height: HEIGHT,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let source = test_render_target(gpu, WIDTH, HEIGHT).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            source.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        )
+        cmd_test_clear_color(device, cb, source.image, [0.0, 1.0, 0.0, 1.0])
     })
     .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: WIDTH,
-        height: HEIGHT,
-        window_width: WIDTH,
-        window_height: HEIGHT,
-    };
-    let bottom = ScenePlacement {
-        id: 0x2458,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let whole = test_full_frame(window, WIDTH, HEIGHT);
+    let bottom = test_opaque_metal_placement(0x2458, DirectFrame::from_frame(&whole));
     state.layers.push(bottom.id);
     state.synchronize_scene(window as usize, &[bottom.clone()]);
     assert_eq!(
@@ -5405,35 +4874,12 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
             .expect("a 6K DMA-only layer must enter retained composition");
         assert!(native_source.bytes.is_empty());
         gpu.one_shot(|device, cb| {
-            device.cmd_clear_color_image(
-                cb,
-                metal.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue {
-                    float32: [0.0, 1.0, 0.0, 1.0],
-                },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
         })
         .expect("clear static Metal background");
         let metal_id = 0x6b1usize;
         let native_id = (1usize << (usize::BITS - 1)) | 0x6b2;
-        let bottom = ScenePlacement {
-            id: metal_id,
-            frame: DirectFrame::from_frame(&whole),
-            opacity: 1.0,
-            opaque: true,
-            clip: None,
-            rounded: vec![],
-            occluded: Some(vec![]),
-            native: None,
-        };
+        let bottom = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
         let huge_frame = appkit::view::Frame {
             x: 40,
             y: 35,
@@ -5711,32 +5157,9 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
             dma_sample: None,
         }),
     };
-    let bottom = ScenePlacement {
-        id: 0xa018usize,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let bottom = test_opaque_metal_placement(0xa018usize, DirectFrame::from_frame(&whole));
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     state.layers.push(bottom.id);
@@ -5809,35 +5232,12 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let id = 7077usize;
     let native_id = (1usize << (usize::BITS - 1)) | 7078;
-    let bottom = ScenePlacement {
-        id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let bottom = test_opaque_metal_placement(id, DirectFrame::from_frame(&whole));
     state.layers.push(id);
     state.synchronize_scene(window as usize, &[bottom.clone()]);
     assert_eq!(
@@ -6054,16 +5454,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     state.synchronize_scene(
         window as usize,
         &[
-            ScenePlacement {
-                id,
-                frame: DirectFrame::from_frame(&whole),
-                opacity: 1.0,
-                opaque: true,
-                clip: None,
-                rounded: vec![],
-                occluded: Some(vec![]),
-                native: None,
-            },
+            test_opaque_metal_placement(id, DirectFrame::from_frame(&whole)),
             cpu,
         ],
     );
@@ -6103,49 +5494,12 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
     let window = sdl3::video::create_window(c"direct rejected native scene", 160, 120, 0).unwrap();
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).unwrap();
-    let green = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let green = test_render_target(gpu, 160, 120).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            green.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, green.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let whole = test_full_frame(window, 160, 120);
     let metal_id = window as usize;
     assert_eq!(present(gpu, metal_id, &whole, &green, &[]), Ok(true));
     let entry = SWAPCHAINS
@@ -6156,16 +5510,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
         .get(&metal_id)
         .unwrap()
         .clone();
-    let bottom = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let bottom = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     // Seed the exact direct presentation state with its GPU source still
     // alive. The preceding public present() creates a genuine WSI window;
     // queue_direct models the last completed full-window guest drawable.
@@ -6389,47 +5734,10 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     let window = sdl3::video::create_window(c"DMA admission fallback WSI", 160, 120, 0).unwrap();
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).unwrap();
-    let metal = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let metal = test_render_target(gpu, 160, 120).unwrap();
+    let whole = test_full_frame(window, 160, 120);
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let metal_id = window as usize;
@@ -6450,16 +5758,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         ..whole
     };
     let native_id = (1usize << (usize::BITS - 1)) | 0x809123usize;
-    let bottom = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let bottom = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     let unknown = ScenePlacement {
         id: native_id,
         frame: DirectFrame::from_frame(&native_frame),
@@ -6714,33 +6013,10 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        )
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0])
     })
     .unwrap();
-    let background = ScenePlacement {
-        id: 0xb010,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let background = test_opaque_metal_placement(0xb010, DirectFrame::from_frame(&whole));
     let old_frame = appkit::view::Frame {
         x: 20,
         y: 16,
@@ -7314,15 +6590,7 @@ fn replacing_obsolete_native_gpu_generations_makes_forward_progress() {
         instance,
     )
     .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 2048,
-        height: 2048,
-        window_width: 2048,
-        window_height: 2048,
-    };
+    let whole = test_full_frame(window, 2048, 2048);
     let old_desc = ImageDescription {
         image_type: vk::ImageType::TYPE_2D,
         view_type: vk::ImageViewType::TYPE_2D,
@@ -7436,15 +6704,7 @@ fn same_native_id_near_scene_budget_replaces_real_dma_pixels() {
         instance,
     )
     .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 2048,
-        height: 2048,
-        window_width: 2048,
-        window_height: 2048,
-    };
+    let whole = test_full_frame(window, 2048, 2048);
     let frame = DirectFrame::from_frame(&whole);
     let desc = ImageDescription {
         image_type: vk::ImageType::TYPE_2D,
@@ -7479,21 +6739,7 @@ fn same_native_id_near_scene_budget_replaces_real_dma_pixels() {
         .image
         .image;
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            base,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [1.0, 0.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, base, [1.0, 0.0, 0.0, 1.0]);
     })
     .unwrap();
     let old_scene = state.scene_placements.clone();
@@ -7778,47 +7024,10 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
     let window = sdl3::video::create_window(c"CPU hard-budget WSI", 160, 120, 0).unwrap();
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).expect("owner SDL snapshot");
-    let metal = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
+    let metal = test_render_target(gpu, 160, 120).unwrap();
+    let whole = test_full_frame(window, 160, 120);
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let metal_id = window as usize;
@@ -7831,16 +7040,7 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
         .get(&metal_id)
         .unwrap()
         .clone();
-    let base = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let base = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     let huge = appkit::view::Frame {
         width: 4096,
         height: 4096,
@@ -7970,21 +7170,7 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let id = 707usize;
@@ -8141,35 +7327,12 @@ fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
     assert_eq!(first.0.len(), 80 * 60 * 4);
     assert_eq!(&first.0[..4], &[255, 0, 0, 255]);
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let metal_id = 0x6d01usize;
     let native_id = (1usize << (usize::BITS - 1)) | (native_view as usize);
-    let bottom = ScenePlacement {
-        id: metal_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.0,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let bottom = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     let native_frame = appkit::view::Frame {
         x: 35,
         y: 20,
@@ -8259,21 +7422,7 @@ fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let metal_id = 0x6c01usize;
@@ -8413,21 +7562,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
         return;
     }
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            green.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, green.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .expect("green source");
     let id = 404;
@@ -8544,21 +7679,7 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            green.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, green.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .expect("green full-window source");
     let first = DirectFrame::from_frame(&appkit::view::Frame {
@@ -8723,40 +7844,13 @@ fn translucent_metal_composites_over_complete_cpu_store() {
     let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
         return;
     };
-    let overlay = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 60,
-            height: 40,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("Metal foreground image");
+    let overlay = test_render_target(gpu, 60, 40).expect("Metal foreground image");
     for (img, color) in [
         (&background, [0.0, 0.0, 1.0, 1.0]),
         (&overlay, [0.0, 1.0, 0.0, 1.0]),
     ] {
         gpu.one_shot(|device, cb| unsafe {
-            device.cmd_clear_color_image(
-                cb,
-                img.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue { float32: color },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, img.image, color);
         })
         .expect("fill source");
     }
@@ -8894,21 +7988,7 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
         return;
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            blue.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 0.0, 1.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, blue.image, [0.0, 0.0, 1.0, 1.0]);
     })
     .expect("full-window blue");
     let id = 101usize;
@@ -8983,21 +8063,7 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
         }]
     ));
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            blue.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.5, 0.5],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, blue.image, [0.0, 0.0, 0.5, 0.5]);
     })
     .expect("half-transparent drawable");
     assert_eq!(
@@ -9057,23 +8123,8 @@ fn benchmark_4k_static_background_with_animated_128px_foreground() {
         height: 128,
         ..frame
     };
-    let make_image = |w: u32, h: u32| {
-        gpu.create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: w,
-            height: h,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("benchmark Vulkan image")
-    };
+    let make_image =
+        |w: u32, h: u32| test_render_target(gpu, w, h).expect("benchmark Vulkan image");
     let background = make_image(width, height);
     let overlay = make_image(128, 128);
     let control = make_image(width, height);
@@ -9082,19 +8133,7 @@ fn benchmark_4k_static_background_with_animated_128px_foreground() {
         (&overlay, [0.0, 1.0, 0.0, 1.0]),
     ] {
         gpu.one_shot(|device, cb| unsafe {
-            device.cmd_clear_color_image(
-                cb,
-                image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue { float32: color },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, image.image, color);
         })
         .expect("initialize benchmark source");
     }
@@ -9266,21 +8305,7 @@ fn one_layer_with_clipping_parent_keeps_outside_pixels_transparent() {
         _ => {}
     }
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            image.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 0.0, 1.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, image.image, [0.0, 0.0, 1.0, 1.0]);
     })
     .expect("blue guest drawable");
     let clip = appkit::view::Frame {
@@ -9399,37 +8424,10 @@ fn static_foreground_survives_repeated_background_submissions() {
     let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
         return;
     };
-    let overlay = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 60,
-            height: 40,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("overlay image");
+    let overlay = test_render_target(gpu, 60, 40).expect("overlay image");
     let paint = |image: &GpuImage, rgba: [f32; 4]| {
         gpu.one_shot(|device, command_buffer| unsafe {
-            device.cmd_clear_color_image(
-                command_buffer,
-                image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue { float32: rgba },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, command_buffer, image.image, rgba);
         })
         .expect("fill test image")
     };
@@ -9680,22 +8678,7 @@ fn failed_scene_submission_restores_last_complete_layer_snapshot() {
     let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
         return;
     };
-    let overlay = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 60,
-            height: 40,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("overlay source");
+    let overlay = test_render_target(gpu, 60, 40).expect("overlay source");
     let child = appkit::view::Frame {
         x: 30,
         y: 10,
@@ -9782,22 +8765,7 @@ fn retained_scene_sources_rotate_and_defer_when_all_generations_are_busy() {
     let Some((window, gpu, mut state, background, whole)) = v10_fifo_fixture() else {
         return;
     };
-    let overlay = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 60,
-            height: 40,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("scene overlay");
+    let overlay = test_render_target(gpu, 60, 40).expect("scene overlay");
     let child = appkit::view::Frame {
         x: 15,
         y: 20,
@@ -9899,37 +8867,10 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
         state.present_mode, expected,
         "test did not select actual requested WSI mode"
     );
-    let overlay = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 60,
-            height: 40,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("foreground image");
+    let overlay = test_render_target(gpu, 60, 40).expect("foreground image");
     let fill = |image: &GpuImage, color| {
         gpu.one_shot(|device, cb| unsafe {
-            device.cmd_clear_color_image(
-                cb,
-                image.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue { float32: color },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, image.image, color);
         })
         .expect("fill scene source")
     };
@@ -10116,23 +9057,7 @@ fn two_layers_in_a_window_are_composited_into_one_image() {
         sdl3::video::window_size_in_pixels(window).expect("a window SDL just made");
     let (width, height) = (width as u32, height as u32);
 
-    let image = |w: u32, h: u32| {
-        gpu.create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: w,
-            height: h,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("a colour image")
-    };
+    let image = |w: u32, h: u32| test_render_target(gpu, w, h).expect("a colour image");
     let background = image(width, height);
     let overlay = image(width / 2, height / 2);
 
@@ -10220,33 +9145,10 @@ fn a_transparent_window_is_presented_through_the_corners_pass() {
     let frame_of = |window| {
         let (width, height) =
             sdl3::video::window_size_in_pixels(window).expect("a window SDL made");
-        appkit::view::Frame {
-            window,
-            x: 0,
-            y: 0,
-            width: width as u32,
-            height: height as u32,
-            window_width: width as u32,
-            window_height: height as u32,
-        }
+        test_full_frame(window, width as u32, height as u32)
     };
     let frame = frame_of(window);
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: frame.width,
-            height: frame.height,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("a colour image");
+    let source = test_render_target(gpu, frame.width, frame.height).expect("a colour image");
     // Enough frames to reuse every frame slot's descriptor set.
     for _ in 0..8 {
         assert_eq!(present(gpu, 1, &frame, &source, &[]), Ok(true));
@@ -10317,31 +9219,8 @@ fn an_opengl_window_is_refused_rather_than_converted() {
     };
     sdl3::video::show_window(window);
     let (w, h) = sdl3::video::window_size_in_pixels(window).expect("a window");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: w as u32,
-        height: h as u32,
-        window_width: w as u32,
-        window_height: h as u32,
-    };
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: frame.width,
-            height: frame.height,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("a colour image");
+    let frame = test_full_frame(window, w as u32, h as u32);
+    let source = test_render_target(gpu, frame.width, frame.height).expect("a colour image");
 
     assert_eq!(
         present(gpu, 1, &frame, &source, &[]),
@@ -10486,22 +9365,8 @@ fn a_layer_on_a_guests_own_window_is_presented_through_a_swapchain() {
         "a content view the size of its window did not cover it"
     );
 
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: frame.width.max(1),
-            height: frame.height.max(1),
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("a colour image");
+    let source =
+        test_render_target(gpu, frame.width.max(1), frame.height.max(1)).expect("a colour image");
     assert_eq!(
         present(gpu, layer as usize, &frame, &source, &[]),
         Ok(true),
@@ -10792,15 +9657,7 @@ fn a_frame_off_the_edge_of_its_window_is_clipped_to_it() {
 /// window: scaled, as before logical clipping, not cropped or left unwritten.
 #[test]
 fn a_covering_layer_fills_a_swapchain_extent_that_lags_its_window() {
-    let frame = appkit::view::Frame {
-        window: std::ptr::null_mut(),
-        x: 0,
-        y: 0,
-        width: 320,
-        height: 240,
-        window_width: 320,
-        window_height: 240,
-    };
+    let frame = test_full_frame(std::ptr::null_mut(), 320, 240);
     for extent in [(330, 250), (300, 200)] {
         let extent = vk::Extent2D {
             width: extent.0,
@@ -10927,15 +9784,7 @@ fn a_shrunken_guest_fullscreen_is_presented_through_the_vulkan_swapchain() {
         bounds.h < h && bounds.h > 0,
         "logical window did not shrink"
     );
-    let full = appkit::view::Frame {
-        window: sdl,
-        x: 0,
-        y: 0,
-        width: w as u32,
-        height: h as u32,
-        window_width: w as u32,
-        window_height: h as u32,
-    };
+    let full = test_full_frame(sdl, w as u32, h as u32);
     let accepted = clamp(
         &full,
         vk::Extent2D {
@@ -10945,41 +9794,12 @@ fn a_shrunken_guest_fullscreen_is_presented_through_the_vulkan_swapchain() {
     )
     .unwrap();
     assert_eq!(accepted[1].y - accepted[0].y, bounds.h);
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: full.width,
-            height: full.height,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let source = test_render_target(gpu, full.width, full.height).unwrap();
     // Give the oversized layer an unmistakable red drawable: pixel-level
     // verification must not pass merely because an uninitialised source image
     // happened to be black.
     gpu.one_shot(|device, commands| unsafe {
-        device.cmd_clear_color_image(
-            commands,
-            source.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [1.0, 0.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, commands, source.image, [1.0, 0.0, 0.0, 1.0]);
     })
     .expect("red source cleared through Vulkan");
     for _ in 0..5 {
@@ -11429,31 +10249,8 @@ fn minimized_compositor_recovers_after_repeated_zero_extent_rebuilds() {
         .expect("SDL test window");
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).expect("SDL snapshot");
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 220,
-            height: 160,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("source image");
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 220,
-        height: 160,
-        window_width: 220,
-        window_height: 160,
-    };
+    let source = test_render_target(gpu, 220, 160).expect("source image");
+    let frame = test_full_frame(window, 220, 160);
     assert_eq!(
         present(gpu, window as usize, &frame, &source, &[]),
         Ok(true)
@@ -11591,31 +10388,8 @@ fn failed_async_rebuild_does_not_register_unpresented_layer() {
     let window = sdl3::video::create_window(c"deferred layer rebuild", 200, 150, 0).unwrap();
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).unwrap();
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 200,
-            height: 150,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 200,
-        height: 150,
-        window_width: 200,
-        window_height: 150,
-    };
+    let source = test_render_target(gpu, 200, 150).unwrap();
+    let frame = test_full_frame(window, 200, 150);
     assert_eq!(
         present(gpu, window as usize, &frame, &source, &[]),
         Ok(true)
@@ -11865,31 +10639,8 @@ fn v17_async_window_fixture() -> Option<(
     let window = sdl3::video::create_window(c"WSI asynchronous ownership", 240, 180, 0)?;
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window)?;
-    let frame = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 240,
-        height: 180,
-        window_width: 240,
-        window_height: 180,
-    };
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 240,
-            height: 180,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .ok()?;
+    let frame = test_full_frame(window, 240, 180);
+    let source = test_render_target(gpu, 240, 180).ok()?;
     assert_eq!(
         present(gpu, window as usize, &frame, &source, &[]),
         Ok(true)
@@ -12064,31 +10815,8 @@ fn appkit_parent_remake_retires_gpu_backed_popup_without_dangling_nswindow() {
     assert_eq!(sdl3::video::window_parent(old_child), old_parent);
     let old_child_id = sdl3::video::live_window_id(old_child).unwrap();
     sdl3::video::presentation_window(old_child).expect("child snapshot");
-    let child_frame = appkit::view::Frame {
-        window: old_child,
-        x: 0,
-        y: 0,
-        width: 180,
-        height: 120,
-        window_width: 180,
-        window_height: 120,
-    };
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 180,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .expect("GPU image for child");
+    let child_frame = test_full_frame(old_child, 180, 120);
+    let source = test_render_target(gpu, 180, 120).expect("GPU image for child");
     assert_eq!(
         present(gpu, 0x450_aaa, &child_frame, &source, &[]),
         Ok(true),
@@ -12383,21 +11111,7 @@ fn native_scene_rollback_metadata_survives_gpu_escrow() {
     };
     let old = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
     gpu.one_shot(|d, cb| unsafe {
-        d.cmd_clear_color_image(
-            cb,
-            old.image.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(d, cb, old.image.image, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     let id = (1usize << (usize::BITS - 1)) | 0xec01;
@@ -12476,21 +11190,7 @@ fn atomic_768mib_native_rollback_escrow_reclaims_real_gpu_images() {
         .collect();
     gpu.one_shot(|device, cb| unsafe {
         for &source in &old_images {
-            device.cmd_clear_color_image(
-                cb,
-                source,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue {
-                    float32: [1.0, 0.0, 0.0, 1.0],
-                },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, source, [1.0, 0.0, 0.0, 1.0]);
         }
     })
     .unwrap();
@@ -12663,15 +11363,7 @@ fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
         instance,
     )
     .unwrap();
-    let full = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 2048,
-        height: 2048,
-        window_width: 2048,
-        window_height: 2048,
-    };
+    let full = test_full_frame(window, 2048, 2048);
     let desc = ImageDescription {
         image_type: vk::ImageType::TYPE_2D,
         view_type: vk::ImageViewType::TYPE_2D,
@@ -12702,21 +11394,7 @@ fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
         .collect();
     gpu.one_shot(|d, cb| unsafe {
         for &image in &images {
-            d.cmd_clear_color_image(
-                cb,
-                image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue {
-                    float32: [1.0, 0.0, 0.0, 1.0],
-                },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(d, cb, image, [1.0, 0.0, 0.0, 1.0]);
         }
     })
     .unwrap();
@@ -12819,47 +11497,10 @@ fn rejected_linear_dma_worker_commits_original_publication() {
     let window = sdl3::video::create_window(c"linear DMA worker admission", 160, 120, 0).unwrap();
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
-    let metal = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let whole = test_full_frame(window, 160, 120);
+    let metal = test_render_target(gpu, 160, 120).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0., 1., 0., 1.],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0., 1., 0., 1.]);
     })
     .unwrap();
     let window_id = window as usize;
@@ -12938,16 +11579,7 @@ fn rejected_linear_dma_worker_commits_original_publication() {
             dma_sample: None,
         }),
     };
-    let base = ScenePlacement {
-        id: window_id,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let base = test_opaque_metal_placement(window_id, DirectFrame::from_frame(&whole));
     appkit::backing::refuse_dmabufs(window);
     *entry.pending_scene.lock().unwrap() = Some(vec![base, native]);
     ensure_layer_compositor_worker(window_id, &entry);
@@ -13222,21 +11854,7 @@ fn native_escrow_failed_wait_retains_exact_gpu_readback_and_restore_resources() 
     )
     .unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            source.image.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0., 1., 0., 1.],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, source.image.image, [0., 1., 0., 1.]);
     })
     .unwrap();
     let budget = Arc::clone(&source._charge.as_ref().unwrap().budget);
@@ -13714,21 +12332,7 @@ fn immediate_composite_clear_and_scene_snapshot_quarantine_gpu_image_charges() {
 
     let composite = state.composite().unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            composite,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0.0, 1.0, 0.0, 1.0],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, composite, [0.0, 1.0, 0.0, 1.0]);
     })
     .unwrap();
     state.layers.push(7);
@@ -13858,31 +12462,8 @@ fn compositor_worker_retries_same_dma_revision_after_temporary_import_failure() 
     let window = sdl3::video::create_window(c"DMA transient worker", 160, 120, 0).unwrap();
     sdl3::video::show_window(window);
     sdl3::video::presentation_window(window).unwrap();
-    let whole = appkit::view::Frame {
-        window,
-        x: 0,
-        y: 0,
-        width: 160,
-        height: 120,
-        window_width: 160,
-        window_height: 120,
-    };
-    let metal = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 160,
-            height: 120,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let whole = test_full_frame(window, 160, 120);
+    let metal = test_render_target(gpu, 160, 120).unwrap();
     assert_eq!(present(gpu, window as usize, &whole, &metal, &[]), Ok(true));
     let entry = SWAPCHAINS
         .lock()
@@ -13916,16 +12497,7 @@ fn compositor_worker_retries_same_dma_revision_after_temporary_import_failure() 
             dma_sample: None,
         }),
     };
-    let base = ScenePlacement {
-        id: window as usize,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let base = test_opaque_metal_placement(window as usize, DirectFrame::from_frame(&whole));
     let failures = TEST_NATIVE_RETRYABLE_FAILURES.load(Ordering::Acquire);
     TEST_BLOCK_LINEAR_DMA_FALLBACK.store(true, Ordering::Release);
     crate::overlay::fail_next_dma_import_for_test();
@@ -14024,33 +12596,10 @@ fn cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change() {
         }),
     };
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            metal.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0., 1., 0., 1.],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, metal.image, [0., 1., 0., 1.]);
     })
     .unwrap();
-    let base = ScenePlacement {
-        id: 0xda46,
-        frame: DirectFrame::from_frame(&whole),
-        opacity: 1.,
-        opaque: true,
-        clip: None,
-        rounded: vec![],
-        occluded: Some(vec![]),
-        native: None,
-    };
+    let base = test_opaque_metal_placement(0xda46, DirectFrame::from_frame(&whole));
     state.layers.push(base.id);
     state.synchronize_scene(window as usize, &[base.clone(), placement.clone()]);
     assert_eq!(
@@ -14406,49 +12955,12 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         instance,
     )
     .unwrap();
-    let source = gpu
-        .create_image(&ImageDescription {
-            image_type: vk::ImageType::TYPE_2D,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format: vk::Format::B8G8R8A8_UNORM,
-            width: 120,
-            height: 90,
-            depth: 1,
-            levels: 1,
-            layers: 1,
-            samples: 1,
-            usage: gpu::USAGE_RENDER_TARGET,
-            cube: false,
-            components: vk::ComponentMapping::default(),
-        })
-        .unwrap();
+    let source = test_render_target(gpu, 120, 90).unwrap();
     gpu.one_shot(|device, cb| unsafe {
-        device.cmd_clear_color_image(
-            cb,
-            source.image,
-            vk::ImageLayout::GENERAL,
-            &vk::ClearColorValue {
-                float32: [0., 1., 0., 1.],
-            },
-            &[vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            }],
-        );
+        cmd_test_clear_color(device, cb, source.image, [0., 1., 0., 1.]);
     })
     .unwrap();
-    let physical = appkit::view::Frame {
-        window: sdl,
-        x: 0,
-        y: 0,
-        width: 120,
-        height: 90,
-        window_width: 120,
-        window_height: 90,
-    };
+    let physical = test_full_frame(sdl, 120, 90);
     let make_scene = |items: Vec<appkit::view::MetalSceneLayer>| -> Vec<ScenePlacement> {
         items
             .into_iter()
@@ -14779,21 +13291,7 @@ fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
             })
             .unwrap();
         gpu.one_shot(|device, cb| unsafe {
-            device.cmd_clear_color_image(
-                cb,
-                metal.image,
-                vk::ImageLayout::GENERAL,
-                &vk::ClearColorValue {
-                    float32: [0., 1., 0., 1.],
-                },
-                &[vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                }],
-            );
+            cmd_test_clear_color(device, cb, metal.image, [0., 1., 0., 1.]);
         })
         .unwrap();
         let frame = appkit::view::Frame {
@@ -14806,16 +13304,10 @@ fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
             window_height: height,
         };
         let base_id = window as usize;
-        let mut placements = vec![ScenePlacement {
-            id: base_id,
-            frame: DirectFrame::from_frame(&frame),
-            opacity: 1.,
-            opaque: true,
-            clip: None,
-            rounded: vec![],
-            occluded: Some(vec![]),
-            native: None,
-        }];
+        let mut placements = vec![test_opaque_metal_placement(
+            base_id,
+            DirectFrame::from_frame(&frame),
+        )];
         let pixel = Arc::new([0u8, 0u8, 255u8, 255u8].repeat(32 * 32));
         for i in 0..count {
             let at = appkit::view::Frame {
