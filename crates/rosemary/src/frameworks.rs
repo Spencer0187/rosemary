@@ -459,6 +459,20 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ),
     ("_kCVImageBufferCleanApertureKey", "CVCleanAperture"),
     ("_kCVImageBufferPixelAspectRatioKey", "CVPixelAspectRatio"),
+    (
+        "_kCVImageBufferPixelAspectRatioHorizontalSpacingKey",
+        "HorizontalSpacing",
+    ),
+    (
+        "_kCVImageBufferPixelAspectRatioVerticalSpacingKey",
+        "VerticalSpacing",
+    ),
+    ("_kCFUserNotificationAlertHeaderKey", "AlertHeader"),
+    ("_kCFUserNotificationAlertMessageKey", "AlertMessage"),
+    (
+        "_kCFUserNotificationDefaultButtonTitleKey",
+        "DefaultButtonTitle",
+    ),
     ("_kCVImageBufferFieldCountKey", "CVFieldCount"),
     ("_kCVImageBufferFieldDetailKey", "CVFieldDetail"),
     ("_kCVImageBufferYCbCrMatrixKey", "CVImageBufferYCbCrMatrix"),
@@ -512,8 +526,55 @@ const MEDIA_CONSTANTS: &[(&str, &str)] = &[
     ),
 ];
 
+/// `CMTimeFlags`, from CMTime.h.
+const CM_TIME_VALID: u32 = 1;
+const CM_TIME_POSITIVE_INFINITY: u32 = 1 << 2;
+const CM_TIME_NEGATIVE_INFINITY: u32 = 1 << 3;
+
+/// `(symbol, value, timescale, flags)` for the `CMTime` globals, which are
+/// structs rather than objects: the symbol is the struct's own address.
+const CM_TIME_CONSTANTS: &[(&str, i64, i32, u32)] = &[
+    ("_kCMTimeInvalid", 0, 0, 0),
+    ("_kCMTimeZero", 0, 1, CM_TIME_VALID),
+    (
+        "_kCMTimePositiveInfinity",
+        0,
+        0,
+        CM_TIME_VALID | CM_TIME_POSITIVE_INFINITY,
+    ),
+    (
+        "_kCMTimeNegativeInfinity",
+        0,
+        0,
+        CM_TIME_VALID | CM_TIME_NEGATIVE_INFINITY,
+    ),
+];
+
+fn cm_time_constants() -> Vec<(String, u64)> {
+    // Built once, so the same call answers the same addresses.
+    static TIMES: std::sync::OnceLock<Vec<(String, u64)>> = std::sync::OnceLock::new();
+    TIMES
+        .get_or_init(|| {
+            CM_TIME_CONSTANTS
+                .iter()
+                .map(|&(symbol, value, timescale, flags)| {
+                    // Leaked: the guest holds the address for the life of the process.
+                    let words: &'static mut [u64; 3] = Box::leak(Box::new([
+                        value as u64,
+                        u64::from(timescale as u32) | u64::from(flags) << 32,
+                        0,
+                    ]));
+                    (symbol.to_string(), words.as_ptr() as u64)
+                })
+                .collect()
+        })
+        .clone()
+}
+
 fn media_constants() -> Vec<(String, u64)> {
-    corefoundation::base::string_globals(MEDIA_CONSTANTS)
+    let mut out = corefoundation::base::string_globals(MEDIA_CONSTANTS);
+    out.extend(cm_time_constants());
+    out
 }
 
 fn shimmed() -> Vec<(&'static str, *const ())> {

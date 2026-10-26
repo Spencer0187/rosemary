@@ -196,6 +196,7 @@ pub fn resolve(symbol: &str) -> Option<Resolved> {
         "vasprintf" => bind!("vasprintf" => printf::vasprintf),
         "asprintf" => bind!("asprintf" => printf::asprintf),
         "syslog" => bind!("syslog" => printf::syslog),
+        "asl_log" => bind!("asl_log" => printf::asl_log),
         "syslog$DARWIN_EXTSN" => bind!("syslog$DARWIN_EXTSN" => printf::syslog),
         "__vsnprintf_chk" => bind!("__vsnprintf_chk" => printf::vsnprintf_chk),
         "sscanf" => bind!("sscanf" => sscanf::sscanf),
