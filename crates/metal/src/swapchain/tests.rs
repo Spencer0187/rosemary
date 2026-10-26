@@ -2145,10 +2145,121 @@ fn failed_dma_blend_defers_or_requests_cpu_without_accepting_raw_store() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(
-        appkit::backing::dmabuf_import_refused(window),
-        "permanent import refusal did not request AppKit CPU pixels"
+        appkit::backing::dmabuf_producer_refused(window, overlays[0].view, &picture),
+        "permanent import refusal did not request this producer's CPU pixels"
+    );
+    assert!(
+        !appkit::backing::dmabuf_import_refused(window),
+        "a producer-specific refusal must not blacklist the window"
     );
     retry(&[]);
+    // The same SDL window may still import a different immutable producer,
+    // including one with no readable CPU fallback.
+    let valid_picture = real_gbm_picture_with_pixels(80, 64, |_, _| [255, 0, 0, 255]);
+    let independent = [appkit::backing::GpuOverlay {
+        view: 0x3158,
+        picture: Arc::clone(&valid_picture),
+        rect: overlays[0].rect,
+    }];
+    assert!(!appkit::backing::dmabuf_producer_refused(
+        window,
+        independent[0].view,
+        &valid_picture,
+    ));
+    retry(&independent);
+    let accepted = crate::present::backing_store_blended_for_test(window)
+        .expect("accepted independent DMA image");
+    assert_eq!(
+        read_scene_pixel(accepted.gpu, accepted.image.image, 80, 64, 40, 30),
+        [0, 0, 255, 255],
+        "different DMA producer did not reach the accepted GPU image"
+    );
+    drop(accepted);
+    crate::present::forget_backing_store_for_test(window);
+    appkit::backing::forget_window(window);
+    forget_window(window);
+    sdl3::video::destroy_window(window);
+    wait_for_test_retirements();
+}
+
+/// The ninth overlay must not disappear just because one pass has eight sets.
+#[test]
+#[cfg(target_os = "linux")]
+fn ninth_dma_overlay_cannot_be_accepted_without_its_last_pixel() {
+    if isolate_vulkan_graphical_test("ninth_dma_overlay_cannot_be_accepted_without_its_last_pixel")
+    {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none()
+        || std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none()
+    {
+        return;
+    }
+    let window = sdl3::video::create_window(c"ninth DMA overlay", 80, 64, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let mut store = appkit::backing::Store::new(80, 64);
+    store.pixels = [0, 255, 0, 255].repeat(80 * 64);
+    let red = real_gbm_picture_with_pixels(80, 64, |_, _| [0, 0, 255, 255]);
+    let blue = real_gbm_picture_with_pixels(80, 64, |_, _| [255, 0, 0, 255]);
+    let mut overlays = (0..8)
+        .map(|view| appkit::backing::GpuOverlay {
+            view,
+            picture: Arc::clone(&red),
+            rect: appkit::backing::Rect {
+                x: 0,
+                y: 0,
+                width: 80,
+                height: 64,
+            },
+        })
+        .collect::<Vec<_>>();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match crate::present::present_store_synchronous(window, &store, &[], &overlays) {
+            appkit::backing::PresentOutcome::Displayed => break,
+            appkit::backing::PresentOutcome::Deferred => {
+                assert!(
+                    Instant::now() < deadline,
+                    "eight DMA overlays never displayed"
+                );
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            other => panic!("unexpected eight-overlay result: {other:?}"),
+        }
+    }
+    let old = crate::present::backing_store_blended_for_test(window)
+        .expect("eight completed DMA overlays");
+    assert_eq!(
+        read_scene_pixel(old.gpu, old.image.image, 80, 64, 40, 30),
+        [255, 0, 0, 255]
+    );
+    overlays.push(appkit::backing::GpuOverlay {
+        view: 8,
+        picture: blue,
+        rect: overlays[0].rect,
+    });
+    let before = crate::overlay::over_capacity_blend_refusals_for_test();
+    while crate::overlay::over_capacity_blend_refusals_for_test() == before {
+        assert!(
+            Instant::now() < deadline,
+            "ninth DMA overlay was not evaluated"
+        );
+        assert_ne!(
+            crate::present::present_store_synchronous(window, &store, &[], &overlays),
+            appkit::backing::PresentOutcome::Displayed,
+            "ninth overlay was silently omitted"
+        );
+        sdl3::video::vulkan::service_surface_requests();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        read_scene_pixel(old.gpu, old.image.image, 80, 64, 40, 30),
+        [255, 0, 0, 255]
+    );
+    assert!(!appkit::backing::dmabuf_import_refused(window));
+    drop(old);
     crate::present::forget_backing_store_for_test(window);
     appkit::backing::forget_window(window);
     forget_window(window);
@@ -5326,7 +5437,11 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
     );
     // Force rejection with the same capability latch used by the real
     // Vulkan importer's invalid-modifier/format/FD path.
-    appkit::backing::refuse_dmabufs(window);
+    state.unsupported_native_dma.push(UnsupportedNativeDma {
+        id: native.id,
+        revision: native.native.as_ref().unwrap().revision,
+        producer: Arc::downgrade(native.native.as_ref().unwrap().dmabuf.as_ref().unwrap()),
+    });
     let before = NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed);
     assert_eq!(stage_native_scene_source(&mut state, &native), Ok(true));
     assert!(NATIVE_IMAGE_UPLOAD_ATTEMPTS.load(Ordering::Relaxed) > before);
@@ -11568,7 +11683,16 @@ fn rejected_linear_dma_worker_commits_original_publication() {
         }),
     };
     let base = test_opaque_metal_placement(window_id, DirectFrame::from_frame(&whole));
-    appkit::backing::refuse_dmabufs(window);
+    entry
+        .state
+        .lock()
+        .unwrap()
+        .unsupported_native_dma
+        .push(UnsupportedNativeDma {
+            id: native.id,
+            revision: native.native.as_ref().unwrap().revision,
+            producer: Arc::downgrade(native.native.as_ref().unwrap().dmabuf.as_ref().unwrap()),
+        });
     *entry.pending_scene.lock().unwrap() = Some(vec![base, native]);
     ensure_layer_compositor_worker(window_id, &entry);
     wake_compositor_worker(&entry);

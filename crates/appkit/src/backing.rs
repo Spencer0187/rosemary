@@ -434,6 +434,74 @@ pub fn dmabuf_import_refused(sdl: sdl3::Window) -> bool {
         .any(|&(window, refused)| window == sdl as usize && refused)
 }
 
+/// A rejected DMA image does not disable unrelated producers in the window.
+/// Weak identity also prevents a later replacement at the same view address
+/// from inheriting a previous producer's incompatibility.
+struct RefusedDmabufProducer {
+    window: usize,
+    view: usize,
+    picture: std::sync::Weak<Dmabuf>,
+}
+
+static REFUSED_DMABUF_PRODUCERS: Mutex<Vec<RefusedDmabufProducer>> = Mutex::new(Vec::new());
+
+pub fn dmabuf_producer_refused(
+    sdl: sdl3::Window,
+    view: usize,
+    picture: &std::sync::Arc<Dmabuf>,
+) -> bool {
+    let mut refused = REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    refused.retain(|entry| entry.picture.strong_count() > 0);
+    refused.iter().any(|entry| {
+        entry.window == sdl as usize
+            && entry.view == view
+            && entry.picture.ptr_eq(&std::sync::Arc::downgrade(picture))
+    })
+}
+
+pub fn refuse_dmabuf_producer(sdl: sdl3::Window, view: usize, picture: &std::sync::Arc<Dmabuf>) {
+    const MAX_REFUSED_PRODUCERS: usize = 256;
+    let mut refused = REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    refused.retain(|entry| entry.picture.strong_count() > 0);
+    if refused.iter().any(|entry| {
+        entry.window == sdl as usize
+            && entry.view == view
+            && entry.picture.ptr_eq(&std::sync::Arc::downgrade(picture))
+    }) {
+        return;
+    }
+    if refused.len() == MAX_REFUSED_PRODUCERS {
+        refused.remove(0);
+    }
+    refused.push(RefusedDmabufProducer {
+        window: sdl as usize,
+        view,
+        picture: std::sync::Arc::downgrade(picture),
+    });
+}
+
+/// WebKit's next CPU-frame request is restricted to its failed current image.
+/// Other view producers remain eligible for DRM/DMA negotiation.
+pub fn shows_dmabufs_for_view(sdl: sdl3::Window, view: usize) -> bool {
+    if !shows_dmabufs(sdl) {
+        return false;
+    }
+    let picture = OVERLAYS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .find(|(owner, _)| *owner == view)
+        .and_then(|(_, overlay)| match &overlay.picture {
+            Picture::Dmabuf(picture) => Some(std::sync::Arc::clone(picture)),
+            Picture::Pixels(_) => None,
+        });
+    picture.is_none_or(|picture| !dmabuf_producer_refused(sdl, view, &picture))
+}
+
 pub fn refuse_dmabufs(sdl: sdl3::Window) {
     let mut windows = GPU_WINDOWS.lock().unwrap_or_else(|e| e.into_inner());
     match windows
@@ -1092,6 +1160,10 @@ pub fn forget_window(sdl: sdl3::Window) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|(window, _)| *window != sdl as usize);
+    REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|entry| entry.window != sdl as usize);
     SURFACE_LAYERS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1121,6 +1193,10 @@ pub(crate) fn forget(view: Id) {
     // A new view may reuse this address with an identical initial generation.
     // The old underlay is never safe across that lifetime transition.
     let key = view as usize;
+    REFUSED_DMABUF_PRODUCERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|entry| entry.view != key);
     // An address may be recycled with generation zero. Evict only underlays
     // which actually read this NSView while it was alive; unrelated windows
     // retain their immutable backing images and cached upload identities.
@@ -3985,6 +4061,71 @@ mod tests {
         );
         forget(view);
         objc::arc::release(view);
+    }
+
+    #[test]
+    fn failed_dma_producer_only_disables_that_live_view_image() {
+        use std::os::fd::OwnedFd;
+        let window = 0x7d48usize as sdl3::Window;
+        let bad_view = 0x7d49usize;
+        let good_view = 0x7d50usize;
+        let picture = || {
+            std::sync::Arc::new(Dmabuf {
+                width: 2,
+                height: 2,
+                fourcc: u32::from_le_bytes(*b"AR24"),
+                modifier: 0,
+                planes: vec![DmabufPlane {
+                    fd: OwnedFd::from(std::fs::File::open("/dev/null").unwrap()),
+                    offset: 0,
+                    stride: 8,
+                }],
+            })
+        };
+        let bad = picture();
+        let good = picture();
+        GPU_WINDOWS.lock().unwrap().push((window as usize, false));
+        {
+            let mut overlays = OVERLAYS.lock().unwrap();
+            overlays.push((
+                bad_view,
+                Overlay {
+                    width: 2,
+                    height: 2,
+                    picture: Picture::Dmabuf(bad.clone()),
+                },
+            ));
+            overlays.push((
+                good_view,
+                Overlay {
+                    width: 2,
+                    height: 2,
+                    picture: Picture::Dmabuf(good.clone()),
+                },
+            ));
+        }
+        assert!(shows_dmabufs_for_view(window, bad_view));
+        refuse_dmabuf_producer(window, bad_view, &bad);
+        refuse_dmabuf_producer(window, bad_view, &bad);
+        assert!(dmabuf_producer_refused(window, bad_view, &bad));
+        assert!(!shows_dmabufs_for_view(window, bad_view));
+        assert!(shows_dmabufs_for_view(window, good_view));
+        assert!(!dmabuf_producer_refused(window, good_view, &good));
+        {
+            let mut overlays = OVERLAYS.lock().unwrap();
+            let source = overlays.iter_mut().find(|(id, _)| *id == bad_view).unwrap();
+            source.1.picture = Picture::Dmabuf(good.clone());
+        }
+        assert!(
+            shows_dmabufs_for_view(window, bad_view),
+            "a new producer on the same NSView must be eligible"
+        );
+        OVERLAYS
+            .lock()
+            .unwrap()
+            .retain(|(id, _)| *id != bad_view && *id != good_view);
+        forget_window(window);
+        assert!(!dmabuf_producer_refused(window, bad_view, &bad));
     }
 
     #[test]

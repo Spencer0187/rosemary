@@ -23,8 +23,28 @@ use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
 /// The shader's workgroup edge.
 const GROUP: u32 = 8;
 
-/// The most overlays one window blends in a frame; one descriptor set each.
+/// The most overlays in one blend pass; one descriptor set each.
 const MOST: usize = 8;
+
+#[cfg(test)]
+static TEST_TOO_MANY_OVERLAYS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn over_capacity_blend_refusals_for_test() -> usize {
+    TEST_TOO_MANY_OVERLAYS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub(crate) fn check_overlay_capacity(count: usize) -> Result<(), String> {
+    if count > MOST {
+        #[cfg(test)]
+        TEST_TOO_MANY_OVERLAYS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Err(format!(
+            "DMA blend requires {count} overlays, but this pass supports {MOST}"
+        ));
+    }
+    Ok(())
+}
 
 /// DRM fourccs the pass can sample, the Vulkan format each is read as, and
 /// whether its fourth byte is padding rather than alpha.
@@ -788,12 +808,14 @@ pub(crate) fn blend_with_store_init_owned<R: Send + 'static>(
     base: Option<StoreInit>,
     retained: R,
 ) -> Result<Vec<ImportRefusal>, String> {
+    // Never accept a partial scene: descriptor sets only cover MOST sources.
+    check_overlay_capacity(overlays.len())?;
     let pass = lease_pass(gpu)?;
     prune(gpu);
 
     let mut refused = Vec::new();
     let mut placed = Vec::new();
-    for overlay in overlays.iter().take(MOST) {
+    for overlay in overlays {
         match import(gpu, &overlay.picture) {
             Ok((image, view)) => placed.push((overlay, image, view)),
             Err((kind, reason)) => {

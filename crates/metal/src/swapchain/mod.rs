@@ -2336,12 +2336,13 @@ fn stage_native_scene_source_effective(
             return Err("native-dmabuf-import-refused".into());
         }
     }
-    if native.dmabuf.is_some()
-        && appkit::backing::dmabuf_import_refused(layer.frame.window as sdl3::Window)
+    if let Some(picture) = &native.dmabuf
+        && appkit::backing::dmabuf_producer_refused(
+            layer.frame.window as sdl3::Window,
+            layer.id,
+            picture,
+        )
     {
-        // A prior import refusal is permanent for this window, but a linear
-        // producer allocation may still be CPU-mappable. Use its *real* texels
-        // as an ordered source rather than dropping the foreground entirely.
         if let Some(cpu) = linear_dmabuf_cpu_fallback(layer) {
             return stage_native_scene_source_effective(state, &cpu);
         }

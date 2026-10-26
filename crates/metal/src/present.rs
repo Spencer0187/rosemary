@@ -1968,6 +1968,18 @@ pub(crate) fn hold_every_blended_source_for_test(
 }
 
 #[cfg(test)]
+pub(crate) fn backing_store_blended_for_test(
+    window: sdl3::Window,
+) -> Option<std::sync::Arc<crate::swapchain::BackingImageLease>> {
+    STORE_IMAGES
+        .lock()
+        .expect("store images")
+        .iter()
+        .find(|(key, _)| *key == window as usize)
+        .and_then(|(_, entry)| entry.blended.as_ref().cloned())
+}
+
+#[cfg(test)]
 pub(crate) fn backing_store_image_for_test(
     window: sdl3::Window,
 ) -> Option<(std::sync::Arc<crate::swapchain::BackingImageLease>, usize)> {
@@ -2482,6 +2494,10 @@ pub(crate) fn present_store_synchronous(
     {
         return Deferred;
     }
+    if let Err(reason) = crate::overlay::check_overlay_capacity(overlays.len()) {
+        gpu::trace_once(reason);
+        return Deferred;
+    }
     // SAFETY: the Metal framework's exported constructor, which has no
     // preconditions.
     let device = unsafe { crate::MTLCreateSystemDefaultDevice() };
@@ -2683,11 +2699,18 @@ pub(crate) fn present_store_synchronous(
         match blend_overlays(entry, overlays) {
             Ok(image) => image,
             Err(BlendFailure::Retryable) => return Deferred,
-            Err(BlendFailure::UnsupportedProducer) => {
-                // Ask AppKit to replace this producer with CPU pixels before
-                // acknowledging any store/overlay scene. A GPU-owned SDL
-                // surface cannot pretend it presented the raw CPU store.
-                appkit::backing::refuse_dmabufs(window);
+            Err(BlendFailure::UnsupportedProducer(views)) => {
+                // Only the rejected producer needs an AppKit/WebKit CPU frame.
+                // A window-wide refusal would disable unrelated GPU-only views.
+                for overlay in overlays {
+                    if views.contains(&overlay.view) {
+                        appkit::backing::refuse_dmabuf_producer(
+                            window,
+                            overlay.view,
+                            &overlay.picture,
+                        );
+                    }
+                }
                 return store_failure_outcome(window);
             }
         }
@@ -2769,23 +2792,25 @@ pub(crate) fn blend_failure_pending_for_test() -> usize {
 }
 
 /// A failed DMA blend cannot publish the underlying CPU image as complete.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum BlendFailure {
     Retryable,
-    UnsupportedProducer,
+    UnsupportedProducer(Vec<usize>),
 }
 
 fn blend_refusal(refused: &[crate::overlay::ImportRefusal]) -> Result<(), BlendFailure> {
     if refused.is_empty() {
         return Ok(());
     }
-    if refused
+    let unsupported = refused
         .iter()
-        .any(|item| item.kind == crate::overlay::ImportFailureKind::UnsupportedProducer)
-    {
-        Err(BlendFailure::UnsupportedProducer)
-    } else {
+        .filter(|item| item.kind == crate::overlay::ImportFailureKind::UnsupportedProducer)
+        .map(|item| item.producer_view)
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
         Err(BlendFailure::Retryable)
+    } else {
+        Err(BlendFailure::UnsupportedProducer(unsupported))
     }
 }
 
@@ -2798,7 +2823,11 @@ fn blend_overlays(
     #[cfg(test)]
     match TEST_BLEND_FAILURE.swap(0, std::sync::atomic::Ordering::SeqCst) {
         2 => return Err(BlendFailure::Retryable),
-        3 => return Err(BlendFailure::UnsupportedProducer),
+        3 => {
+            return Err(BlendFailure::UnsupportedProducer(
+                overlays.iter().map(|overlay| overlay.view).collect(),
+            ));
+        }
         _ => {}
     }
     let blended = entry.blended.as_ref().expect("reserved before upload");
