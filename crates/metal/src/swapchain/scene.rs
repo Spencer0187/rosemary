@@ -1375,10 +1375,17 @@ impl Swapchain {
             Group(Vec<OpacityGroup>),
         }
         let mut children: Vec<(Vec<OpacityGroup>, Vec<Child>)> = Vec::new();
+        let contributes = |placement: &ScenePlacement| {
+            placement.opacity > 0.0
+                && placement
+                    .opacity_groups
+                    .iter()
+                    .all(|group| group.opacity > 0.0)
+        };
         for placement in self
             .scene_placements
             .iter()
-            .filter(|entry| self.layers.contains(&entry.id))
+            .filter(|entry| self.layers.contains(&entry.id) && contributes(entry))
         {
             let path = &placement.opacity_groups;
             for depth in 0..path.len() {
@@ -1402,7 +1409,7 @@ impl Swapchain {
         }
         self.scene_placements
             .iter()
-            .filter(|entry| self.layers.contains(&entry.id))
+            .filter(|entry| self.layers.contains(&entry.id) && contributes(entry))
             .map(|placement| {
                 let mut path = Vec::new();
                 let mut inherited = 1.0_f32;
@@ -2012,10 +2019,11 @@ impl Swapchain {
         // A source update inside an isolated group can alter pixels anywhere
         // inside its group's overlap. Rebuild that complete group, not only
         // the incoming source rectangle.
-        let groups_present = self
-            .scene_placements
-            .iter()
-            .any(|p| !p.opacity_groups.is_empty());
+        let groups_present = self.scene_placements.iter().any(|p| {
+            p.opacity > 0.0
+                && !p.opacity_groups.is_empty()
+                && p.opacity_groups.iter().all(|group| group.opacity > 0.0)
+        });
         let damage = (!groups_present)
             .then(|| {
                 pending
@@ -2265,7 +2273,25 @@ impl Swapchain {
             }) else {
                 continue;
             };
+            // Excluded zero-alpha groups cannot draw or acquire scratch.
+            // Close any preceding visible group before moving past them.
             let effective = normalized.iter().find(|(source, _, _)| source == id);
+            if effective.is_none()
+                && self.scene_placements.iter().any(|placement| {
+                    placement.id == *id
+                        && (placement.opacity <= 0.0
+                            || placement
+                                .opacity_groups
+                                .iter()
+                                .any(|group| group.opacity <= 0.0))
+                })
+            {
+                for depth in (0..open_groups.len()).rev() {
+                    close_group(depth, &open_groups[..=depth], &mut scene_index)?;
+                }
+                open_groups.clear();
+                continue;
+            }
             let wanted = effective.map_or(&[][..], |(_, path, _)| path.as_slice());
             let unary_opacity = effective.map_or(1.0, |(_, _, alpha)| *alpha);
             let common = open_groups

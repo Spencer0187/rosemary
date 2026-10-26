@@ -3616,6 +3616,166 @@ fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
 
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn zero_alpha_sparse_six_k_groups_never_block_visible_metal_changes() {
+    if isolate_vulkan_graphical_test(
+        "zero_alpha_sparse_six_k_groups_never_block_visible_metal_changes",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (6016u32, 3384u32);
+    let window = sdl3::video::create_window(
+        c"zero alpha sparse CA group",
+        width as i32,
+        height as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let full = test_full_frame(window, width, height);
+    let tile = appkit::view::Frame {
+        x: 320,
+        y: 320,
+        width: 16,
+        height: 16,
+        ..full
+    };
+    let background = test_render_target(gpu, width, height).unwrap();
+    let colored = test_render_target(gpu, 16, 16).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, background.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, colored.image, [1., 0., 0., 1.]);
+    })
+    .unwrap();
+
+    let base = test_opaque_metal_placement(0x9000, DirectFrame::from_frame(&full));
+    let mut visible = test_opaque_metal_placement(0x9001, DirectFrame::from_frame(&tile));
+    let mut placements = vec![base.clone(), visible.clone()];
+    for depth in 0..8 {
+        let spot = appkit::view::Frame {
+            x: if depth % 2 == 0 { 0 } else { 6000 },
+            y: if depth % 2 == 0 { 0 } else { 3368 },
+            width: 16,
+            height: 16,
+            ..full
+        };
+        placements.push(ScenePlacement {
+            id: 0x9100 + depth,
+            opacity_groups: (0..=depth)
+                .map(|n| appkit::view::OpacityGroup {
+                    id: 0x9200 + n,
+                    opacity: if n == 0 { 0.0 } else { 0.5 },
+                })
+                .collect(),
+            frame: DirectFrame::from_frame(&spot),
+            opacity: 1.0,
+            opaque: true,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: None,
+        });
+    }
+    state.layers.extend(placements.iter().map(|p| p.id));
+    state.synchronize_scene(window as usize, &placements);
+    state.prepare_opacity_group_targets(0).unwrap();
+    assert!(state.group_targets.iter().all(Vec::is_empty));
+    assert_eq!(
+        state.stage_composite_source(
+            base.id,
+            &full,
+            PresentSource::from(&background),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            visible.id,
+            &tile,
+            PresentSource::from(&colored),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    for placement in placements.iter().skip(2) {
+        assert_eq!(
+            state.stage_composite_source(
+                placement.id,
+                &placement.frame.frame(),
+                PresentSource::from(&colored),
+                None,
+                &mut SourceOwner(None),
+                false,
+                true
+            ),
+            Ok(Some(true))
+        );
+    }
+    state.idle();
+    let read = |state: &Swapchain, x, y| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            x,
+            y,
+        )
+    };
+    assert_eq!(read(&state, 8, 8), [0, 255, 0, 255]);
+    assert_eq!(read(&state, 6008, 3376), [0, 255, 0, 255]);
+    assert_eq!(read(&state, 328, 328), [255, 0, 0, 255]);
+    visible.opacity = 0.5;
+    placements[1] = visible;
+    assert!(state.synchronize_scene(window as usize, &placements));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let actual = read(&state, 328, 328);
+    assert!(
+        actual[0].abs_diff(127) <= 1
+            && actual[1].abs_diff(127) <= 1
+            && actual[2] == 0
+            && actual[3] == 255,
+        "unrelated visible Metal change was blocked by zero-alpha scene: {actual:?}"
+    );
+    assert!(state.group_targets.iter().all(Vec::is_empty));
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+
+    drop(state);
+    gpu.destroy_image(colored);
+    gpu.destroy_image(background);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn two_overlapping_full_six_k_sources_inside_twenty_four_ancestors_progress() {
     if isolate_vulkan_graphical_test(
         "two_overlapping_full_six_k_sources_inside_twenty_four_ancestors_progress",
