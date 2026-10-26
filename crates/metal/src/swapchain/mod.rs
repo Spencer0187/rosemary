@@ -2359,6 +2359,10 @@ fn stage_native_scene_source(
     stage_native_scene_source_effective(state, layer).map(|identity| identity.is_some())
 }
 
+#[cfg(test)]
+static TILED_NATIVE_GPU_COPY_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 /// Stage an immutable row-banded CPU source without ever flattening its
 /// entire image in host RAM. After the first full staging upload, known dirty
 /// generations copy the previous *GPU* snapshot into a new private lease and
@@ -2408,6 +2412,14 @@ fn stage_tiled_native_source(
                 })
                 .map(|old| (Arc::clone(&old.snapshot), r))
         });
+    // At or above half-frame damage, copying the complete predecessor
+    // image only to overwrite most of it costs extra GPU bandwidth.
+    let old = old.filter(|(_, rect)| {
+        let bytes = (rect.width as u64)
+            .saturating_mul(rect.height as u64)
+            .saturating_mul(4);
+        bytes < whole_bytes / 2
+    });
     let patch = old.as_ref().map(|(_, rect)| *rect);
     let upload = patch.map_or(whole_bytes, |r| {
         (r.width as u64)
@@ -2477,6 +2489,8 @@ fn stage_tiled_native_source(
             layer_count: 1,
         };
         if let Some((source, _)) = old.as_ref() {
+            #[cfg(test)]
+            TILED_NATIVE_GPU_COPY_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let barrier = vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::GENERAL)
                 .new_layout(vk::ImageLayout::GENERAL)

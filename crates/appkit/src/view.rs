@@ -1183,12 +1183,16 @@ fn visit_metal_scene(
                             width: i64::from(width),
                             height: i64::from(height),
                         };
-                        let tiled = crate::backing::native_scene_tiled_pixels_cropped_with_damage(
-                            view,
-                            frame.width,
-                            frame.height,
-                            cropped,
-                        );
+                        let tiled = if dma.is_none() {
+                            crate::backing::native_scene_tiled_pixels_cropped_with_damage(
+                                view,
+                                frame.width,
+                                frame.height,
+                                cropped,
+                            )
+                        } else {
+                            None
+                        };
                         let cpu = if tiled.is_some() {
                             None
                         } else {

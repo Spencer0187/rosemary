@@ -294,6 +294,8 @@ pub struct NativeCpuCapture {
 
 struct NativeCapture {
     layer: usize,
+    /// Identifies the exact backing Store allocation, not merely its generation.
+    store_instance: Option<u64>,
     width: u32,
     height: u32,
     crop_x: i64,
@@ -525,7 +527,9 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
     let overlay = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
     if overlay
         .iter()
-        .any(|(id, entry)| *id == view as usize && matches!(entry.picture, Picture::Pixels(_)))
+        // Both CPU and DMA-BUF overlays require the established blended
+        // contiguous path; banded sources have no mixed-DMA stage/fallback.
+        .any(|(id, _)| *id == view as usize)
     {
         return None;
     }
@@ -682,6 +686,7 @@ fn update_plain_opaque_capture(
     let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
     let prior = captures.get_mut(&key)?;
     if !prior.plain_store
+        || prior.store_instance != Some(source.instance)
         || prior.layer != layer
         || prior.overlay_generation != overlay_generation
         || prior.ca_content_revision != ca_content_revision
@@ -2428,6 +2433,7 @@ fn native_scene_pixels_impl(
         return None;
     }
     let view_generation = source.map(Store::generation);
+    let store_instance = source.map(|src| src.instance);
     let overlay_generation = OVERLAY_REVISIONS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -2453,6 +2459,7 @@ fn native_scene_pixels_impl(
             .get(&key)
             .filter(|hit| {
                 hit.layer == layer as usize
+                    && hit.store_instance == store_instance
                     && hit.width == crop.width as u32
                     && hit.height == crop.height as u32
                     && hit.crop_x == crop.x
@@ -2480,6 +2487,7 @@ fn native_scene_pixels_impl(
         let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(prior) = captures.get_mut(&key)
             && prior.plain_store
+            && prior.store_instance == Some(src.instance)
             && prior.layer == layer as usize
             && prior.overlay_generation == overlay_generation
             && prior.ca_content_revision == ca_content_revision
@@ -2534,6 +2542,7 @@ fn native_scene_pixels_impl(
             .get(&key)
             .and_then(|prior| {
                 (prior.plain_store
+                    && prior.store_instance == Some(source.instance)
                     && prior.layer == layer as usize
                     && prior.ca_content_revision == ca_content_revision
                     && prior.ca_descendant_revision == ca_descendant_revision
@@ -2679,6 +2688,7 @@ fn native_scene_pixels_impl(
             key,
             NativeCapture {
                 layer: layer as usize,
+                store_instance,
                 width: crop.width as u32,
                 height: crop.height as u32,
                 crop_x: crop.x,
@@ -4761,6 +4771,161 @@ mod tests {
                 height: 76
             }
         );
+    }
+
+    #[test]
+    fn flat_native_capture_rejects_replaced_store_even_with_reused_generation() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        const W: usize = 128;
+        const H: usize = 128;
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: 128,
+            height: 128,
+        };
+        let mut red = Store::new(W as u32, H as u32);
+        red.pixels = [0u8, 0, 255, 255].repeat(W * H);
+        red.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, red);
+        let old = native_scene_pixels_cropped_with_damage(view, W as u32, H as u32, crop).unwrap();
+        assert_eq!(&old.0[0..4], &[0, 0, 255, 255]);
+
+        // Identical generation must not authenticate a different Store.
+        let mut blue = Store::new(W as u32, H as u32);
+        blue.pixels = [255u8, 0, 0, 255].repeat(W * H);
+        blue.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(view as usize, blue);
+        let replaced =
+            native_scene_pixels_cropped_with_damage(view, W as u32, H as u32, crop).unwrap();
+        assert_eq!(&replaced.0[0..4], &[255, 0, 0, 255]);
+        assert_ne!(old.1, replaced.1);
+        assert!(
+            replaced.2.is_none(),
+            "replaced Store cannot assert incremental provenance"
+        );
+
+        // Also replace immediately *before* a generation-2 dirty patch;
+        // otherwise the new Store's journal would authorize mixing blue
+        // backing with unrelated old red snapshot bytes.
+        let mut fresh = Store::new(W as u32, H as u32);
+        fresh.pixels = [10u8, 20, 30, 255].repeat(W * H);
+        fresh.touch(); // generation 1
+        let offset = (99 * W + 100) * 4;
+        fresh.pixels[offset..offset + 4].copy_from_slice(&[42, 55, 66, 255]);
+        fresh.touch_region(Rect {
+            x: 100,
+            y: 99,
+            width: 1,
+            height: 1,
+        }); // generation 2
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(view as usize, fresh);
+        let patched =
+            native_scene_pixels_cropped_with_damage(view, W as u32, H as u32, crop).unwrap();
+        assert_eq!(&patched.0[0..4], &[10, 20, 30, 255]);
+        assert_eq!(&patched.0[offset..offset + 4], &[42, 55, 66, 255]);
+        assert_eq!(&replaced.0[0..4], &[255, 0, 0, 255]);
+        assert!(
+            patched.2.is_none(),
+            "cross-Store damage was presented as a valid patch"
+        );
+
+        // Off-crop advancement must also reject the new Store identity.
+        let left = Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 128,
+        };
+        let first_left = native_scene_pixels_cropped_with_damage(view, 128, 128, left).unwrap();
+        let mut fourth = Store::new(W as u32, H as u32);
+        fourth.pixels = [99u8, 11, 22, 255].repeat(W * H);
+        fourth.touch();
+        fourth.pixels[(100 * W + 110) * 4] = 77;
+        fourth.touch_region(Rect {
+            x: 110,
+            y: 100,
+            width: 1,
+            height: 1,
+        });
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert(view as usize, fourth);
+        let next_left = native_scene_pixels_cropped_with_damage(view, 128, 128, left).unwrap();
+        assert_eq!(&next_left.0[0..4], &[99, 11, 22, 255]);
+        assert!(next_left.2.is_none());
+        assert_eq!(&first_left.0[0..4], &[10, 20, 30, 255]);
+        drop((old, replaced, patched, first_left, next_left));
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn mixed_dma_overlay_is_ineligible_for_row_banded_cpu_capture() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        const W: u32 = 512;
+        const H: u32 = 512;
+        let mut store = Store::new(W, H);
+        store.pixels = [255u8, 0, 0, 255].repeat((W * H) as usize);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: W as i64,
+            height: H as i64,
+        };
+        assert!(native_scene_tiled_pixels_cropped_with_damage(view, W, H, rect).is_some());
+        let dma = std::sync::Arc::new(Dmabuf {
+            width: W,
+            height: H,
+            fourcc: 0,
+            modifier: 0,
+            planes: Vec::new(),
+        });
+        set_overlay(
+            view,
+            Overlay {
+                width: W,
+                height: H,
+                picture: Picture::Dmabuf(dma),
+            },
+        );
+        assert!(native_dma_overlay(view).is_some());
+        assert!(
+            native_scene_tiled_pixels_cropped_with_damage(view, W, H, rect).is_none(),
+            "a mixed CPU/DMA source must use the original flat CPU background"
+        );
+        let cpu = native_scene_pixels_cropped_with_damage(view, W, H, rect).unwrap();
+        assert_eq!(cpu.0.len(), (W * H * 4) as usize);
+        assert_eq!(&cpu.0[..4], &[255, 0, 0, 255]);
+        remove_overlay(view);
+        assert!(native_scene_tiled_pixels_cropped_with_damage(view, W, H, rect).is_some());
+        forget(view);
+        objc::arc::release(view);
     }
 
     #[test]

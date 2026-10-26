@@ -6231,13 +6231,15 @@ fn immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image() {
     );
     state.synchronize_scene(window as usize, &[second.clone()]);
     assert_eq!(stage_native_scene_source(&mut state, &second), Ok(true));
-    let accepted = &state
-        .scene_layers
-        .iter()
-        .find(|item| item.id == second.id)
-        .unwrap()
-        .snapshot;
-    assert!(!Arc::ptr_eq(accepted, &old_gpu));
+    let accepted = Arc::clone(
+        &state
+            .scene_layers
+            .iter()
+            .find(|item| item.id == second.id)
+            .unwrap()
+            .snapshot,
+    );
+    assert!(!Arc::ptr_eq(&accepted, &old_gpu));
     assert_eq!(
         read_scene_pixel(gpu, accepted.image.image, width, height, 77, 40),
         [255, 0, 0, 255],
@@ -6267,6 +6269,58 @@ fn immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image() {
         [0, 0, 255, 255],
         "new scene did not present dirty CPU texel (RGBA accumulator)"
     );
+    let copied_after_small_patch = TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed);
+    assert!(
+        copied_after_small_patch > 0,
+        "small edit did not use GPU prior-frame copy"
+    );
+    let full_pixels = [0u8, 255, 0, 255].repeat((width * height) as usize);
+    let full = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &full_pixels).unwrap(),
+    );
+    let full_damage = appkit::backing::NativeCpuDamage {
+        from_revision: second.native.as_ref().unwrap().revision,
+        rect: appkit::backing::Rect {
+            x: 0,
+            y: 0,
+            width: width as i64,
+            height: height as i64,
+        },
+    };
+    let third = make(full, Some(full_damage));
+    let second_gpu = Arc::clone(&accepted);
+    state.synchronize_scene(window as usize, &[third.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &third), Ok(true));
+    assert_eq!(
+        TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed),
+        copied_after_small_patch,
+        "complete source replacement copied old GPU image unnecessarily"
+    );
+    let latest = &state
+        .scene_layers
+        .iter()
+        .find(|i| i.id == third.id)
+        .unwrap()
+        .snapshot;
+    assert_eq!(
+        read_scene_pixel(gpu, latest.image.image, width, height, 77, 40),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, latest.image.image, width, height, 7, 8),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, second_gpu.image.image, width, height, 77, 40),
+        [255, 0, 0, 255],
+        "old GPU image mutated during full replacement"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, old_gpu.image.image, width, height, 77, 40),
+        [0, 0, 255, 255],
+        "initial GPU image mutated during full replacement"
+    );
+    drop(second_gpu);
     drop(old_gpu);
     drop(state);
     sdl3::video::destroy_window(window);
