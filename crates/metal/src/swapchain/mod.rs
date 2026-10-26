@@ -1844,22 +1844,6 @@ fn uses_layer_compositor(mode: vk::PresentModeKHR) -> bool {
     )
 }
 
-/// FIFO image pacing can wait briefly for the next scanout. IMMEDIATE and
-/// MAILBOX must poll: the older non-FIFO presenter did not wait for a WSI
-/// image, and a 20ms acquire turns that backpressure into worker stalls.
-fn compositor_acquire_waits(mode: vk::PresentModeKHR, timeouts: u32) -> bool {
-    // Benchmark only: compare the previous all-mode bounded acquire with
-    // nonblocking IMMEDIATE/MAILBOX on the same WSI surface.
-    #[cfg(test)]
-    if std::env::var_os("ROSEMARY_BENCH_BLOCKING_ACQUIRE").is_some() {
-        return timeouts == 0;
-    }
-    matches!(
-        mode,
-        vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
-    ) && timeouts == 0
-}
-
 /// Bound source-copy work independently of WSI's own image count. A guest
 /// drawing multiple layers per frame should not wait for each WSI image.
 fn frame_slots(_mode: vk::PresentModeKHR) -> usize {
@@ -1867,8 +1851,6 @@ fn frame_slots(_mode: vk::PresentModeKHR) -> usize {
 }
 
 /// In immediate mode the compositor publishes promptly, while FIFO's longer
-/// A window with the corners pass still goes through its composite at
-/// present time; a direct layer only skips the accumulator stage.
 /// window batch gathers a full refresh's independent layer changes. Neither
 /// timer changes the guest's command-buffer ordering or source completion.
 fn compositor_batch_delay(mode: vk::PresentModeKHR, rate: f32) -> Duration {
@@ -1885,17 +1867,8 @@ fn compositor_batch_delay(mode: vk::PresentModeKHR, rate: f32) -> Duration {
 
 /// Only a full-window opaque drawable with a retained lifetime may bypass
 /// offscreen composition. FIFO retains its previous batching behavior.
-/// How many layers presenting `layer` directly would have to account for.
-/// The window's CPU store lies below every Metal layer, so it cannot show
-/// through a drawable that covers the window with no regions cut out of it.
-fn composited_layers(swapchain: &Swapchain, layer: usize) -> usize {
-    swapchain
-        .layers
-        .iter()
-        .filter(|&&known| layer == swapchain.window || known != swapchain.window)
-        .count()
-}
-
+/// A window with the corners pass still goes through its composite at
+/// present time; a direct layer only skips the accumulator stage.
 fn fast_direct_layer(
     mode: vk::PresentModeKHR,
     layers: usize,
@@ -1910,6 +1883,17 @@ fn fast_direct_layer(
         && frame.covers_window()
         && regions.is_none()
         && owned
+}
+
+/// How many layers presenting `layer` directly would have to account for.
+/// The window's CPU store lies below every Metal layer, so it cannot show
+/// through a drawable that covers the window with no regions cut out of it.
+fn composited_layers(swapchain: &Swapchain, layer: usize) -> usize {
+    swapchain
+        .layers
+        .iter()
+        .filter(|&&known| layer == swapchain.window || known != swapchain.window)
+        .count()
 }
 
 /// Effective CA state is a hard eligibility requirement for bypassing the
@@ -3625,7 +3609,6 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
         let prepared = state.prepare_composite(window as sdl3::Window);
         let typed_device_loss = state.last_wsi_error.take() == Some(vk::Result::ERROR_DEVICE_LOST);
         let gpu = state.gpu;
-        let mode = state.present_mode;
         drop(state);
         let prepared = match prepared {
             Ok(prepared) => prepared,
@@ -3662,7 +3645,10 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             .take();
         #[cfg(not(test))]
         let injected: Option<vk::Result> = None;
-        let wait = compositor_acquire_waits(mode, acquire_timeouts);
+        // Every mode waits for its image. Polling MAILBOX with a backoff let
+        // the retry miss the image's release, so frames were superseded
+        // before they reached WSI.
+        let wait = acquire_timeouts == 0;
         let acquired = match injected {
             Some(error) => CompositorAcquire::Terminal(error),
             None => {
@@ -3692,7 +3678,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
             // time out indefinitely, and every producer needs that lock.
             acquire_timeouts = acquire_timeouts.saturating_add(1);
             drop(_presenting);
-            std::thread::park_timeout(compositor_acquire_retry_delay(mode, acquire_timeouts));
+            std::thread::park_timeout(compositor_acquire_backoff(acquire_timeouts));
             continue;
         }
         acquire_timeouts = 0;
@@ -5461,24 +5447,6 @@ unsafe fn keep_top_left(
 /// acquisition in a row that found no image.
 fn compositor_acquire_backoff(timeouts: u32) -> Duration {
     Duration::from_millis(1 << timeouts.saturating_sub(1).min(5))
-}
-
-/// Avoid an idle spin, but retry low-latency WSI modes promptly while the
-/// display is temporarily full. Prolonged starvation eventually uses the
-/// same capped backoff as FIFO (e.g. a minimized window).
-fn compositor_acquire_retry_delay(mode: vk::PresentModeKHR, timeouts: u32) -> Duration {
-    if matches!(
-        mode,
-        vk::PresentModeKHR::IMMEDIATE | vk::PresentModeKHR::MAILBOX
-    ) {
-        match timeouts {
-            1..=3 => Duration::from_micros(500),
-            4..=6 => Duration::from_millis(1),
-            _ => compositor_acquire_backoff(timeouts - 5),
-        }
-    } else {
-        compositor_acquire_backoff(timeouts)
-    }
 }
 
 fn classify_compositor_acquire(outcome: Result<(u32, bool), vk::Result>) -> CompositorAcquire {

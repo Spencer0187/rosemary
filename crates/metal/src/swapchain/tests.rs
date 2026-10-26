@@ -12975,12 +12975,7 @@ fn benchmark_live_immediate_acquisition_policy() {
     let dirty = state.composite_dirty;
     drop(state);
     eprintln!(
-        "LIVE_WSI_BENCH policy={} selected_mode={mode:?} guest_updates={updates} deferred={deferred} wsi_publishes={submitted} elapsed_ms={:.2} dirty={dirty}",
-        if std::env::var_os("ROSEMARY_BENCH_BLOCKING_ACQUIRE").is_some() {
-            "bounded-wait"
-        } else {
-            "nonblocking"
-        },
+        "LIVE_WSI_BENCH selected_mode={mode:?} guest_updates={updates} deferred={deferred} wsi_publishes={submitted} elapsed_ms={:.2} dirty={dirty}",
         elapsed.as_secs_f64() * 1000.
     );
     crate::stats::tick();
@@ -12990,55 +12985,6 @@ fn benchmark_live_immediate_acquisition_policy() {
         gpu.destroy_image(image);
     }
     sdl3::video::destroy_window(window);
-}
-
-#[test]
-fn wsi_acquisition_pacing_is_mode_specific_and_starvation_is_bounded() {
-    for mode in [vk::PresentModeKHR::IMMEDIATE, vk::PresentModeKHR::MAILBOX] {
-        for timeouts in [0, 1, 6, 64] {
-            assert!(
-                !compositor_acquire_waits(mode, timeouts),
-                "{mode:?} unexpectedly waits inside vkAcquireNextImageKHR"
-            );
-        }
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 1),
-            Duration::from_micros(500)
-        );
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 3),
-            Duration::from_micros(500)
-        );
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 4),
-            Duration::from_millis(1)
-        );
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 6),
-            Duration::from_millis(1)
-        );
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 7),
-            Duration::from_millis(2)
-        );
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 100),
-            Duration::from_millis(32)
-        );
-    }
-    for mode in [vk::PresentModeKHR::FIFO, vk::PresentModeKHR::FIFO_RELAXED] {
-        assert!(compositor_acquire_waits(mode, 0));
-        assert!(!compositor_acquire_waits(mode, 1));
-        assert!(!compositor_acquire_waits(mode, 100));
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 1),
-            Duration::from_millis(1)
-        );
-        assert_eq!(
-            compositor_acquire_retry_delay(mode, 8),
-            Duration::from_millis(32)
-        );
-    }
 }
 
 #[test]
