@@ -3547,7 +3547,7 @@ fn twenty_four_nested_groups_fit_in_small_window_without_depth_refusal() {
         128,
         96,
         24,
-        false,
+        true, // A tiny GPU workload need not overlap with its predecessor.
         (0, 0),
         false,
         false,
