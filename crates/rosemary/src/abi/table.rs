@@ -377,6 +377,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("CFArrayRemoveValueAtIndex", V, P, I64),
     sig!("CFArrayRemoveAllValues", V, P),
     sig!("CFArrayExchangeValuesAtIndices", V, P, I64, I64),
+    cbsig!([3], "CFArraySortValues", V, P, I64, I64, P, P),
     sig!("CFArrayGetCount", I64, P),
     sig!("CFArrayGetTypeID", U64),
     sig!("CFArrayGetValueAtIndex", P, P, I64),
@@ -1738,6 +1739,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("asinf", F32, F32),
     sig!("asinh", F64, F64),
     sig!("asinhf", F32, F32),
+    vsig!("asl_log", I32, P, P, I32, P),
     vsig!("asprintf", I32, P, P),
     sig!("atan", F64, F64),
     sig!("atan2", F64, F64, F64),
@@ -4337,6 +4339,7 @@ mod tests {
         // these declare more arguments than the prototype has, deliberately.
         const SPLIT_AGGREGATES: &[&str] = &[
             "CFArrayApplyFunction",
+            "CFArraySortValues",
             "CFDataDeleteBytes",
             "CFDataReplaceBytes",
             "CFStringGetBytes",
