@@ -1367,6 +1367,34 @@ impl Swapchain {
     // An isolation boundary matters only if it must composite two distinct
     // immediate children. Through a unary chain, alpha can be forwarded to
     // its only child without any intermediate target or changed paint order.
+    // Only sources with a nonempty viewport/rectangular-clip intersection
+    // participate in CA isolation. Use the same bounds for scratch sizing.
+    fn visible_scene_bounds(&self, placement: &ScenePlacement) -> Option<Region> {
+        let frame = placement.frame.frame();
+        let mut x0 = i64::from(frame.x).max(0);
+        let mut y0 = i64::from(frame.y).max(0);
+        let mut x1 =
+            (i64::from(frame.x) + i64::from(frame.width)).min(i64::from(self.extent.width));
+        let mut y1 =
+            (i64::from(frame.y) + i64::from(frame.height)).min(i64::from(self.extent.height));
+        if let Some(clip) = placement.clip {
+            let clip = clip.frame();
+            x0 = x0.max(i64::from(clip.x));
+            y0 = y0.max(i64::from(clip.y));
+            x1 = x1.min(i64::from(clip.x) + i64::from(clip.width));
+            y1 = y1.min(i64::from(clip.y) + i64::from(clip.height));
+        }
+        if x1 <= x0 || y1 <= y0 || x1 > i64::from(i32::MAX) || y1 > i64::from(i32::MAX) {
+            return None;
+        }
+        Some(Region {
+            x: x0 as i32,
+            y: y0 as i32,
+            width: (x1 - x0) as i32,
+            height: (y1 - y0) as i32,
+        })
+    }
+
     pub(super) fn normalized_opacity_paths(
         &self,
     ) -> Vec<(usize, Vec<appkit::view::OpacityGroup>, f32)> {
@@ -1388,6 +1416,7 @@ impl Swapchain {
                     .opacity_groups
                     .iter()
                     .all(|group| group.opacity > 0.0)
+                && self.visible_scene_bounds(placement).is_some()
         };
         for placement in self
             .scene_placements
@@ -1451,33 +1480,8 @@ impl Swapchain {
             if path.is_empty() {
                 continue;
             }
-            let frame = placement.frame.frame();
-            let mut x0 = i64::from(frame.x).max(0);
-            let mut y0 = i64::from(frame.y).max(0);
-            let mut x1 =
-                (i64::from(frame.x) + i64::from(frame.width)).min(i64::from(self.extent.width));
-            let mut y1 =
-                (i64::from(frame.y) + i64::from(frame.height)).min(i64::from(self.extent.height));
-            if let Some(clip) = placement.clip {
-                let clip = clip.frame();
-                x0 = x0.max(i64::from(clip.x));
-                y0 = y0.max(i64::from(clip.y));
-                x1 = x1.min(i64::from(clip.x) + i64::from(clip.width));
-                y1 = y1.min(i64::from(clip.y) + i64::from(clip.height));
-            }
-            if x1 <= x0 || y1 <= y0 {
+            let Some(region) = self.visible_scene_bounds(placement) else {
                 continue;
-            }
-            // Coordinates are physical VkExtent2D values. Reject dimensions
-            // outside the compute shader's signed coordinate representation.
-            if x1 > i64::from(i32::MAX) || y1 > i64::from(i32::MAX) {
-                continue;
-            }
-            let region = Region {
-                x: x0 as i32,
-                y: y0 as i32,
-                width: (x1 - x0) as i32,
-                height: (y1 - y0) as i32,
             };
             let mut key = Vec::with_capacity(path.len());
             for depth in 0..path.len() {

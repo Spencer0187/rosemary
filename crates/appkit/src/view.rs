@@ -211,6 +211,12 @@ static METAL_VIEW_SCENE_DIRTY: std::sync::atomic::AtomicBool =
 /// SDL window identities are published without borrowing NSViews. Targeted
 /// AppKit changes only recapture the affected window; unresolved reparenting
 /// still goes through the process-wide fallback flag above.
+// Swapchain initialization can occur after an otherwise unchanged AppKit
+// publication. Replay only the registered window on its owner thread.
+static METAL_SCENE_REPLAY_WINDOWS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashSet<usize>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
 static METAL_VIEW_DIRTY_WINDOWS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashSet<usize>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
@@ -351,6 +357,25 @@ pub(crate) fn invalidate_metal_scene_for_window(sdl: sdl3::Window) {
         .expect("view dirty windows")
         .insert(sdl as usize);
     METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// Request from the Vulkan initializer. No AppKit/NSView state is read on
+/// that thread; the next video pump recaptures and publishes even if identical.
+pub fn request_metal_scene_replay(sdl: sdl3::Window) {
+    if sdl.is_null()
+        || !METAL_SCENES
+            .lock()
+            .expect("AppKit scene snapshots")
+            .as_ref()
+            .is_some_and(|scenes| scenes.contains_key(&(sdl as usize)))
+    {
+        return;
+    }
+    METAL_SCENE_REPLAY_WINDOWS
+        .lock()
+        .expect("Metal swapchain replay requests")
+        .insert(sdl as usize);
+    invalidate_metal_scene_for_window(sdl);
 }
 
 /// Ordinary view setters run in AppKit's owner context. Never dereference an
@@ -495,12 +520,17 @@ pub(crate) fn flush_metal_scenes() {
             return;
         }
     }
+    let replay = std::mem::take(
+        &mut *METAL_SCENE_REPLAY_WINDOWS
+            .lock()
+            .expect("Metal swapchain replay requests"),
+    );
     let dirty = METAL_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
     let damage = METAL_CA_DAMAGE.swap(false, std::sync::atomic::Ordering::AcqRel);
     let view_dirty = METAL_VIEW_SCENE_DIRTY.swap(false, std::sync::atomic::Ordering::AcqRel);
     let targeted =
         std::mem::take(&mut *METAL_VIEW_DIRTY_WINDOWS.lock().expect("view dirty windows"));
-    if (damage || view_dirty || !targeted.is_empty()) && !dirty {
+    if (damage || view_dirty || !targeted.is_empty() || !replay.is_empty()) && !dirty {
         if damage {
             METAL_CA_DAMAGE.store(true, std::sync::atomic::Ordering::Release);
         }
@@ -511,6 +541,10 @@ pub(crate) fn flush_metal_scenes() {
             .lock()
             .expect("view dirty windows")
             .extend(targeted.iter().copied());
+        METAL_SCENE_REPLAY_WINDOWS
+            .lock()
+            .expect("Metal swapchain replay requests")
+            .extend(replay.iter().copied());
         METAL_SCENE_DIRTY.store(true, std::sync::atomic::Ordering::Release);
     }
     if !dirty && !animating && !was_animating {
@@ -558,6 +592,7 @@ pub(crate) fn flush_metal_scenes() {
     // Unknown lifecycle owners and unscoped CA damage conservatively fan out.
     let global = damage || view_dirty || unknown;
     affected.extend(targeted);
+    affected.extend(replay.iter().copied());
     for window in crate::window::all() {
         let sdl = unsafe { crate::window::sdl_window(window) };
         if sdl.is_null() {
@@ -579,7 +614,7 @@ pub(crate) fn flush_metal_scenes() {
                 .push(sdl as usize);
             crate::backing::damage_view(crate::window::content_view_of(window));
         }
-        publish_metal_scene_at(sdl, now);
+        publish_metal_scene_at(sdl, now, replay.contains(&(sdl as usize)));
     }
 }
 
@@ -1252,7 +1287,7 @@ fn intersect_scene_clips(a: Frame, b: Frame) -> Frame {
     }
 }
 
-fn publish_metal_scene_at(sdl: sdl3::Window, now: f64) {
+fn publish_metal_scene_at(sdl: sdl3::Window, now: f64, force: bool) {
     debug_assert!(sdl3::video::is_video_thread());
     let (scene, roots) = capture_metal_scene(sdl, now).unwrap_or_default();
     capture_surface_poll_owners(sdl);
@@ -1271,7 +1306,7 @@ fn publish_metal_scene_at(sdl: sdl3::Window, now: f64) {
     let differs = changed
         .as_ref()
         .is_none_or(|old| !same_metal_scene(old, &scene));
-    if differs {
+    if differs || force {
         if let Some(hook) = METAL_SCENE_CHANGED.get() {
             hook(sdl, scene);
         }
@@ -1301,6 +1336,10 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
 }
 
 pub fn forget_metal_scene(sdl: sdl3::Window) {
+    METAL_SCENE_REPLAY_WINDOWS
+        .lock()
+        .expect("Metal swapchain replay requests")
+        .remove(&(sdl as usize));
     let old = METAL_SURFACE_POLL_OWNERS
         .lock()
         .expect("Metal IOSurface owner registry")

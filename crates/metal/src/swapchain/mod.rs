@@ -1406,6 +1406,7 @@ fn present_impl(
                 if !current || cancelled.load(Ordering::Acquire) {
                     return;
                 }
+                let mut registered = false;
                 let device_lost_on_init = result
                     .as_ref()
                     .err()
@@ -1423,6 +1424,7 @@ fn present_impl(
                             .max(30.0);
                         swapchain.compositor_batch_delay =
                             compositor_batch_delay(swapchain.present_mode, rate);
+                        registered = true;
                         registry.get_or_insert_with(HashMap::new).insert(
                             window,
                             Arc::new(WindowSwapchain {
@@ -1467,6 +1469,12 @@ fn present_impl(
                     }
                 }
                 drop(registry);
+                // The earlier AppKit scene publication may have happened
+                // before the swapchain existed. Queue an owner-thread replay:
+                // it must still pass the compositor's native staging gate.
+                if registered {
+                    appkit::view::request_metal_scene_replay(window as sdl3::Window);
+                }
                 if device_lost_on_init {
                     // The failed Swapchain::create already released its
                     // VkSurface. Mark SDL's transferred request terminal

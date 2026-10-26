@@ -3606,6 +3606,195 @@ fn full_six_k_unary_twenty_four_level_ca_chain_makes_progress_without_scratch() 
 
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn offscreen_previously_admitted_six_k_source_does_not_force_nested_isolation() {
+    if isolate_vulkan_graphical_test(
+        "offscreen_previously_admitted_six_k_source_does_not_force_nested_isolation",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (6016u32, 3384u32);
+    let window =
+        sdl3::video::create_window(c"offscreen nested CA", width as i32, height as i32, 0).unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let full = test_full_frame(window, width, height);
+    let green = test_render_target(gpu, width, height).unwrap();
+    let red = test_render_target(gpu, width, height).unwrap();
+    let blue = test_render_target(gpu, width, height).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, green.image, [0., 1., 0., 1.]);
+        cmd_test_clear_color(device, cb, red.image, [0., 0., 1., 1.]);
+        cmd_test_clear_color(device, cb, blue.image, [1., 0., 0., 1.]);
+    })
+    .unwrap();
+    let base = test_opaque_metal_placement(0x8310, DirectFrame::from_frame(&full));
+    let groups = (0..24)
+        .map(|n| appkit::view::OpacityGroup {
+            id: 0x9000 + n,
+            opacity: 0.98,
+        })
+        .collect::<Vec<_>>();
+    let mut first = test_opaque_metal_placement(0x8311, DirectFrame::from_frame(&full));
+    first.opacity_groups = groups.clone();
+    let mut second = test_opaque_metal_placement(0x8312, DirectFrame::from_frame(&full));
+    second.opacity_groups = groups;
+    state.layers.extend([base.id, first.id, second.id]);
+    state.synchronize_scene(
+        window as usize,
+        &[base.clone(), first.clone(), second.clone()],
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            base.id,
+            &full,
+            PresentSource::from(&green),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            first.id,
+            &full,
+            PresentSource::from(&red),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    assert_eq!(
+        state.stage_composite_source(
+            second.id,
+            &full,
+            PresentSource::from(&blue),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    state.idle();
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|s| s.id == first.id && s.ready)
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|s| s.id == second.id && s.ready)
+    );
+    // All 24 ancestors contain two visible sources initially, but only one
+    // isolation scratch depth is required after unary folding.
+    assert_eq!(
+        state
+            .normalized_opacity_paths()
+            .iter()
+            .filter(|(id, _, _)| *id == first.id || *id == second.id)
+            .count(),
+        2
+    );
+    let mut moved = second.clone();
+    moved.frame = DirectFrame::from_frame(&appkit::view::Frame {
+        x: width as i32 + 10,
+        ..full
+    });
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[base.clone(), first.clone(), moved.clone()]
+    ));
+    let normalized = state.normalized_opacity_paths();
+    assert_eq!(
+        normalized
+            .iter()
+            .filter(|(id, _, _)| *id == second.id)
+            .count(),
+        0
+    );
+    let visible = normalized
+        .iter()
+        .find(|(id, _, _)| *id == first.id)
+        .unwrap();
+    assert!(
+        visible.1.is_empty(),
+        "offscreen source kept 24 isolation boundaries"
+    );
+    state.prepare_opacity_group_targets(0).unwrap();
+    assert!(
+        state.group_targets[0].is_empty(),
+        "offscreen source allocated group scratch"
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let sample = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        width,
+        height,
+        500,
+        400,
+    );
+    assert!(
+        sample[0] <= 1 && sample[2] > 100 && sample[1] > 30,
+        "visible red source did not recompose over green: {sample:?}"
+    );
+    // The same is true if the source is on-screen but its clipping boundary
+    // is entirely outside the viewport, without new drawable submission.
+    let mut clipped = second;
+    clipped.clip = Some(DirectFrame::from_frame(&appkit::view::Frame {
+        x: width as i32 + 20,
+        y: 0,
+        width: 32,
+        height: 32,
+        ..full
+    }));
+    assert!(state.synchronize_scene(window as usize, &[base, first, clipped]));
+    assert!(
+        state
+            .normalized_opacity_paths()
+            .iter()
+            .all(|(id, _, _)| *id != moved.id)
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(state.scene_gpu_bytes() <= 512 * 1024 * 1024);
+    drop(state);
+    for image in [green, red, blue] {
+        gpu.destroy_image(image);
+    }
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
     if isolate_vulkan_graphical_test(
         "irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress",
@@ -14324,6 +14513,188 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
 
 /// A non-NSView CALayer descendant must paint above the retained Metal
 /// drawable and move without any subsequent guest Metal frame submission.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn static_native_foreground_published_before_swapchain_init_replays_on_first_present() {
+    if isolate_vulkan_graphical_test(
+        "static_native_foreground_published_before_swapchain_init_replays_on_first_present",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let _retire_guard = AwaitTestWindowRetirements;
+    crate::bootstrap();
+    let pool = objc::arc::pool_push();
+    use foundation::geometry::{NSPoint, NSRect, NSSize};
+    use objc::object::Id;
+    let rect = |x, y, width, height| NSRect {
+        origin: NSPoint { x, y },
+        size: NSSize { width, height },
+    };
+    let window = objc::object::create_instance(
+        objc::class::lookup(c"NSWindow").unwrap(),
+        appkit::window::INSTANCE_SIZE,
+    );
+    let initialize: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect, usize, usize, u8) -> Id =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    assert_eq!(
+        unsafe {
+            initialize(
+                window,
+                objc::sel::get("initWithContentRect:styleMask:backing:defer:"),
+                rect(0., 0., 120., 90.),
+                0,
+                0,
+                0,
+            )
+        },
+        window
+    );
+    let make_view = |frame: NSRect| {
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let init: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { init(view, objc::sel::get("initWithFrame:"), frame) }
+    };
+    let make_layer = |class: &str| {
+        let cls = objc::class::lookup(std::ffi::CString::new(class).unwrap().as_c_str()).unwrap();
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { make(cls as *const _ as Id, objc::sel::get("layer")) }
+    };
+    let content = make_view(rect(0., 0., 120., 90.));
+    let metal_view = make_view(rect(0., 0., 120., 90.));
+    let native = make_view(rect(13., 12., 24., 20.));
+    let metal_layer = make_layer("CAMetalLayer");
+    let native_layer = make_layer("CALayer");
+    let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let red = unsafe { appkit::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+    unsafe {
+        set(window, objc::sel::get("setContentView:"), content);
+        set(metal_view, objc::sel::get("setLayer:"), metal_layer);
+        set(native, objc::sel::get("setLayer:"), native_layer);
+        set(
+            native_layer,
+            objc::sel::get("setBackgroundColor:"),
+            red as Id,
+        );
+        set(content, objc::sel::get("addSubview:"), metal_view);
+        set(content, objc::sel::get("addSubview:"), native);
+    }
+    let sdl = unsafe { appkit::window::sdl_window(window) };
+    appkit::event::pump(std::ptr::null_mut());
+    let published = appkit::view::metal_scene(sdl).unwrap();
+    let native_item = published
+        .iter()
+        .find(|item| item.native_owner == native as usize)
+        .expect("static native foreground must be published before Vulkan init");
+    assert!(native_item.native_pixels.is_some());
+    assert!(
+        SWAPCHAINS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_none_or(|registry| !registry.contains_key(&(sdl as usize)))
+    );
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let source = test_render_target(gpu, 120, 90).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, source.image, [0., 1., 0., 1.]);
+    })
+    .unwrap();
+    let physical = test_full_frame(sdl, 120, 90);
+    // The initializer runs independently. No setters or calls to publish
+    // the foreground follow this first guest drawable.
+    let _ = present(gpu, metal_layer as usize, &physical, &source, &[]);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let entry = loop {
+        appkit::event::pump(std::ptr::null_mut());
+        if let Some(entry) = SWAPCHAINS
+            .lock()
+            .unwrap()
+            .as_ref()
+            .and_then(|all| all.get(&(sdl as usize)).cloned())
+        {
+            break entry;
+        }
+        assert!(Instant::now() < deadline, "swapchain never initialized");
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    // The owner thread consumes the initializer's targeted replay request.
+    for _ in 0..4 {
+        appkit::event::pump(std::ptr::null_mut());
+    }
+    let _ = present(gpu, metal_layer as usize, &physical, &source, &[]);
+    ensure_layer_compositor_worker(sdl as usize, &entry);
+    wake_compositor_worker(&entry);
+    loop {
+        appkit::event::pump(std::ptr::null_mut());
+        {
+            let mut state = entry.state.lock().unwrap();
+            let ready = state.scene_layers.iter().any(|layer| {
+                layer.id == native_item.layer
+                    && layer.ready
+                    && layer.native_published_revision.is_some()
+            });
+            if ready
+                && entry.pending_scene.lock().unwrap().is_none()
+                && state.composite.is_some()
+                && !state.scene_restore_pending
+            {
+                state.idle();
+                let image = state.composite.as_ref().unwrap().image;
+                // Readback returns raw texel bytes; the negotiated target
+                // may store red first (RGBA) or blue first (BGRA).
+                let red_pixel = match state.composite.as_ref().unwrap().format {
+                    vk::Format::R8G8B8A8_UNORM | vk::Format::R8G8B8A8_SRGB => [255, 0, 0, 255],
+                    vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => [0, 0, 255, 255],
+                    other => panic!("unexpected compositor format {other:?}"),
+                };
+                let red = read_scene_pixel(gpu, image, 120, 90, 20, 65);
+                let green = read_scene_pixel(gpu, image, 120, 90, 70, 30);
+                assert_eq!(
+                    red, red_pixel,
+                    "pre-initialization static native view remained missing"
+                );
+                assert_eq!(
+                    green,
+                    [0, 255, 0, 255],
+                    "native replay displaced the underlying Metal drawable"
+                );
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "native foreground never staged from pre-swapchain publication"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    TEST_WINDOW_RETIRED.store(0, Ordering::Release);
+    forget_window(sdl);
+    drop(entry);
+    sdl3::video::destroy_window(sdl);
+    let teardown_deadline = Instant::now() + Duration::from_secs(5);
+    while TEST_WINDOW_RETIRED.load(Ordering::Acquire) != sdl as usize {
+        assert!(
+            Instant::now() < teardown_deadline,
+            "retired WSI workers must stop"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    sdl3::video::vulkan::service_surface_requests();
+    gpu.destroy_image(source);
+    objc::arc::pool_pop(pool);
+}
+
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable() {
