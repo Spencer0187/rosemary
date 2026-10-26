@@ -2246,6 +2246,18 @@ fn forget_window(window: sdl3::Window) {
 }
 
 #[cfg(test)]
+pub(crate) fn store_upload_completed_outcome_for_test(
+    window: sdl3::Window,
+) -> Option<appkit::backing::PresentOutcome> {
+    let all = STORE_UPLOADS.lock().expect("store workers");
+    let worker = all.get(&(window as usize))?;
+    let state = worker.state.lock().expect("store job");
+    (!state.busy && state.pending.is_none())
+        .then(|| state.completed.as_ref().map(|(_, outcome)| *outcome))
+        .flatten()
+}
+
+#[cfg(test)]
 pub(crate) fn test_has_store_upload_worker(window: sdl3::Window) -> bool {
     STORE_UPLOADS
         .lock()
@@ -2565,12 +2577,28 @@ pub(crate) fn present_store_synchronous(
     let blend_available = if overlays.is_empty() {
         false
     } else {
-        match entry.reserve_blended_source() {
+        #[cfg(test)]
+        let injected_allocation = TEST_BLEND_FAILURE
+            .compare_exchange(
+                1,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        #[cfg(not(test))]
+        let injected_allocation = false;
+        let reserve = if injected_allocation {
+            Err("injected blended-image allocation failure".into())
+        } else {
+            entry.reserve_blended_source()
+        };
+        match reserve {
             Ok(true) => true,
             Ok(false) => return Deferred,
             Err(reason) => {
                 gpu::trace(format!("no image to blend overlays into: {reason}"));
-                false // Recoverable allocation failure: show raw store this frame.
+                return Deferred; // An incomplete DMA composite cannot be accepted.
             }
         }
     };
@@ -2652,7 +2680,17 @@ pub(crate) fn present_store_synchronous(
         return store_failure_outcome(window);
     }
     let shown = if blend_available {
-        blend_overlays(window, entry, overlays)
+        match blend_overlays(entry, overlays) {
+            Ok(image) => image,
+            Err(BlendFailure::Retryable) => return Deferred,
+            Err(BlendFailure::UnsupportedProducer) => {
+                // Ask AppKit to replace this producer with CPU pixels before
+                // acknowledging any store/overlay scene. A GPU-owned SDL
+                // surface cannot pretend it presented the raw CPU store.
+                appkit::backing::refuse_dmabufs(window);
+                return store_failure_outcome(window);
+            }
+        }
     } else {
         std::sync::Arc::clone(&entry.image)
     };
@@ -2708,15 +2746,63 @@ pub(crate) fn present_store_synchronous(
     presented
 }
 
+#[cfg(test)]
+static TEST_ACCEPTED_DMA_BLENDS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn accepted_dma_blends_for_test() -> usize {
+    TEST_ACCEPTED_DMA_BLENDS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+static TEST_BLEND_FAILURE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn inject_blend_failure_for_test(mode: usize) {
+    TEST_BLEND_FAILURE.store(mode, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(crate) fn blend_failure_pending_for_test() -> usize {
+    TEST_BLEND_FAILURE.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// A failed DMA blend cannot publish the underlying CPU image as complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlendFailure {
+    Retryable,
+    UnsupportedProducer,
+}
+
+fn blend_refusal(refused: &[crate::overlay::ImportRefusal]) -> Result<(), BlendFailure> {
+    if refused.is_empty() {
+        return Ok(());
+    }
+    if refused
+        .iter()
+        .any(|item| item.kind == crate::overlay::ImportFailureKind::UnsupportedProducer)
+    {
+        Err(BlendFailure::UnsupportedProducer)
+    } else {
+        Err(BlendFailure::Retryable)
+    }
+}
+
 /// Blend into the source reserved before the backing-store upload. Only
 /// call this after `reserve_blended_source` succeeds while STORE_IMAGES is held.
 fn blend_overlays(
-    _window: sdl3::Window,
     entry: &mut StoreImage,
     overlays: &[appkit::backing::GpuOverlay],
-) -> std::sync::Arc<crate::swapchain::BackingImageLease> {
+) -> Result<std::sync::Arc<crate::swapchain::BackingImageLease>, BlendFailure> {
+    #[cfg(test)]
+    match TEST_BLEND_FAILURE.swap(0, std::sync::atomic::Ordering::SeqCst) {
+        2 => return Err(BlendFailure::Retryable),
+        3 => return Err(BlendFailure::UnsupportedProducer),
+        _ => {}
+    }
     let blended = entry.blended.as_ref().expect("reserved before upload");
-    match crate::overlay::blend_with_store_init_owned(
+    let refusals = crate::overlay::blend_with_store_init_owned(
         entry.gpu,
         &entry.image,
         &blended.image,
@@ -2726,20 +2812,18 @@ fn blend_overlays(
             std::sync::Arc::clone(&entry.image),
             std::sync::Arc::clone(blended),
         ),
-    ) {
-        Ok(refused) => {
-            if !refused.is_empty() {
-                // Incomplete blending is not a reason to blacklist later
-                // unrelated DMA producers. Preserve the existing CPU store.
-                return std::sync::Arc::clone(&entry.image);
-            }
-            std::sync::Arc::clone(blended)
-        }
-        Err(reason) => {
-            gpu::trace(format!("blending overlays failed: {reason}"));
-            std::sync::Arc::clone(&entry.image)
-        }
+    )
+    .map_err(|reason| {
+        gpu::trace(format!("blending overlays failed: {reason}"));
+        BlendFailure::Retryable
+    })?;
+    for refused in &refusals {
+        gpu::trace(format!("DMA overlay import refused: {}", refused.reason));
     }
+    blend_refusal(&refusals)?;
+    #[cfg(test)]
+    TEST_ACCEPTED_DMA_BLENDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(std::sync::Arc::clone(blended))
 }
 
 #[cfg(test)]

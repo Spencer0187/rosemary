@@ -1866,7 +1866,7 @@ fn backing_store_uploads_select_direct_wsi_without_overwriting_inflight_source()
 /// overlay fallback copy and refusal contract without requiring an exporter;
 /// importing an actual foreign buffer needs separate supported-host coverage.
 #[test]
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
     if isolate_vulkan_graphical_test(
         "backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite",
@@ -1878,7 +1878,9 @@ fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
         _ => return,
     };
-    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none()
+        || std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none()
+    {
         return;
     }
     let window = sdl3::video::create_window(c"direct GPU overlay store", 160, 120, 0)
@@ -1889,13 +1891,7 @@ fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
     store.pixels.fill(42);
     let overlays = [appkit::backing::GpuOverlay {
         view: 0,
-        picture: Arc::new(appkit::backing::Dmabuf {
-            width: 160,
-            height: 120,
-            fourcc: u32::from_le_bytes(*b"AR24"),
-            modifier: 0,
-            planes: Vec::new(),
-        }),
+        picture: real_gbm_picture_with_pixels(160, 120, |_, _| [0, 0, 255, 255]),
         rect: appkit::backing::Rect {
             x: 0,
             y: 0,
@@ -2009,6 +2005,152 @@ fn backing_store_with_gpu_overlay_uses_direct_wsi_without_extra_composite() {
     drop(entry);
     crate::present::forget_backing_store_for_test(window);
     appkit::backing::forget_window(window); // Clear the deliberate DMA-BUF refusal.
+    forget_window(window);
+    sdl3::video::destroy_window(window);
+    wait_for_test_retirements();
+}
+
+/// A failed DMA blend cannot publish the raw CPU backing as a complete frame.
+#[test]
+#[cfg(target_os = "linux")]
+fn failed_dma_blend_defers_or_requests_cpu_without_accepting_raw_store() {
+    if isolate_vulkan_graphical_test(
+        "failed_dma_blend_defers_or_requests_cpu_without_accepting_raw_store",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none()
+        || std::env::var_os("ROSEMARY_TEST_GBM_DMA").is_none()
+    {
+        return;
+    }
+    let window = sdl3::video::create_window(c"DMA blend rollback", 80, 64, 0)
+        .expect("SDL Vulkan overlay fixture");
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).expect("SDL snapshot");
+    let mut store = appkit::backing::Store::new(80, 64);
+    for pixel in store.pixels.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[0, 255, 0, 255]);
+    }
+    let picture = real_gbm_picture_with_pixels(80, 64, |_, _| [0, 0, 255, 255]);
+    let overlays = [appkit::backing::GpuOverlay {
+        picture: Arc::clone(&picture),
+        view: 0x3157,
+        rect: appkit::backing::Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 64,
+        },
+    }];
+    let retry = |overlays: &[appkit::backing::GpuOverlay]| {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        loop {
+            match crate::present::present_store_synchronous(window, &store, &[], overlays) {
+                appkit::backing::PresentOutcome::Displayed => break,
+                appkit::backing::PresentOutcome::Deferred => {
+                    assert!(Instant::now() < deadline, "Vulkan store never admitted");
+                    sdl3::video::vulkan::service_surface_requests();
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                other => panic!("unexpected outcome: {other:?}"),
+            }
+        }
+    };
+    retry(&[]);
+    for fault in [1, 2] {
+        crate::present::inject_blend_failure_for_test(fault);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while crate::present::blend_failure_pending_for_test() != 0 {
+            assert!(Instant::now() < deadline, "blend fault never reached");
+            assert_ne!(
+                crate::present::present_store_synchronous(window, &store, &[], &overlays),
+                appkit::backing::PresentOutcome::Displayed,
+                "incomplete DMA overlay acknowledged as displayed"
+            );
+            sdl3::video::vulkan::service_surface_requests();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !appkit::backing::dmabuf_import_refused(window),
+            "temporary failure permanently disabled DMA-BUF capability"
+        );
+        retry(&overlays);
+    }
+    // The asynchronous worker must not cache a failed submission as the
+    // accepted overlay snapshot. A subsequent identical job must retry.
+    let accepted_before = crate::present::accepted_dma_blends_for_test();
+    crate::present::inject_blend_failure_for_test(2);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while crate::present::blend_failure_pending_for_test() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "async DMA fault was never exercised"
+        );
+        assert_ne!(
+            crate::present::present_store(window, &store, &[], &overlays),
+            appkit::backing::PresentOutcome::Displayed
+        );
+        sdl3::video::vulkan::service_surface_requests();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    while crate::present::store_upload_completed_outcome_for_test(window).is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "async store worker never completed"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // The store worker retries a transient Vulkan deferral internally for
+    // up to 250ms. A Displayed completion is valid only after a later full
+    // overlay blend actually succeeds; the failed attempt alone cannot count.
+    assert_eq!(
+        crate::present::store_upload_completed_outcome_for_test(window),
+        Some(appkit::backing::PresentOutcome::Displayed)
+    );
+    assert!(
+        crate::present::accepted_dma_blends_for_test() > accepted_before,
+        "worker accepted the raw store without completing any DMA blend"
+    );
+    // No change to CPU generation, producer allocation or overlay placement.
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        match crate::present::present_store(window, &store, &[], &overlays) {
+            appkit::backing::PresentOutcome::Displayed => break,
+            appkit::backing::PresentOutcome::Deferred
+            | appkit::backing::PresentOutcome::DisplayedEarlier => {
+                assert!(
+                    Instant::now() < deadline,
+                    "unchanged DMA source never retried"
+                );
+                sdl3::video::vulkan::service_surface_requests();
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            other => panic!("DMA retry worker returned {other:?}"),
+        }
+    }
+    crate::present::inject_blend_failure_for_test(3);
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while crate::present::blend_failure_pending_for_test() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "permanent refusal never reached importer"
+        );
+        assert_ne!(
+            crate::present::present_store_synchronous(window, &store, &[], &overlays),
+            appkit::backing::PresentOutcome::Displayed,
+            "permanent DMA refusal acknowledged an incomplete frame"
+        );
+        sdl3::video::vulkan::service_surface_requests();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(
+        appkit::backing::dmabuf_import_refused(window),
+        "permanent import refusal did not request AppKit CPU pixels"
+    );
+    retry(&[]);
+    crate::present::forget_backing_store_for_test(window);
+    appkit::backing::forget_window(window);
     forget_window(window);
     sdl3::video::destroy_window(window);
     wait_for_test_retirements();
