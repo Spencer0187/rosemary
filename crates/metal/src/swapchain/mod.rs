@@ -256,6 +256,9 @@ struct Swapchain {
     transaction_retiring_bytes: u64,
     scene_placements: Vec<ScenePlacement>,
     scene_blender: Option<SceneBlender>,
+    /// Fence-slot-local isolated Core Animation group targets. Never shared
+    /// across in-flight GPU command buffers.
+    group_targets: Vec<Vec<Arc<BackingImageLease>>>,
     /// The previous layer's frame is needed when its contents must first be
     /// captured out of a single-layer accumulator when another layer joins.
     scene_frames: Vec<(usize, DirectFrame)>,
@@ -556,6 +559,7 @@ pub(crate) fn scene_changed(window: sdl3::Window, visible: Vec<appkit::view::Met
     let ordered = visible
         .into_iter()
         .map(|layer| ScenePlacement {
+            opacity_groups: layer.opacity_groups,
             id: layer.layer,
             frame: DirectFrame::from_frame(&layer.frame),
             opacity: layer.opacity,
@@ -1560,6 +1564,7 @@ fn present_impl(
         scene
             .into_iter()
             .map(|item| ScenePlacement {
+                opacity_groups: item.opacity_groups,
                 id: item.layer,
                 frame: DirectFrame::from_frame(&item.frame),
                 opacity: item.opacity,
@@ -1882,6 +1887,7 @@ fn fast_direct_scene(
             .iter()
             .any(|p| p.id != layer && p.native.is_some())
         && swapchain.scene_opacity(layer) >= 1.0
+        && !swapchain.scene_has_opacity_groups(layer)
         && swapchain.scene_opaque(layer)
         && swapchain.scene_rounded(layer).is_empty()
         && swapchain
@@ -3874,6 +3880,7 @@ impl Swapchain {
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         let staged = (|| -> Result<(), String> {
+            self.prepare_opacity_group_targets(slot)?;
             // SAFETY: this command buffer's fence has completed, and all images
             // remain in GENERAL for copies between guest layers.
             unsafe {
@@ -4392,6 +4399,7 @@ impl Swapchain {
             transaction_retiring_bytes: 0,
             scene_placements: Vec::new(),
             scene_blender: None,
+            group_targets: (0..FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
             scene_frames: Vec::new(),
             scene_repaint_needed: false,
             scene_restore_pending: false,
@@ -4723,6 +4731,19 @@ impl Swapchain {
     /// and say whether there was one.
     fn retire_copied(&mut self) -> bool {
         let mut retired = false;
+        // Direct WSI may resume after CA group opacity disappears.
+        // Retire optional GPU targets only after their command fence signals.
+        if !self
+            .scene_placements
+            .iter()
+            .any(|p| !p.opacity_groups.is_empty())
+        {
+            for (index, frame) in self.frames.iter().enumerate() {
+                if !frame.submitted || self.gpu.fence_signaled(frame.done).unwrap_or(false) {
+                    self.group_targets[index].clear();
+                }
+            }
+        }
         for frame in &mut self.frames {
             if (frame.source.is_none() && frame.backing.is_none() && frame.scene_reads.is_empty())
                 || !frame.submitted

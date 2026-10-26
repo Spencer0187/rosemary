@@ -1830,7 +1830,7 @@ pub fn native_scene_pixels_cropped(
     height: u32,
     crop: Rect,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    native_scene_pixels_impl(view, width, height, crop, false, &[])
+    native_scene_pixels_impl(view, width, height, crop, false, &[], &[])
 }
 
 #[cfg(test)]
@@ -1840,7 +1840,7 @@ pub(crate) fn metal_sublayers_pixels_cropped(
     height: u32,
     crop: Rect,
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    native_scene_pixels_impl(view, width, height, crop, true, &[])
+    native_scene_pixels_impl(view, width, height, crop, true, &[], &[])
 }
 
 pub(crate) fn metal_sublayers_segment_pixels_cropped(
@@ -1849,8 +1849,9 @@ pub(crate) fn metal_sublayers_segment_pixels_cropped(
     height: u32,
     crop: Rect,
     selected: &[usize],
+    gpu_groups: &[usize],
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
-    native_scene_pixels_impl(view, width, height, crop, true, selected)
+    native_scene_pixels_impl(view, width, height, crop, true, selected, gpu_groups)
 }
 
 fn native_scene_pixels_impl(
@@ -1860,6 +1861,7 @@ fn native_scene_pixels_impl(
     crop: Rect,
     metal_children: bool,
     selected: &[usize],
+    gpu_groups: &[usize],
 ) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
     if (!metal_children
         && (crop.x < 0
@@ -1875,6 +1877,7 @@ fn native_scene_pixels_impl(
     let selection_hash = if metal_children {
         let mut hash = std::collections::hash_map::DefaultHasher::new();
         selected.hash(&mut hash);
+        gpu_groups.hash(&mut hash);
         hash.finish()
     } else {
         0
@@ -2093,6 +2096,7 @@ fn native_scene_pixels_impl(
                 logical,
                 whole,
                 selected,
+                gpu_groups,
             );
         } else {
             render_with_root_opacity(

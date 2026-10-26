@@ -96,9 +96,17 @@ pub struct RoundedSceneClip {
     pub radius: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OpacityGroup {
+    /// A Core Animation tree identity, captured on AppKit's video thread.
+    pub id: usize,
+    pub opacity: f32,
+}
+
 #[derive(Clone)]
 pub struct MetalSceneLayer {
     pub layer: usize,
+    pub opacity_groups: Vec<OpacityGroup>,
     pub frame: Frame,
     pub opacity: f32,
     pub opaque: bool,
@@ -650,6 +658,7 @@ fn capture_metal_scene(
         std::ptr::null_mut(),
         std::ptr::null_mut(),
         &[],
+        &[],
         now,
         0,
     );
@@ -680,9 +689,11 @@ fn capture_metal_subtree_segment(
     view: Id,
     frame: Frame,
     selected: &[usize],
+    isolated_group_ids: &[usize],
     ca_clip: Option<Frame>,
     rounded: &[RoundedSceneClip],
     opacity: f32,
+    opacity_groups: &[OpacityGroup],
     tile: &mut u32,
     scene: &mut Vec<MetalSceneLayer>,
 ) {
@@ -743,8 +754,10 @@ fn capture_metal_subtree_segment(
                 frame.height,
                 crop,
                 selected,
+                isolated_group_ids,
             ) {
                 scene.push(MetalSceneLayer {
+                    opacity_groups: opacity_groups.to_vec(),
                     layer: native_tile_id(view, *tile),
                     native_owner: view as usize,
                     frame: part,
@@ -778,6 +791,7 @@ fn visit_metal_scene(
     parent_layer: Id,
     parent_view: Id,
     inherited_rounded: &[RoundedSceneClip],
+    inherited_groups: &[OpacityGroup],
     now: f64,
     depth: usize,
 ) {
@@ -791,12 +805,39 @@ fn visit_metal_scene(
     let (hidden, own_layer_opacity) = if layer.is_null() {
         (false, 1.0)
     } else {
-        crate::coreanimation::scene_properties_below(layer, parent_layer, now)
+        let excluded_ids = inherited_groups
+            .iter()
+            .map(|group| group.id)
+            .collect::<Vec<_>>();
+        crate::coreanimation::scene_properties_below_excluding(
+            layer,
+            parent_layer,
+            now,
+            &excluded_ids,
+        )
     };
     if hidden {
         return;
     }
-    let layer_opacity = inherited_layer_opacity * own_layer_opacity;
+    let has_isolated_metal_group = !layer.is_null()
+        && crate::layer::is_metal(layer)
+        && own_layer_opacity > 0.0
+        && own_layer_opacity < 1.0
+        && (crate::coreanimation::has_renderable_sublayers(layer)
+            || !unsafe { children(view) }.is_empty());
+    let mut opacity_groups = inherited_groups.to_vec();
+    if has_isolated_metal_group {
+        opacity_groups.push(OpacityGroup {
+            id: layer as usize,
+            opacity: own_layer_opacity,
+        });
+    }
+    let layer_opacity = inherited_layer_opacity
+        * if has_isolated_metal_group {
+            1.0
+        } else {
+            own_layer_opacity
+        };
     let has_ca_mask = !layer.is_null() && crate::coreanimation::scene_masks_to_bounds(layer);
     let current_masks = view_of(view).layer_backing & CLIPS_TO_BOUNDS != 0 || has_ca_mask;
     let own_frame = current_masks
@@ -850,6 +891,7 @@ fn visit_metal_scene(
         if let Some(frame) = unsafe { presentation_frame(view) } {
             if frame.window == window {
                 scene.push(MetalSceneLayer {
+                    opacity_groups: opacity_groups.clone(),
                     layer: layer as usize,
                     frame,
                     opacity: (effective_alpha(view) as f32) * layer_opacity,
@@ -896,24 +938,31 @@ fn visit_metal_scene(
             })
             .collect();
         let layer_ids = backed.iter().map(|entry| entry.0).collect::<Vec<_>>();
-        let paint = crate::coreanimation::metal_paint_steps(layer, &layer_ids);
+        let paint = crate::coreanimation::metal_paint_steps(layer, &layer_ids, now);
         let mut tile = 0u32;
         for step in paint {
             match step {
-                crate::coreanimation::MetalPaintStep::Native(selected) => {
+                crate::coreanimation::MetalPaintStep::Native { selected, groups } => {
+                    let mut combined = opacity_groups.clone();
+                    combined.extend(groups.iter().copied());
+                    let isolated_ids = groups.iter().map(|g| g.id).collect::<Vec<_>>();
                     capture_metal_subtree_segment(
                         view,
                         frame,
                         &selected,
+                        &isolated_ids,
                         ca_clip,
                         &rounded,
                         (effective_alpha(view) as f32) * layer_opacity,
+                        &combined,
                         &mut tile,
                         scene,
                     );
                 }
-                crate::coreanimation::MetalPaintStep::View(id) => {
+                crate::coreanimation::MetalPaintStep::View { id, groups } => {
                     if let Some((_, child)) = backed.iter().find(|entry| entry.0 == id) {
+                        let mut combined = opacity_groups.clone();
+                        combined.extend(groups.iter().copied());
                         ca_visited.insert(*child as usize);
                         visit_metal_scene(
                             *child,
@@ -926,6 +975,7 @@ fn visit_metal_scene(
                             layer,
                             view,
                             &rounded,
+                            &combined,
                             now,
                             depth + 1,
                         );
@@ -1027,6 +1077,7 @@ fn visit_metal_scene(
                                         ^ (u64::from(x) << 32 | u64::from(y)).rotate_left(37)
                                 });
                             scene.push(MetalSceneLayer {
+                                opacity_groups: opacity_groups.clone(),
                                 layer: native_tile_id(view, index),
                                 native_owner: view as usize,
                                 frame: part,
@@ -1068,6 +1119,7 @@ fn visit_metal_scene(
                 if layer.is_null() { parent_layer } else { layer },
                 if layer.is_null() { parent_view } else { view },
                 &rounded,
+                &opacity_groups,
                 now,
                 depth + 1,
             );
@@ -1120,6 +1172,7 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(a, b)| {
             a.layer == b.layer
+                && a.opacity_groups == b.opacity_groups
                 && a.frame == b.frame
                 && a.opacity == b.opacity
                 && a.opaque == b.opaque
@@ -4208,7 +4261,13 @@ mod tests {
         }
         flush_metal_scenes();
         let faded = metal_scene(sdl).unwrap();
-        assert!((faded[1].opacity - 0.5).abs() < 0.001);
+        let group = [OpacityGroup {
+            id: metal as usize,
+            opacity: 0.5,
+        }];
+        assert_eq!(faded[0].opacity_groups, group);
+        assert_eq!(faded[1].opacity_groups, group);
+        assert_eq!(faded[1].opacity, 1.0);
         assert_eq!(faded[1].native_revision, changed.native_revision);
         // Descendant opacity modifies CPU pixels, unlike Metal root opacity.
         unsafe {
@@ -4454,6 +4513,183 @@ mod tests {
         assert_eq!(
             verify(&[metal_view as usize, blue_view as usize]),
             vec![vec![0, 0, 255, 255], vec![255, 0, 0, 255]]
+        );
+        objc::arc::release(window);
+    }
+
+    #[test]
+    fn interleaved_view_and_native_children_share_one_isolated_ca_opacity_group() {
+        crate::bootstrap();
+        if !sdl3::may_pump() {
+            return;
+        }
+        let window = objc::object::create_instance(objc::class::lookup(c"NSWindow").unwrap(), 0);
+        if !unsafe {
+            crate::window::init_with_content_rect_for_tests(window, rect(0., 0., 100., 80.))
+        } {
+            return;
+        }
+        let sdl = unsafe { crate::window::sdl_window(window) };
+        let content = view(rect(0., 0., 100., 80.));
+        let metal_view = view(rect(0., 0., 100., 80.));
+        let blue_view = view(rect(10., 10., 20., 20.));
+        let metal_class = objc::class::lookup(c"CAMetalLayer").unwrap();
+        let ca_class = objc::class::lookup(c"CALayer").unwrap();
+        let create: unsafe extern "C" fn(Id, objc::sel::Sel) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let metal = unsafe { create(metal_class as *const _ as Id, objc::sel::get("layer")) };
+        let wrap = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let a = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let b = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let c = unsafe { create(ca_class as *const _ as Id, objc::sel::get("layer")) };
+        let set: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_frame: unsafe extern "C" fn(Id, objc::sel::Sel, NSRect) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let rgba = |r, g, bl| unsafe { crate::cgcontext::CGColorCreateGenericRGB(r, g, bl, 1.) };
+        let (red, blue, green) = (rgba(1., 0., 0.), rgba(0., 0., 1.), rgba(0., 1., 0.));
+        unsafe {
+            set(window, objc::sel::get("setContentView:"), content);
+            set(metal_view, objc::sel::get("setLayer:"), metal);
+            set(blue_view, objc::sel::get("setLayer:"), b);
+            set(content, objc::sel::get("addSubview:"), metal_view);
+            set(metal_view, objc::sel::get("addSubview:"), blue_view);
+            set_frame(wrap, objc::sel::get("setFrame:"), rect(0., 0., 100., 80.));
+            for layer in [a, b, c] {
+                set_frame(layer, objc::sel::get("setFrame:"), rect(10., 10., 20., 20.));
+            }
+            set(a, objc::sel::get("setBackgroundColor:"), red as Id);
+            set(b, objc::sel::get("setBackgroundColor:"), blue as Id);
+            set(c, objc::sel::get("setBackgroundColor:"), green as Id);
+            set(metal, objc::sel::get("addSublayer:"), wrap);
+            for child in [a, b, c] {
+                set(wrap, objc::sel::get("addSublayer:"), child);
+            }
+            crate::coreanimation::set_opacity_for_test(wrap, 0.5);
+        }
+        let capture = || {
+            flush_metal_scenes();
+            metal_scene(sdl).unwrap()
+        };
+        let scene = capture();
+        assert_eq!(scene.len(), 4, "A/B/C must remain independent sources");
+        assert_eq!(scene[0].layer, metal as usize);
+        let path = [OpacityGroup {
+            id: wrap as usize,
+            opacity: 0.5,
+        }];
+        for part in &scene[1..] {
+            assert_eq!(part.opacity_groups, path);
+            assert_eq!(part.opacity, 1.0, "container alpha was applied per source");
+        }
+        assert_eq!(
+            scene
+                .iter()
+                .skip(1)
+                .map(|p| p.native_owner)
+                .collect::<Vec<_>>(),
+            [metal_view as usize, blue_view as usize, metal_view as usize]
+        );
+        for native in [1, 2, 3] {
+            let pixel = scene[native]
+                .native_pixels
+                .as_ref()
+                .unwrap()
+                .chunks_exact(4)
+                .find(|px| px[3] != 0)
+                .unwrap();
+            assert_eq!(pixel[3], 255, "CPU capture premultiplied GPU group alpha");
+        }
+        unsafe {
+            crate::coreanimation::set_opacity_for_test(wrap, 0.25);
+        }
+        let quarter = capture();
+        assert!(quarter[1..].iter().all(|p| p.opacity_groups
+            == [OpacityGroup {
+                id: wrap as usize,
+                opacity: 0.25
+            }]
+            && p.opacity == 1.0));
+        // A live CABasicAnimation changes the shared isolation-group alpha
+        // without altering any individual source opacity or guest Metal pixel.
+        let animation_class =
+            objc::class::ptr(objc::class::lookup(c"CABasicAnimation").unwrap()) as Id;
+        let key = foundation::string::from_str("opacity");
+        let make: unsafe extern "C" fn(Id, objc::sel::Sel, Id) -> Id =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let anim = unsafe {
+            make(
+                animation_class,
+                objc::sel::get("animationWithKeyPath:"),
+                key,
+            )
+        };
+        let number = |v| {
+            corefoundation::collections::new_number(corefoundation::collections::Number::Float(v))
+                as Id
+        };
+        let (from, to) = (number(0.2), number(0.8));
+        let set_obj: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let set_duration: unsafe extern "C" fn(Id, objc::sel::Sel, f64) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        let add: unsafe extern "C" fn(Id, objc::sel::Sel, Id, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            set_obj(anim, objc::sel::get("setFromValue:"), from);
+            set_obj(anim, objc::sel::get("setToValue:"), to);
+            set_duration(anim, objc::sel::get("setDuration:"), 0.18);
+            add(wrap, objc::sel::get("addAnimation:forKey:"), anim, key);
+        }
+        let initial = capture();
+        let start_alpha = initial[1].opacity_groups[0].opacity;
+        std::thread::sleep(std::time::Duration::from_millis(48));
+        let animated = capture();
+        let next_alpha = animated[1].opacity_groups[0].opacity;
+        assert!(
+            next_alpha > start_alpha + 0.08,
+            "independently retained children failed to track animated group opacity"
+        );
+        assert!(animated[1..].iter().all(|source| source.opacity_groups
+            == [OpacityGroup {
+                id: wrap as usize,
+                opacity: next_alpha
+            }]
+            && source.opacity == 1.0));
+        std::thread::sleep(std::time::Duration::from_millis(190));
+        assert!((capture()[1].opacity_groups[0].opacity - 0.25).abs() < 0.001);
+        let remove: unsafe extern "C" fn(Id, objc::sel::Sel, Id) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { remove(wrap, objc::sel::get("removeAnimationForKey:"), key) };
+        for object in [key, from, to] {
+            objc::arc::release(object);
+        }
+
+        let insert: unsafe extern "C" fn(Id, objc::sel::Sel, Id, u32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            insert(wrap, objc::sel::get("insertSublayer:atIndex:"), a, 2);
+        }
+        let reordered = capture();
+        assert_eq!(
+            reordered
+                .iter()
+                .skip(1)
+                .map(|p| p.native_owner)
+                .collect::<Vec<_>>(),
+            [blue_view as usize, metal_view as usize]
+        );
+        let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe {
+            hidden(a, objc::sel::get("setHidden:"), 1);
+        }
+        let fewer = capture();
+        assert_eq!(fewer.len(), reordered.len());
+        assert_ne!(
+            fewer.last().unwrap().native_pixels.as_ref().unwrap(),
+            reordered.last().unwrap().native_pixels.as_ref().unwrap(),
+            "hidden top child kept its previous opaque CPU content"
         );
         objc::arc::release(window);
     }
@@ -5805,6 +6041,7 @@ mod tests {
     #[test]
     fn moved_static_dma_source_sampling_must_invalidate_identical_output_frame() {
         let mut old = MetalSceneLayer {
+            opacity_groups: Vec::new(),
             layer: 7,
             frame: Frame {
                 window: std::ptr::null_mut(),

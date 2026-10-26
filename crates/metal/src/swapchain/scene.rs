@@ -733,6 +733,7 @@ pub(super) struct NativeCpuSceneSource {
 
 #[derive(Clone)]
 pub(super) struct ScenePlacement {
+    pub opacity_groups: Vec<appkit::view::OpacityGroup>,
     pub id: usize,
     pub frame: DirectFrame,
     pub opacity: f32,
@@ -898,6 +899,7 @@ impl Swapchain {
         self.layers.push(id);
         self.scene_frames.push((id, frame));
         self.scene_placements.push(ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame,
             opacity: 1.0,
@@ -996,6 +998,7 @@ impl Swapchain {
             let old = self.scene_placements.iter().find(|p| p.id == id);
             if live.iter().find(|p| p.id == id).is_some_and(|p| {
                 p.opacity < 1.0
+                    || !p.opacity_groups.is_empty()
                     || !p.opaque
                     || !p.rounded.is_empty()
                     || p.occluded.as_ref().is_some_and(|r| !r.is_empty())
@@ -1029,6 +1032,7 @@ impl Swapchain {
                         != old.native.as_ref().map(|n| n.revision)
             }) || new.is_some_and(|p| {
                 p.opacity < 1.0
+                    || !p.opacity_groups.is_empty()
                     || !p.opaque
                     || !p.rounded.is_empty()
                     || p.occluded.as_ref().is_some_and(|r| !r.is_empty())
@@ -1038,6 +1042,12 @@ impl Swapchain {
                 changed = true;
             }
         }
+        changed |= live.iter().any(|incoming| {
+            self.scene_placements
+                .iter()
+                .find(|old| old.id == incoming.id)
+                .is_some_and(|old| old.opacity_groups != incoming.opacity_groups)
+        });
         self.layers = ordered;
         self.scene_placements = live.to_vec();
         if self
@@ -1178,6 +1188,12 @@ impl Swapchain {
             .find(|entry| entry.id == id)
             .map_or(1.0, |entry| entry.opacity)
     }
+    pub(super) fn scene_has_opacity_groups(&self, id: usize) -> bool {
+        self.scene_placements
+            .iter()
+            .find(|entry| entry.id == id)
+            .is_some_and(|entry| !entry.opacity_groups.is_empty())
+    }
 
     /// Count distinct *owned* GPU images, not Arc references: copies held by
     /// the current scene and submitted frame leases refer to one allocation.
@@ -1198,6 +1214,11 @@ impl Swapchain {
         }
         for base in &self.native_cpu_bases {
             count(&base.image);
+        }
+        for slot in &self.group_targets {
+            for target in slot {
+                count(target);
+            }
         }
         for pinned in &self.transaction_pinned {
             count(pinned);
@@ -1251,6 +1272,11 @@ impl Swapchain {
         for current in &self.scene_layers {
             count(&current.snapshot);
         }
+        for slot in &self.group_targets {
+            for target in slot {
+                count(target);
+            }
+        }
         for prior in &self.transaction_pinned {
             count(prior);
         }
@@ -1270,11 +1296,18 @@ impl Swapchain {
     /// This is the non-evictable set; a new native source which cannot fit
     /// alongside it will not become stageable by polling fences or sleeping.
     pub(super) fn committed_scene_bytes(&self) -> u64 {
+        let group_bytes = self
+            .group_targets
+            .iter()
+            .flatten()
+            .map(|target| scene_image_bytes(PresentSource::from(&target.image)))
+            .sum::<u64>();
         self.scene_layers
             .iter()
             .filter(|layer| layer.ready)
             .map(|layer| scene_image_bytes(PresentSource::from(&layer.snapshot.image)))
             .sum::<u64>()
+            .saturating_add(group_bytes)
             .saturating_add(
                 self.composite
                     .as_ref()
@@ -1296,6 +1329,73 @@ impl Swapchain {
     pub(super) fn shed_scene_spares(&mut self) {
         self.native_cpu_bases.clear();
         self.shed_scene_snapshot_spares();
+    }
+
+    fn opacity_group_descriptor_count(&self) -> Result<usize, String> {
+        let group_closures = self
+            .scene_placements
+            .iter()
+            .try_fold(0usize, |total, source| {
+                total.checked_add(source.opacity_groups.len())
+            })
+            .ok_or("CA group descriptor count overflow")?;
+        self.layers
+            .len()
+            .checked_add(group_closures)
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| "CA group descriptor count overflow".to_string())
+    }
+
+    pub(super) fn prepare_opacity_group_targets(&mut self, slot: usize) -> Result<(), String> {
+        const MAX_GROUP_DEPTH: usize = 16;
+        let depth = self
+            .scene_placements
+            .iter()
+            .map(|p| p.opacity_groups.len())
+            .max()
+            .unwrap_or(0);
+        if depth > MAX_GROUP_DEPTH {
+            return Err("Core Animation group nesting exceeds compositor limit".into());
+        }
+        if depth == 0 {
+            self.group_targets[slot].clear();
+            return Ok(());
+        }
+        {
+            let description = Self::composite_description(self.format, self.extent, false);
+            // This fence slot has retired. Old-size group scratch cannot be
+            // sampled or written after a swapchain extent/format rebuild.
+            self.group_targets[slot].retain(|target| {
+                (target.image.width, target.image.height, target.image.format)
+                    == (description.width, description.height, description.format)
+            });
+            while self.group_targets[slot].len() < depth {
+                let bytes = scene_image_bytes(PresentSource {
+                    image: vk::Image::null(),
+                    width: description.width,
+                    height: description.height,
+                    format: description.format,
+                });
+                if !fits_scene_budget(self.budgeted_scene_bytes(), bytes) {
+                    self.shed_scene_spares();
+                    if !fits_scene_budget(self.budgeted_scene_bytes(), bytes) {
+                        return Err(
+                            "Core Animation opacity group exceeds retained scene budget".into()
+                        );
+                    }
+                }
+                let target =
+                    BackingImageLease::create_for_window(self.gpu, self.window, &description)?;
+                self.group_targets[slot].push(target);
+            }
+            self.group_targets[slot].truncate(depth);
+        }
+        let needed = self.opacity_group_descriptor_count()?;
+        self.scene_blender
+            .as_mut()
+            .ok_or("scene blend pipeline missing")?
+            .reserve_layers(needed)?;
+        Ok(())
     }
 
     /// Create/rotate a snapshot allocation before a command references it.
@@ -1330,6 +1430,7 @@ impl Swapchain {
             && !source_is_clipped
             && self.scene_rounded(id).is_empty()
             && self.scene_opacity(id) >= 1.0
+            && !self.scene_has_opacity_groups(id)
             && self.scene_opaque(id)
         {
             return Ok(ScenePrepared::SingleLayer);
@@ -1656,9 +1757,20 @@ impl Swapchain {
             base_array_layer: 0,
             layer_count: 1,
         };
-        let damage = pending
-            .and_then(|work| work.damage)
-            .map(|frame| frame.frame());
+        // A source update inside an isolated group can alter pixels anywhere
+        // inside its group's overlap. Rebuild that complete group, not only
+        // the incoming source rectangle.
+        let groups_present = self
+            .scene_placements
+            .iter()
+            .any(|p| !p.opacity_groups.is_empty());
+        let damage = (!groups_present)
+            .then(|| {
+                pending
+                    .and_then(|work| work.damage)
+                    .map(|frame| frame.frame())
+            })
+            .flatten();
         if let Some(damage) = damage {
             // A scene layer submission does not invalidate the whole window:
             // clear only the source's previous bounds, then recompose every
@@ -1767,6 +1879,107 @@ impl Swapchain {
             }
         }
         let mut scene_index = 0;
+        let mut open_groups = Vec::<appkit::view::OpacityGroup>::new();
+        let clear_group = |depth: usize| {
+            let target = &self.group_targets[slot][depth].image;
+            unsafe {
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    &[(
+                        target.image,
+                        vk::AccessFlags::SHADER_READ
+                            | vk::AccessFlags::SHADER_WRITE
+                            | vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                    )],
+                );
+                device.cmd_clear_color_image(
+                    command_buffer,
+                    target.image,
+                    vk::ImageLayout::GENERAL,
+                    &clear,
+                    &[range],
+                );
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    &[(
+                        target.image,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )],
+                );
+            }
+        };
+        let close_group = |depth: usize, opacity: f32, index: &mut usize| -> Result<(), String> {
+            let source = &self.group_targets[slot][depth].image;
+            let target: &GpuImage = if depth == 0 {
+                output
+            } else {
+                &self.group_targets[slot][depth - 1].image
+            };
+            unsafe {
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    &[
+                        (
+                            source.image,
+                            vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ,
+                        ),
+                        (
+                            target.image,
+                            vk::AccessFlags::SHADER_WRITE,
+                            vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                        ),
+                    ],
+                );
+            }
+            blender.bind(command_buffer, slot, *index, source, target)?;
+            *index += 1;
+            blender.draw(
+                command_buffer,
+                &crate::overlay::Placement {
+                    x: 0,
+                    y: 0,
+                    width: self.extent.width,
+                    height: self.extent.height,
+                    target_width: self.extent.width,
+                    target_height: self.extent.height,
+                    clip_x: 0,
+                    clip_y: 0,
+                    clip_width: self.extent.width,
+                    clip_height: self.extent.height,
+                    opacity,
+                    clear: false,
+                    round_start: 0,
+                    round_count: 0,
+                    sampled_srgb: 0,
+                },
+            );
+            unsafe {
+                scene_sync(
+                    device,
+                    command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    &[(
+                        target.image,
+                        vk::AccessFlags::SHADER_WRITE,
+                        vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+                    )],
+                );
+            }
+            Ok(())
+        };
         for id in &self.layers {
             let Some(scene) = self.scene_layers.iter().find(|scene| {
                 scene.id == *id
@@ -1777,12 +1990,34 @@ impl Swapchain {
             }) else {
                 continue;
             };
+            let wanted = self
+                .scene_placements
+                .iter()
+                .find(|placement| placement.id == *id)
+                .map_or(&[][..], |placement| placement.opacity_groups.as_slice());
+            let common = open_groups
+                .iter()
+                .zip(wanted)
+                .take_while(|(a, b)| *a == *b)
+                .count();
+            for depth in (common..open_groups.len()).rev() {
+                close_group(depth, open_groups[depth].opacity, &mut scene_index)?;
+            }
+            for depth in common..wanted.len() {
+                clear_group(depth);
+            }
+            open_groups = wanted.to_vec();
+            let draw_target: &GpuImage = if wanted.is_empty() {
+                output
+            } else {
+                &self.group_targets[slot][wanted.len() - 1].image
+            };
             blender.bind(
                 command_buffer,
                 slot,
                 scene_index,
                 &scene.snapshot.image,
-                output,
+                draw_target,
             )?;
             scene_index += 1;
             let frame = scene.frame.frame();
@@ -1847,12 +2082,15 @@ impl Swapchain {
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
                     &[(
-                        composite,
+                        draw_target.image,
                         vk::AccessFlags::SHADER_WRITE,
                         vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                     )],
                 );
             }
+        }
+        for depth in (0..open_groups.len()).rev() {
+            close_group(depth, open_groups[depth].opacity, &mut scene_index)?;
         }
         unsafe {
             scene_sync(
@@ -1958,6 +2196,7 @@ impl Swapchain {
             let source_frame = direct.frame.frame();
             let layer = direct.layer;
             let needs_scene = self.scene_opacity(layer) < 1.0
+                || self.scene_has_opacity_groups(layer)
                 || !self.scene_opaque(layer)
                 || !self.scene_rounded(layer).is_empty()
                 || self.live_scene_regions(layer, &source_frame).is_some()
@@ -1984,6 +2223,7 @@ impl Swapchain {
                         .is_some_and(|clip| !scene_clip_contains(&clip.frame(), &frame.frame()))
                 });
             if self.scene_opacity(id) < 1.0
+                || self.scene_has_opacity_groups(id)
                 || !self.scene_opaque(id)
                 || !self.scene_rounded(id).is_empty()
                 || clipped
@@ -2018,6 +2258,7 @@ impl Swapchain {
                     self.corners.is_some(),
                     true,
                 ) && scene.opacity >= 1.0
+                    && !self.scene_has_opacity_groups(layer)
                     && scene.opaque
                     && scene.rounded.is_empty()
                     && scene
@@ -2057,6 +2298,7 @@ impl Swapchain {
         self.frames[slot].backing.take();
         self.frames[slot].scene_reads.clear();
         let composite = self.composite()?;
+        self.prepare_opacity_group_targets(slot)?;
         let device = &self.gpu.device;
         unsafe {
             device

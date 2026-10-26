@@ -256,6 +256,15 @@ pub(crate) fn forget(layer: Id) {
 /// A missing ancestor link is intentional: NSView backing layers need not be
 /// structurally linked as Core Animation superlayers.
 pub(crate) fn scene_properties_below(layer: Id, ancestor: Id, now: f64) -> (bool, f32) {
+    scene_properties_below_excluding(layer, ancestor, now, &[])
+}
+
+pub(crate) fn scene_properties_below_excluding(
+    layer: Id,
+    ancestor: Id,
+    now: f64,
+    group_ids: &[usize],
+) -> (bool, f32) {
     let nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
     let Some(nodes) = nodes.as_ref() else {
         return (false, 1.0);
@@ -269,7 +278,9 @@ pub(crate) fn scene_properties_below(layer: Id, ancestor: Id, now: f64) -> (bool
         }
         let Some(node) = nodes.get(&at) else { break };
         hidden |= node.hidden;
-        opacity *= presented(&node.animations, "opacity", node.opacity, now);
+        if !group_ids.contains(&at) {
+            opacity *= presented(&node.animations, "opacity", node.opacity, now);
+        }
         at = node.superlayer;
     }
     (hidden, opacity.clamp(0.0, 1.0) as f32)
@@ -2701,6 +2712,7 @@ fn draw_layer(
         depth,
         &[],
         &[],
+        &[],
     )
 }
 
@@ -2750,6 +2762,7 @@ fn draw_layer_filtered(
     depth: usize,
     excluded: &[usize],
     selected: &[usize],
+    gpu_groups: &[usize],
 ) -> bool {
     if excluded.contains(&(layer as usize)) {
         return false;
@@ -2764,8 +2777,13 @@ fn draw_layer_filtered(
     }
     let frame = presented.frame_at(origin);
     let pixels = mapping.to_pixels(frame);
+    // The Metal compositor isolates any CA group whose contents include
+    // independently backed NSViews. The CPU run contributes unattenuated
+    // source pixels to that same retained GPU group.
+    let isolated_on_gpu = gpu_groups.contains(&(layer as usize));
     let group_alpha = presented.opacity.clamp(0.0, 1.0);
-    let isolated = group_alpha < 1.0
+    let isolated = !isolated_on_gpu
+        && group_alpha < 1.0
         && group_alpha > 0.0
         && !presented.sublayers.is_empty()
         && owns_complete_opacity_group(layer, selected, excluded);
@@ -2801,7 +2819,12 @@ fn draw_layer_filtered(
         }
         saved
     });
-    let opacity = opacity * if isolated { 1.0 } else { presented.opacity };
+    let opacity = opacity
+        * if isolated || isolated_on_gpu {
+            1.0
+        } else {
+            presented.opacity
+        };
     if selected.is_empty() || selected.contains(&(layer as usize)) {
         if let Some(color) = presented.background {
             let radius = presented.corner_radius * mapping.scale_x.min(mapping.scale_y);
@@ -2836,6 +2859,7 @@ fn draw_layer_filtered(
             depth + 1,
             excluded,
             selected,
+            gpu_groups,
         );
     }
     if let Some(before) = before {
@@ -2862,18 +2886,44 @@ pub(crate) fn has_renderable_sublayers(layer: Id) -> bool {
 
 /// The paint order of a Metal root may interleave ordinary CALayers with
 /// NSView-owned CALayers. Each native run must be represented independently.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MetalPaintStep {
-    Native(Vec<usize>),
-    View(usize),
+    Native {
+        selected: Vec<usize>,
+        groups: Vec<crate::view::OpacityGroup>,
+    },
+    View {
+        id: usize,
+        groups: Vec<crate::view::OpacityGroup>,
+    },
 }
 
-pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize]) -> Vec<MetalPaintStep> {
+pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize], now: f64) -> Vec<MetalPaintStep> {
     read_all_nodes(|nodes| {
+        fn contains_backed_view(
+            nodes: &HashMap<usize, Node>,
+            at: usize,
+            view_layers: &[usize],
+            depth: usize,
+        ) -> bool {
+            if depth >= 64 {
+                return false;
+            }
+            if view_layers.contains(&at) {
+                return true;
+            }
+            nodes.get(&at).is_some_and(|node| {
+                node.sublayers
+                    .iter()
+                    .any(|&child| contains_backed_view(nodes, child, view_layers, depth + 1))
+            })
+        }
         fn walk(
             nodes: &HashMap<usize, Node>,
             at: usize,
             view_layers: &[usize],
+            now: f64,
+            groups: &mut Vec<crate::view::OpacityGroup>,
             depth: usize,
             out: &mut Vec<MetalPaintStep>,
         ) {
@@ -2881,26 +2931,51 @@ pub(crate) fn metal_paint_steps(root: Id, view_layers: &[usize]) -> Vec<MetalPai
                 return;
             }
             if view_layers.contains(&at) {
-                out.push(MetalPaintStep::View(at));
+                out.push(MetalPaintStep::View {
+                    id: at,
+                    groups: groups.clone(),
+                });
                 return;
             }
             let Some(node) = nodes.get(&at) else {
                 return;
             };
+            let alpha =
+                presented(&node.animations, "opacity", node.opacity, now).clamp(0.0, 1.0) as f32;
+            // A fully CPU-owned ordinary group is handled by the existing
+            // CA rasterizer. Cross-source groups need a separate GPU target.
+            let isolate =
+                alpha > 0.0 && alpha < 1.0 && contains_backed_view(nodes, at, view_layers, depth);
+            if isolate {
+                groups.push(crate::view::OpacityGroup {
+                    id: at,
+                    opacity: alpha,
+                });
+            }
             if node.background.is_some_and(|color| color[3] > 0.0) || node.contents != 0 {
                 match out.last_mut() {
-                    Some(MetalPaintStep::Native(run)) => run.push(at),
-                    _ => out.push(MetalPaintStep::Native(vec![at])),
+                    Some(MetalPaintStep::Native {
+                        selected,
+                        groups: previous,
+                    }) if previous == groups => selected.push(at),
+                    _ => out.push(MetalPaintStep::Native {
+                        selected: vec![at],
+                        groups: groups.clone(),
+                    }),
                 }
             }
             for &child in &node.sublayers {
-                walk(nodes, child, view_layers, depth + 1, out);
+                walk(nodes, child, view_layers, now, groups, depth + 1, out);
+            }
+            if isolate {
+                groups.pop();
             }
         }
         let mut steps = Vec::new();
         if let Some(root) = nodes.get(&(root as usize)) {
+            let mut groups = Vec::new();
             for &child in &root.sublayers {
-                walk(nodes, child, view_layers, 0, &mut steps);
+                walk(nodes, child, view_layers, now, &mut groups, 0, &mut steps);
             }
         }
         steps
@@ -3042,6 +3117,7 @@ pub(crate) fn render_metal_sublayers_selected(
     rect: Rect,
     clip: Rect,
     selected: &[usize],
+    gpu_groups: &[usize],
 ) -> bool {
     let root = crate::view::layer_of(view);
     if root.is_null() || !crate::layer::is_metal(root) {
@@ -3081,6 +3157,7 @@ pub(crate) fn render_metal_sublayers_selected(
             0,
             &excluded,
             selected,
+            gpu_groups,
         );
     }
     animating
@@ -4376,7 +4453,7 @@ mod tests {
             height: 8,
         };
         let mut image = Store::for_tests(8, 8);
-        render_metal_sublayers_selected(view, &mut image, whole, whole, &[]);
+        render_metal_sublayers_selected(view, &mut image, whole, whole, &[], &[]);
         let actual = &image.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4];
         // Native Apple M2 26.5 offscreen CARenderer: opaque blue above
         // opaque red in a half-opacity group appears as half blue over
@@ -4387,7 +4464,7 @@ mod tests {
         for pixel in green.pixels.chunks_exact_mut(4) {
             pixel.copy_from_slice(&[0, 255, 0, 255]);
         }
-        render_metal_sublayers_selected(view, &mut green, whole, whole, &[]);
+        render_metal_sublayers_selected(view, &mut green, whole, whole, &[], &[]);
         let blended = &green.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4];
         // Native Apple M2 output [128,127,0,255] over opaque green.
         assert_eq!(blended[0], 128);
@@ -4395,7 +4472,7 @@ mod tests {
         assert_eq!(&blended[2..], &[0, 255]);
         send::<u8, ()>(top, "setHidden:", 1);
         let mut just_red = Store::for_tests(8, 8);
-        render_metal_sublayers_selected(view, &mut just_red, whole, whole, &[]);
+        render_metal_sublayers_selected(view, &mut just_red, whole, whole, &[], &[]);
         assert_eq!(
             &just_red.pixels[(4 * 8 + 4) * 4..(4 * 8 + 5) * 4],
             &[0, 0, 128, 128]

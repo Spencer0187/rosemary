@@ -2,6 +2,7 @@ use super::*;
 
 fn test_opaque_metal_placement(id: usize, frame: DirectFrame) -> ScenePlacement {
     ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame,
         opacity: 1.0,
@@ -82,6 +83,7 @@ fn a_scene_retry_never_overwrites_a_more_recent_view_snapshot() {
     };
     let scene = |id| {
         vec![ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame,
             opacity: 1.0,
@@ -2981,6 +2983,125 @@ fn read_scene_pixel(
     pixel
 }
 
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn opacity_group_composites_metal_drawable_before_applying_root_alpha() {
+    if isolate_vulkan_graphical_test(
+        "opacity_group_composites_metal_drawable_before_applying_root_alpha",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, underlay, frame)) = v10_fifo_fixture() else {
+        return;
+    };
+    let drawable = test_render_target(gpu, frame.width, frame.height).unwrap();
+    let ca = test_render_target(gpu, frame.width, frame.height).unwrap();
+    for (image, channels) in [
+        (&underlay, [1., 0., 0., 1.]),
+        (&drawable, [0., 1., 0., 1.]),
+        (&ca, [0., 0., 1., 1.]),
+    ] {
+        gpu.one_shot(|device, cb| unsafe {
+            cmd_test_clear_color(device, cb, image.image, channels);
+        })
+        .unwrap();
+    }
+    let blue = test_opaque_metal_placement(0x200, DirectFrame::from_frame(&frame));
+    let group = |id| ScenePlacement {
+        opacity_groups: vec![appkit::view::OpacityGroup {
+            id: 0x201,
+            opacity: 0.5,
+        }],
+        id,
+        frame: DirectFrame::from_frame(&frame),
+        opacity: 1.0,
+        opaque: true,
+        clip: None,
+        rounded: Vec::new(),
+        occluded: Some(Vec::new()),
+        native: None,
+    };
+    let root = group(0x202);
+    let red = group(0x203);
+    state.layers.extend([blue.id, root.id, red.id]);
+    state.synchronize_scene(window as usize, &[blue.clone(), root.clone(), red.clone()]);
+    for (id, image) in [(blue.id, &underlay), (root.id, &drawable), (red.id, &ca)] {
+        assert_eq!(
+            state.stage_composite_layer(id, &frame, image, None, &mut SourceOwner(None), false),
+            Ok(Some(true))
+        );
+    }
+    state.idle();
+    let pixel = |state: &Swapchain| {
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            frame.width,
+            frame.height,
+            40,
+            30,
+        )
+    };
+    // Metal source-over rounds at a different intermediate step from Apple's
+    // offscreen CARenderer; allow one 8-bit unit, but never a leaked child.
+    let native_pixel = |actual: Vec<u8>, expected: [u8; 4]| {
+        assert!(
+            actual.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 1),
+            "native macOS CA reference {expected:?}, Rosemary GPU {actual:?}"
+        );
+    };
+    native_pixel(pixel(&state), [127, 0, 128, 255]);
+
+    // The inner group covers an opaque red child. Its alpha must first
+    // composite onto the green drawable in the outer half-opacity group.
+    let mut nested_red = red.clone();
+    nested_red.opacity_groups.push(appkit::view::OpacityGroup {
+        id: 0x204,
+        opacity: 0.5,
+    });
+    assert!(state.synchronize_scene(window as usize, &[blue.clone(), root.clone(), nested_red]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    native_pixel(pixel(&state), [127, 64, 64, 255]);
+    assert!(state.committed_scene_bytes() <= 512 * 1024 * 1024);
+    assert_eq!(state.group_targets.iter().map(Vec::len).max(), Some(2));
+
+    let mut quarter_root = root.clone();
+    let mut quarter_red = red.clone();
+    quarter_root.opacity_groups[0].opacity = 0.25;
+    quarter_red.opacity_groups[0].opacity = 0.25;
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[blue.clone(), quarter_root.clone(), quarter_red.clone()]
+    ));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    native_pixel(pixel(&state), [191, 0, 64, 255]);
+
+    assert!(state.synchronize_scene(window as usize, &[blue, root]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    native_pixel(pixel(&state), [127, 128, 0, 255]);
+    // End of grouped rendering eventually returns per-frame temporary image
+    // allocations to the physical window ledger without destroying the window.
+    assert!(state.synchronize_scene(
+        window as usize,
+        &[test_opaque_metal_placement(
+            0x200,
+            DirectFrame::from_frame(&frame)
+        )]
+    ));
+    state.idle();
+    state.retire_copied();
+    assert!(state.group_targets.iter().all(Vec::is_empty));
+
+    drop(state);
+    for image in [underlay, drawable, ca] {
+        gpu.destroy_image(image);
+    }
+    sdl3::video::destroy_window(window);
+}
+
 /// A single *partial* CAMetalLayer cannot use the FIFO flattened path:
 /// after a move or resize it must sample its original image-space source.
 /// Adding a second layer must not reinterpret that snapshot as a full-window
@@ -3019,6 +3140,7 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
     state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&initial),
             opacity: 1.0,
@@ -3074,6 +3196,7 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&moved),
             opacity: 1.0,
@@ -3106,6 +3229,7 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&resized),
             opacity: 1.0,
@@ -3132,6 +3256,7 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
         window as usize,
         &[
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: sibling,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
@@ -3142,6 +3267,7 @@ fn partial_single_layer_moves_resizes_and_gains_sibling_without_new_drawable() {
                 native: None,
             },
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id,
                 frame: DirectFrame::from_frame(&resized),
                 opacity: 1.0,
@@ -3337,6 +3463,7 @@ fn fifo_flattened_static_drawable_recomposes_after_ca_mask_change() {
     .expect("green FIFO source");
     let id = 613;
     let base = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&frame),
         opacity: 1.0,
@@ -3359,6 +3486,7 @@ fn fifo_flattened_static_drawable_recomposes_after_ca_mask_change() {
         "FIFO fixture did not flatten"
     );
     let masked = ScenePlacement {
+        opacity_groups: Vec::new(),
         rounded: vec![scene::RoundedClip {
             frame: base.frame,
             radius: 32.0,
@@ -3474,6 +3602,7 @@ fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
         window as usize,
         &[
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: background,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
@@ -3484,6 +3613,7 @@ fn srgb_midtone_and_premultiplied_alpha_retain_encoded_scene_colors() {
                 native: None,
             },
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: foreground,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
@@ -3579,6 +3709,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
     };
     let metal_placement = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     let native_placement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_id,
         frame: DirectFrame::from_frame(&native_frame),
         opacity: 1.0,
@@ -3654,6 +3785,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         ..native_frame
     };
     let moved = ScenePlacement {
+        opacity_groups: Vec::new(),
         frame: DirectFrame::from_frame(&moved_frame),
         ..native_placement.clone()
     };
@@ -3673,6 +3805,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         ..moved_frame
     };
     let resized = ScenePlacement {
+        opacity_groups: Vec::new(),
         frame: DirectFrame::from_frame(&resized_frame),
         native: Some(scene::NativeCpuSceneSource {
             cpu_capture: None,
@@ -3846,6 +3979,7 @@ fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
             .expect("intermediate CA mask clip projected onto Metal");
         (
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: metal_id,
                 frame: DirectFrame::from_frame(&entry.frame),
                 opacity: entry.opacity,
@@ -4064,6 +4198,7 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
             let tw = (WIDTH - x).min(2048);
             let th = (HEIGHT - y).min(2048);
             let tile = ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: (3usize << (usize::BITS - 2)) | (tile_no + 1),
                 frame: DirectFrame::from_frame(&appkit::view::Frame {
                     x: x as i32,
@@ -4170,6 +4305,7 @@ fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
         let x = 5 + (n % 4) * 33;
         let y = 6 + (n / 4) * 31;
         let red = ScenePlacement {
+            opacity_groups: Vec::new(),
             id: (1usize << (usize::BITS - 1)) | (n as usize + 0x400),
             frame: DirectFrame::from_frame(&appkit::view::Frame {
                 x: x as i32,
@@ -4314,6 +4450,7 @@ fn twelve_transaction_pinned_gpu_generations_count_toward_scene_budget() {
     // Progress also requires the GPU to accept new pixels, not merely a
     // successful arithmetic budget check.
     let placement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0x201,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 16,
@@ -4390,6 +4527,7 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
         ..whole
     };
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 992,
         frame: DirectFrame::from_frame(&child_frame),
         opacity: 1.0,
@@ -4455,6 +4593,7 @@ fn rounded_native_opaque_overlay_preserves_metal_corners() {
     let native_layer = (1usize << (usize::BITS - 1)) | 0x314;
     let bottom = test_opaque_metal_placement(metal_layer, DirectFrame::from_frame(&whole));
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_layer,
         frame: DirectFrame::from_frame(&whole),
         opacity: 1.0,
@@ -4707,6 +4846,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
             let tw = (WIDTH - x).min(2048);
             let th = (HEIGHT - y).min(2048);
             let tile = ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: (3usize << (usize::BITS - 2)) | (count + 1),
                 frame: DirectFrame::from_frame(&appkit::view::Frame {
                     x: x as i32,
@@ -5042,6 +5182,7 @@ fn many_offscreen_six_k_dma_views_stage_in_bounded_visible_gpu_budget() {
     let mut plans = Vec::new();
     for n in 0..12usize {
         let placement = ScenePlacement {
+            opacity_groups: Vec::new(),
             id: (1usize << (usize::BITS - 1)) | (n + 0x6010),
             frame: DirectFrame::from_frame(&full),
             opacity: 1.0,
@@ -5141,6 +5282,7 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
             ..whole
         };
         let native = ScenePlacement {
+            opacity_groups: Vec::new(),
             id: native_id,
             frame: DirectFrame::from_frame(&huge_frame),
             opacity: 1.0,
@@ -5233,6 +5375,7 @@ fn linear_dma_fallback_maps_only_far_visible_rows_and_keeps_texel_offsets() {
         0
     );
     let scene = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 123,
         frame: DirectFrame {
             window: 1,
@@ -5395,6 +5538,7 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
     };
     let id = (1usize << (usize::BITS - 1)) | 0xa017usize;
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&native_frame),
         opacity: 1.0,
@@ -5510,6 +5654,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         ..whole
     };
     let invalid = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_id,
         frame: DirectFrame::from_frame(&native_frame),
         opacity: 1.0,
@@ -5588,6 +5733,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     // accepted Metal frame can be repainted at a new opacity while the
     // unsupported native picture is excluded awaiting a software redraw.
     let half_metal = ScenePlacement {
+        opacity_groups: Vec::new(),
         opacity: 0.5,
         ..bottom.clone()
     };
@@ -5614,6 +5760,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         "an unrelated Metal opacity update stalled behind failed DMA: {unaffected:?}"
     );
     let cpu = ScenePlacement {
+        opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 128, 128].repeat(30 * 25)),
@@ -5628,6 +5775,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     // Once a CPU replacement has been accepted, a later refused DMA revision
     // must retain those last valid native pixels, not erase them.
     let second_invalid = ScenePlacement {
+        opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
@@ -5798,6 +5946,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
     };
     let missing_id = (1usize << (usize::BITS - 1)) | 0x55bbu64 as usize;
     let missing = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: missing_id,
         frame: DirectFrame::from_frame(&bframe),
         opacity: 1.0,
@@ -5823,6 +5972,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
     if busy_restore {
         // A previously absent stage writes the accumulator before rejecting B.
         proposal.push(ScenePlacement {
+            opacity_groups: Vec::new(),
             id: (1usize << (usize::BITS - 1)) | 0x55aa,
             frame: DirectFrame::from_frame(&appkit::view::Frame {
                 x: 70,
@@ -6017,6 +6167,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     let native_id = (1usize << (usize::BITS - 1)) | 0x809123usize;
     let bottom = test_opaque_metal_placement(metal_id, DirectFrame::from_frame(&whole));
     let unknown = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_id,
         frame: DirectFrame::from_frame(&native_frame),
         opacity: 1.0,
@@ -6048,6 +6199,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         ..native_frame
     };
     let previously_accepted_a = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: earlier_id,
         frame: DirectFrame::from_frame(&earlier_frame),
         native: Some(scene::NativeCpuSceneSource {
@@ -6093,6 +6245,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         original_snapshot
     };
     let earlier = ScenePlacement {
+        opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
@@ -6209,6 +6362,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     }
     assert_eq!(entry.present_failure.load(Ordering::Relaxed), 0);
     let real = ScenePlacement {
+        opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
@@ -6282,6 +6436,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
         ..whole
     };
     let old = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xb011,
         frame: DirectFrame::from_frame(&old_frame),
         opacity: 1.0,
@@ -6321,6 +6476,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
         [255, 0, 0, 255]
     );
     let proposed = ScenePlacement {
+        opacity_groups: Vec::new(),
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 75,
             y: 55,
@@ -6416,6 +6572,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
     );
     assert!(removal[1].frame == old.frame);
     let introduction = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: old.id + 1,
         ..proposed
     };
@@ -6459,6 +6616,7 @@ fn pinned_scene_generation_budget_defers_dma_and_recovers_after_retirement() {
         ..whole
     };
     let placement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xb015,
         frame: DirectFrame::from_frame(&view),
         opacity: 1.0,
@@ -6662,6 +6820,7 @@ fn appkit_moving_six_k_dma_source_updates_static_metal_window_pixels() {
     )
     .unwrap();
     let to_placement = |item: appkit::view::MetalSceneLayer| ScenePlacement {
+        opacity_groups: Vec::new(),
         id: item.layer,
         frame: DirectFrame::from_frame(&item.frame),
         opacity: item.opacity,
@@ -6753,6 +6912,7 @@ fn moving_static_large_dma_source_changes_retained_gpu_pixels() {
     };
     let id = (1usize << (usize::BITS - 1)) | 0x9911;
     let make = |crop_x| ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&whole),
         opacity: 1.0,
@@ -6874,6 +7034,7 @@ fn replacing_obsolete_native_gpu_generations_makes_forward_progress() {
     assert!(state.scene_gpu_bytes() >= 512 * 1024 * 1024);
     let new_id = (1usize << (usize::BITS - 1)) | 0xc200;
     let replacement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: new_id,
         frame: DirectFrame::from_frame(&whole),
         opacity: 1.0,
@@ -7009,6 +7170,7 @@ fn same_native_id_near_scene_budget_replaces_real_dma_pixels() {
     // transition; their pixels are not an AppKit producer publication.
     assert_eq!(state.scene_layers.iter().filter(|s| s.ready).count(), 28);
     let changed = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame,
         opacity: 1.0,
@@ -7137,6 +7299,7 @@ fn atomic_scene_replacement_peak_reports_nonprogressing_physical_pressure() {
     assert!(state.atomic_transition_gpu_floor() + incoming > WINDOW_GPU_PAYLOAD_BUDGET);
     assert!(!window_gpu_capacity_available(window as usize, incoming));
     let pending = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xee00,
         frame: DirectFrame {
             window: window as usize,
@@ -7209,6 +7372,7 @@ fn temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal() {
         ..whole
     };
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0x91ab,
         frame: DirectFrame::from_frame(&view),
         opacity: 1.0,
@@ -7307,6 +7471,7 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
     for index in 0..6usize {
         let id = (1usize << (usize::BITS - 1)) | (0x41000 + index);
         scene.push(ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&huge),
             opacity: 1.0,
@@ -7371,6 +7536,7 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
     // Recompose static metal after changing only its alpha, with the identical
     // rejected CPU revision still supplied. No repeated failed large upload.
     let changed = ScenePlacement {
+        opacity_groups: Vec::new(),
         opacity: 0.6,
         ..base
     };
@@ -7438,6 +7604,7 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
         height: 30,
     };
     let placement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&whole),
         opacity: 1.0,
@@ -7496,6 +7663,7 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
     assert_eq!(pixel(&state, 20, 20), [0, 0, 0, 0]);
     assert_eq!(pixel(&state, 90, 50), [0, 255, 0, 255]);
     let moved = ScenePlacement {
+        opacity_groups: Vec::new(),
         occluded: Some(vec![Region {
             x: 85,
             y: 40,
@@ -7518,6 +7686,7 @@ fn live_native_occlusion_updates_without_new_drawable_or_initial_backing() {
         "new opaque native view area reveals Metal"
     );
     let removed = ScenePlacement {
+        opacity_groups: Vec::new(),
         occluded: Some(vec![]),
         ..moved
     };
@@ -7598,6 +7767,7 @@ fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
         ..whole
     };
     let foreground = |capture: (Arc<Vec<u8>>, u64)| ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_id,
         frame: DirectFrame::from_frame(&native_frame),
         opacity: 1.0,
@@ -7705,6 +7875,7 @@ fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
         height: clip.height as i32,
     };
     let bottom = |clip| ScenePlacement {
+        opacity_groups: Vec::new(),
         id: metal_id,
         frame: DirectFrame::from_frame(&whole),
         opacity: 1.0,
@@ -7722,6 +7893,7 @@ fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
         dma_sample: None,
     };
     let native = |clip| ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_id,
         frame: DirectFrame::from_frame(&frame),
         opacity: 1.0,
@@ -7824,6 +7996,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
     .expect("green source");
     let id = 404;
     let base = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&whole),
         opacity: 1.0,
@@ -7851,11 +8024,50 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
         "fixture did not enter actual direct path"
     );
     assert!(state.composite.is_none(), "unexpected early accumulator");
+    // A CA opacity group cannot bypass the group shader just because its
+    // individual retained drawable remains opaque. Replay the same direct
+    // WSI source into a half-opacity group without asking the guest to draw.
+    let grouped = ScenePlacement {
+        opacity_groups: vec![appkit::view::OpacityGroup {
+            id: 0x4040,
+            opacity: 0.5,
+        }],
+        ..base.clone()
+    };
+    assert!(state.synchronize_scene(window as usize, &[grouped]));
+    assert!(!fast_direct_scene(&state, id, &whole, None, true));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(state.direct.is_none());
+    let grouped_pixel = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        whole.width,
+        whole.height,
+        80,
+        60,
+    );
+    assert!(
+        grouped_pixel
+            .iter()
+            .zip([0u8, 128, 0, 128])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "a direct WSI image escaped newly added Core Animation opacity: {grouped_pixel:?}"
+    );
+    assert!(state.synchronize_scene(window as usize, &[base.clone()]));
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert!(
+        state.direct.is_some(),
+        "restoring opaque CA state did not restore direct WSI"
+    );
+
     let rounded = scene::RoundedClip {
         frame: DirectFrame::from_frame(&whole),
         radius: 35.0,
     };
     let new = ScenePlacement {
+        opacity_groups: Vec::new(),
         rounded: vec![rounded],
         ..base.clone()
     };
@@ -7886,6 +8098,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
     // Removing the rounded mask, then restricting the rectangular ancestor,
     // still updates the same preserved green drawable without new submissions.
     let unrounded = ScenePlacement {
+        opacity_groups: Vec::new(),
         rounded: vec![],
         ..new
     };
@@ -7906,6 +8119,7 @@ fn direct_wsi_static_drawable_recomposes_after_ca_mask_changes() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             clip: Some(rect),
             ..unrounded
         }]
@@ -7974,6 +8188,7 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
     state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
@@ -8027,6 +8242,7 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
@@ -8071,6 +8287,7 @@ fn opaque_metal_content_respects_nested_rounded_ca_clips() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
@@ -8165,6 +8382,7 @@ fn translucent_metal_composites_over_complete_cpu_store() {
     state.synchronize_scene(
         cpu_id,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id: metal_id,
             frame: DirectFrame::from_frame(&foreground),
             opacity: 0.5,
@@ -8200,6 +8418,7 @@ fn translucent_metal_composites_over_complete_cpu_store() {
     assert!(state.synchronize_scene(
         cpu_id,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id: metal_id,
             frame: DirectFrame::from_frame(&foreground),
             opacity: 0.25,
@@ -8276,6 +8495,7 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&whole),
             opacity: 0.5,
@@ -8309,6 +8529,7 @@ fn lone_metal_alpha_change_invalidates_fifo_and_direct_wsi_fast_paths() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
@@ -8576,6 +8797,7 @@ fn one_layer_with_clipping_parent_keeps_outside_pixels_transparent() {
     state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id: 1,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
@@ -8805,6 +9027,7 @@ fn static_foreground_survives_repeated_background_submissions() {
         window as usize,
         &[
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: 1,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
@@ -8815,6 +9038,7 @@ fn static_foreground_survives_repeated_background_submissions() {
                 native: None,
             },
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: 2,
                 frame: DirectFrame::from_frame(&foreground),
                 opacity: 0.5,
@@ -8876,6 +9100,7 @@ fn static_foreground_survives_repeated_background_submissions() {
         window as usize,
         &[
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: 1,
                 frame: DirectFrame::from_frame(&whole),
                 opacity: 1.0,
@@ -8886,6 +9111,7 @@ fn static_foreground_survives_repeated_background_submissions() {
                 native: None,
             },
             ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: 2,
                 frame: DirectFrame::from_frame(&foreground),
                 opacity: 0.5,
@@ -9176,6 +9402,7 @@ fn removed_foreground_recomposes_and_restores_direct_wsi() {
     assert!(state.synchronize_scene(
         window as usize,
         &[ScenePlacement {
+            opacity_groups: Vec::new(),
             id: 1,
             frame: DirectFrame::from_frame(&whole),
             opacity: 1.0,
@@ -11661,6 +11888,7 @@ fn rejected_linear_dma_worker_commits_original_publication() {
     });
     let id = (1usize << (usize::BITS - 1)) | 0xa021usize;
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 40,
@@ -11767,6 +11995,7 @@ fn native_upload_failed_fence_wait_retains_gpu_resources_until_completion() {
         .unwrap();
     let baseline = before.held.load(Ordering::Acquire);
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xd21,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 5,
@@ -11840,6 +12069,7 @@ fn native_dma_failed_fence_wait_keeps_descriptor_and_import_alive() {
     let baseline = budget.held.load(Ordering::Acquire);
     let available_passes = crate::overlay::available_passes_for_test(gpu);
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xd22,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 5,
@@ -12045,6 +12275,7 @@ fn native_cpu_producer_damage_reuses_only_exact_gpu_base_and_rolls_back_on_faile
     });
     let old_pixels = [255u8, 0, 0, 255].repeat(32 * 32);
     let mut layer = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame,
         opacity: 1.,
@@ -12229,6 +12460,7 @@ fn extra_native_window_crop_invalidates_damage_before_mixed_dma_gpu_upload() {
     let picture = real_gbm_picture_with_pixels(30, 16, |_, _| [0, 0, 0, 0]);
     let mut pixels = [200u8, 0, 0, 255].repeat(30 * 16);
     let mut placement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xabce,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: -5,
@@ -12345,6 +12577,7 @@ fn transient_native_dma_import_retries_new_gpu_only_producer_without_window_blac
     let second = real_gbm_picture_with_pixels(32, 32, |_, _| [40, 60, 80, 255]);
     let id = (1usize << (usize::BITS - 1)) | 0xdab1;
     let mut source = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 8,
@@ -12588,6 +12821,7 @@ fn compositor_worker_retries_same_dma_revision_after_temporary_import_failure() 
     let picture = real_gbm_picture_with_pixels(32, 32, |_, _| [15, 45, 175, 255]);
     let native_id = (1usize << (usize::BITS - 1)) | 0xda44;
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native_id,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 26,
@@ -12686,6 +12920,7 @@ fn cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change() {
     assert_eq!(picture.modifier, 0, "CPU fallback fixture must be linear");
     let id = (1usize << (usize::BITS - 1)) | 0xda45;
     let mut placement = ScenePlacement {
+        opacity_groups: Vec::new(),
         id,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 12,
@@ -12830,6 +13065,7 @@ fn unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry() {
             .collect(),
     });
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xdaf0,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 8,
@@ -12909,6 +13145,7 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
             .collect(),
     });
     let native = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: (1usize << (usize::BITS - 1)) | 0xda91,
         frame: DirectFrame::from_frame(&appkit::view::Frame {
             x: 8,
@@ -12946,6 +13183,7 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
     assert_eq!(crate::overlay::import_attempts_for_test(), before + 1);
     // A different valid producer still reaches the Vulkan importer.
     let other = ScenePlacement {
+        opacity_groups: Vec::new(),
         id: native.id + 1,
         native: Some(scene::NativeCpuSceneSource {
             bytes: Arc::new(Vec::new()),
@@ -13077,6 +13315,7 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         items
             .into_iter()
             .map(|item| ScenePlacement {
+                opacity_groups: item.opacity_groups,
                 id: item.layer,
                 frame: DirectFrame::from_frame(&item.frame),
                 opacity: item.opacity,
@@ -13129,6 +13368,72 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         read_scene_pixel(gpu, accumulated, 120, 90, old_point.0, old_point.1),
         [255, 0, 0, 255]
     );
+    // The original drawable stays unchanged. Changing only root CA opacity
+    // must group its old Metal pixels with the native child before fading.
+    let change_root_opacity = |state: &mut Swapchain, alpha: f32| {
+        let set_alpha: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+            unsafe { std::mem::transmute(objc::msg::entry()) };
+        unsafe { set_alpha(metal_layer, objc::sel::get("setOpacity:"), alpha) };
+        appkit::event::pump(std::ptr::null_mut());
+        let proposal = make_scene(appkit::view::metal_scene(sdl).unwrap());
+        if alpha < 1.0 {
+            assert!(proposal.iter().all(|source| source.opacity_groups
+                == [appkit::view::OpacityGroup {
+                    id: metal_layer as usize,
+                    opacity: alpha,
+                }]));
+        }
+        for native in proposal.iter().filter(|p| p.native.is_some()) {
+            assert_eq!(stage_native_scene_source(state, native), Ok(true));
+        }
+        state.synchronize_scene(sdl as usize, &proposal);
+        assert_eq!(state.redisplay_scene(sdl as usize), Ok(true));
+        state.idle();
+    };
+    change_root_opacity(&mut state, 0.5);
+    let half = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        120,
+        90,
+        old_point.0,
+        old_point.1,
+    );
+    assert!(
+        half.iter()
+            .zip([128u8, 0, 0, 128])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "root CA opacity leaked retained drawable through opaque native child: {half:?}"
+    );
+    change_root_opacity(&mut state, 0.25);
+    let quarter = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        120,
+        90,
+        old_point.0,
+        old_point.1,
+    );
+    assert!(
+        quarter
+            .iter()
+            .zip([64u8, 0, 0, 64])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "metadata-only opacity did not update completed retained group: {quarter:?}"
+    );
+    change_root_opacity(&mut state, 1.0);
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            120,
+            90,
+            old_point.0,
+            old_point.1
+        ),
+        [255, 0, 0, 255]
+    );
+
     // Move a CALayer-only overlay after the Metal image was last submitted.
     unsafe {
         set_frame(child, objc::sel::get("setFrame:"), rect(64., 40., 24., 20.));
@@ -13207,6 +13512,119 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
         [0, 255, 0, 255],
         "ordinary CALayer above NSView-backed layer was not topmost"
     );
+    // The same retained frame also contains a mixed CA/NSView group:
+    // native red A, NSView-backed opaque blue B, and ordinary green C.
+    // Their enclosing alpha must not be applied to each source separately.
+    let group_wrap = make_layer("CALayer");
+    let set_alpha: unsafe extern "C" fn(Id, objc::sel::Sel, f32) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    let hidden: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        set_frame(
+            group_wrap,
+            objc::sel::get("setFrame:"),
+            rect(0., 0., 120., 90.),
+        );
+        set_alpha(group_wrap, objc::sel::get("setOpacity:"), 0.5);
+        set(metal_layer, objc::sel::get("addSublayer:"), group_wrap);
+        for member in [child, b, c] {
+            set(group_wrap, objc::sel::get("addSublayer:"), member);
+        }
+    }
+    repaint(&mut state);
+    let wrapped = appkit::view::metal_scene(sdl).unwrap();
+    assert!(wrapped.iter().skip(1).all(|part| part.opacity_groups
+        == [appkit::view::OpacityGroup {
+            id: group_wrap as usize,
+            opacity: 0.5
+        }]));
+    unsafe { hidden(c, objc::sel::get("setHidden:"), 1) };
+    repaint(&mut state);
+    let mixed_blue = sample(&state);
+    assert!(
+        mixed_blue
+            .iter()
+            .zip([0u8, 127, 128, 255])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "interleaved NSView B leaked opaque CA child A under group alpha: {mixed_blue:?}"
+    );
+    unsafe { set_alpha(group_wrap, objc::sel::get("setOpacity:"), 0.25) };
+    repaint(&mut state);
+    let quarter_blue = sample(&state);
+    assert!(
+        quarter_blue
+            .iter()
+            .zip([0u8, 191, 64, 255])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "metadata-only mixed-group opacity did not repaint: {quarter_blue:?}"
+    );
+    // masksToBounds is applied before the completed mixed group is faded.
+    // A clipped independently backed blue child may not escape the group.
+    let set_mask: unsafe extern "C" fn(Id, objc::sel::Sel, u8) =
+        unsafe { std::mem::transmute(objc::msg::entry()) };
+    unsafe {
+        set_frame(
+            group_wrap,
+            objc::sel::get("setFrame:"),
+            rect(0., 0., 66., 90.),
+        );
+        set_mask(group_wrap, objc::sel::get("setMasksToBounds:"), 1);
+    }
+    repaint(&mut state);
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            120,
+            90,
+            75,
+            45
+        ),
+        [0, 255, 0, 255],
+        "independent NSView-backed child escaped opacity group's clipping mask"
+    );
+    let within_clip = read_scene_pixel(
+        gpu,
+        state.composite.as_ref().unwrap().image,
+        120,
+        90,
+        65,
+        45,
+    );
+    assert!(
+        within_clip
+            .iter()
+            .zip([0u8, 191, 64, 255])
+            .all(|(a, b)| a.abs_diff(b) <= 1),
+        "opacity group mask clipped valid source pixels: {within_clip:?}"
+    );
+    unsafe {
+        set_mask(group_wrap, objc::sel::get("setMasksToBounds:"), 0);
+        set_frame(
+            group_wrap,
+            objc::sel::get("setFrame:"),
+            rect(0., 0., 120., 90.),
+        );
+    }
+    repaint(&mut state);
+    assert!(
+        sample(&state)
+            .iter()
+            .zip([0u8, 191, 64, 255])
+            .all(|(a, b)| a.abs_diff(b) <= 1)
+    );
+
+    // Restore the original explicit interleaving regression below.
+    unsafe {
+        hidden(c, objc::sel::get("setHidden:"), 0);
+        for member in [child, b, c] {
+            set(metal_layer, objc::sel::get("addSublayer:"), member);
+        }
+    }
+    repaint(&mut state);
+    assert_eq!(sample(&state), [0, 255, 0, 255]);
+
     let insert: unsafe extern "C" fn(Id, objc::sel::Sel, Id, u32) =
         unsafe { std::mem::transmute(objc::msg::entry()) };
     unsafe {
@@ -13472,6 +13890,7 @@ fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
                 ..frame
             };
             placements.push(ScenePlacement {
+                opacity_groups: Vec::new(),
                 id: (1usize << (usize::BITS - 1)) | (0x6f00 + i),
                 frame: DirectFrame::from_frame(&at),
                 opacity: 1.,
