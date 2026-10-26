@@ -291,15 +291,173 @@ struct NativeCapture {
     excluded_view_layers: u64,
     plain_store: bool,
     pixels: std::sync::Arc<Vec<u8>>,
+    /// Fixed-size chunk hashes for exact plain opaque Store snapshots. A
+    /// producer-attested rectangle can update only touched chunks; readers
+    /// of an earlier Arc still own its complete, immutable pixel generation.
+    opaque_hashes: Option<Vec<u64>>,
     revision: u64,
     damage: Option<NativeCpuDamage>,
 }
 type CaptureKey = (usize, i64, i64, u32, u32, u32, u32, bool, u64);
+const NATIVE_HASH_CHUNK_BYTES: usize = 64 * 1024;
+
+fn opaque_capture_hashes(pixels: &[u8]) -> Vec<u64> {
+    use std::hash::{Hash, Hasher};
+    pixels
+        .chunks(NATIVE_HASH_CHUNK_BYTES)
+        .map(|chunk| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            chunk.hash(&mut hash);
+            hash.finish()
+        })
+        .collect()
+}
+
+fn opaque_capture_revision(hashes: &[u64], bytes: usize) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hash);
+    hashes.hash(&mut hash);
+    hash.finish()
+}
+
+/// An incremental capture is admitted only from a validated plain opaque
+/// image and a contiguous producer-authored damage journal. The patch edits
+/// only current changed rows; Arc::make_mut preserves every GPU-held reader.
+fn update_plain_opaque_capture(
+    key: CaptureKey,
+    source: &Store,
+    layer: usize,
+    crop: Rect,
+    overlay_generation: u64,
+    ca_content_revision: u64,
+    ca_descendant_revision: u64,
+    excluded_view_layers: u64,
+) -> Option<(std::sync::Arc<Vec<u8>>, u64)> {
+    let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let prior = captures.get_mut(&key)?;
+    if !prior.plain_store
+        || prior.layer != layer
+        || prior.overlay_generation != overlay_generation
+        || prior.ca_content_revision != ca_content_revision
+        || prior.ca_descendant_revision != ca_descendant_revision
+        || prior.excluded_view_layers != excluded_view_layers
+        || prior.pixels.is_empty()
+    {
+        return None;
+    }
+    let from = prior.view_generation?;
+    let region = source.damage_since(from)?.intersection(&crop);
+    if region.is_empty() {
+        return None;
+    }
+    let x = usize::try_from(region.x).ok()?;
+    let y = usize::try_from(region.y).ok()?;
+    let dx = usize::try_from(region.x - crop.x).ok()?;
+    let dy = usize::try_from(region.y - crop.y).ok()?;
+    let w = usize::try_from(region.width).ok()?;
+    let h = usize::try_from(region.height).ok()?;
+    let width = source.width as usize;
+    let crop_width = usize::try_from(crop.width).ok()?;
+    let row_bytes = w.checked_mul(4)?;
+    let length = crop_width
+        .checked_mul(usize::try_from(crop.height).ok()?)?
+        .checked_mul(4)?;
+    // Validate *all* bounds before mutating a cached Arc. An invalid
+    // producer must not leave the cache holding half-applied pixel patches.
+    if source.pixels.len() != width.checked_mul(source.height as usize)?.checked_mul(4)?
+        || x.checked_add(w)? > width
+        || y.checked_add(h)? > source.height as usize
+        || dx.checked_add(w)? > crop_width
+        || dy.checked_add(h)? > crop.height as usize
+    {
+        return None;
+    }
+    if prior.pixels.len() != length
+        || prior.opaque_hashes.as_ref()?.len() != length.div_ceil(NATIVE_HASH_CHUNK_BYTES)
+    {
+        return None;
+    }
+    // Producer mutation was explicitly recorded; old texels outside the
+    // rectangle were opaque, so only the new texels inside it need checking.
+    for row in y..y + h {
+        let start = row.checked_mul(width)?.checked_add(x)?.checked_mul(4)?;
+        let bytes = source.pixels.get(start..start + row_bytes)?;
+        if bytes.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+            return None; // Re-render through the general alpha-aware path.
+        }
+    }
+    // Marking identical data dirty must not clone the old allocation or
+    // change the content identity consumed by the Metal scene publisher.
+    if (0..h).all(|row| {
+        let src_at = ((y + row) * width + x) * 4;
+        let dst_at = ((dy + row) * crop_width + dx) * 4;
+        source.pixels[src_at..src_at + row_bytes] == prior.pixels[dst_at..dst_at + row_bytes]
+    }) {
+        prior.view_generation = Some(source.generation());
+        prior.damage = None;
+        return Some((std::sync::Arc::clone(&prior.pixels), prior.revision));
+    }
+    let old_revision = prior.revision;
+    let pixels = std::sync::Arc::make_mut(&mut prior.pixels);
+    let mut touched = vec![false; length.div_ceil(NATIVE_HASH_CHUNK_BYTES)];
+    for row in 0..h {
+        let src_at = (y + row)
+            .checked_mul(width)?
+            .checked_add(x)?
+            .checked_mul(4)?;
+        let dst_at = (dy + row)
+            .checked_mul(crop_width)?
+            .checked_add(dx)?
+            .checked_mul(4)?;
+        pixels
+            .get_mut(dst_at..dst_at + row_bytes)?
+            .copy_from_slice(source.pixels.get(src_at..src_at + row_bytes)?);
+        for part in
+            dst_at / NATIVE_HASH_CHUNK_BYTES..=(dst_at + row_bytes - 1) / NATIVE_HASH_CHUNK_BYTES
+        {
+            touched[part] = true;
+        }
+    }
+    let hashes = prior.opaque_hashes.as_mut()?;
+    for (index, changed) in touched.into_iter().enumerate() {
+        if changed {
+            let offset = index * NATIVE_HASH_CHUNK_BYTES;
+            let end = pixels.len().min(offset + NATIVE_HASH_CHUNK_BYTES);
+            use std::hash::{Hash, Hasher};
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            pixels[offset..end].hash(&mut hash);
+            hashes[index] = hash.finish();
+        }
+    }
+    prior.revision = opaque_capture_revision(hashes, length);
+    prior.view_generation = Some(source.generation());
+    prior.damage = (old_revision != prior.revision).then_some(NativeCpuDamage {
+        from_revision: old_revision,
+        rect: Rect {
+            x: region.x - crop.x,
+            y: region.y - crop.y,
+            width: region.width,
+            height: region.height,
+        },
+    });
+    #[cfg(test)]
+    {
+        NATIVE_RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+        NATIVE_INCREMENTAL_PATCHES.fetch_add(1, Ordering::Relaxed);
+    }
+    Some((std::sync::Arc::clone(&prior.pixels), prior.revision))
+}
+
 const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
 static NATIVE_RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static NATIVE_INCREMENTAL_PATCHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 #[cfg(test)]
 pub(crate) fn native_render_count_for_tests() -> usize {
     NATIVE_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
@@ -1991,6 +2149,35 @@ fn native_scene_pixels_impl(
         }
     }
 
+    // Authenticate the producer's changed rectangle against the cached
+    // immutable generation before any full alpha scan, raster or hash.
+    #[cfg(test)]
+    let disable_patch = std::env::var_os("ROSEMARY_BENCH_NATIVE_PLAIN_PATCH_DISABLE").is_some();
+    #[cfg(not(test))]
+    let disable_patch = false;
+    #[cfg(test)]
+    let compare_slow = std::env::var_os("ROSEMARY_BENCH_NATIVE_CAPTURE_FORCE_SLOW").is_some();
+    #[cfg(not(test))]
+    let compare_slow = false;
+    if plain_store
+        && !compare_slow
+        && !disable_patch
+        && let Some(src) = source
+        && src.width == width
+        && src.height == height
+        && let Some(snapshot) = update_plain_opaque_capture(
+            key,
+            src,
+            layer as usize,
+            crop,
+            overlay_generation,
+            ca_content_revision,
+            ca_descendant_revision,
+            excluded_view_layers,
+        )
+    {
+        return Some(snapshot);
+    }
     let damage = if plain_store && let Some(source) = source {
         NATIVE_CAPTURES
             .lock()
@@ -2023,10 +2210,6 @@ fn native_scene_pixels_impl(
     // A plain fully opaque backing store has exactly the same BGRA texels
     // after blending over a transparent native background. Allocate/copy its
     // crop directly; the existing compositor path handles alpha and CA.
-    #[cfg(test)]
-    let compare_slow = std::env::var_os("ROSEMARY_BENCH_NATIVE_CAPTURE_FORCE_SLOW").is_some();
-    #[cfg(not(test))]
-    let compare_slow = false;
     let exact_opaque = if plain_store && !compare_slow {
         source.filter(|src| src.width == width && src.height == height && src.fully_opaque())
     } else {
@@ -2121,12 +2304,22 @@ fn native_scene_pixels_impl(
         .0
         .iter()
         .all(|pixel| pixel[3] == 0);
+    let opaque_hashes = if !empty && exact_opaque.is_some() {
+        Some(opaque_capture_hashes(&output.pixels))
+    } else {
+        None
+    };
     let (pixels, revision) = if empty {
         (std::sync::Arc::new(Vec::new()), 0)
     } else {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        output.pixels.hash(&mut hasher);
-        (std::sync::Arc::new(output.pixels), hasher.finish())
+        let revision = if let Some(hashes) = &opaque_hashes {
+            opaque_capture_revision(hashes, output.pixels.len())
+        } else {
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            output.pixels.hash(&mut hasher);
+            hasher.finish()
+        };
+        (std::sync::Arc::new(output.pixels), revision)
     };
     let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
     if content_animating {
@@ -2147,6 +2340,7 @@ fn native_scene_pixels_impl(
                 excluded_view_layers,
                 plain_store,
                 pixels: std::sync::Arc::clone(&pixels),
+                opaque_hashes,
                 revision,
                 damage,
             },
@@ -4087,6 +4281,178 @@ mod tests {
     }
 
     #[test]
+    fn incremental_plain_capture_keeps_gpu_readers_immutable_and_hashes_only_damage() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(130, 140);
+        store.pixels = [12, 34, 56, 255].repeat(130 * 140);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 5,
+            y: 7,
+            width: 117,
+            height: 122,
+        };
+        let first = native_scene_pixels_cropped_with_damage(view, 130, 140, crop).unwrap();
+        let original = std::sync::Arc::clone(&first.0); // GPU reader
+        let baseline = original.as_ref().clone();
+        let count = NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed);
+        {
+            let mut sources = VIEW_STORES.lock().unwrap();
+            let src = sources.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            for (x, y, pixel) in [
+                (6, 8, [3, 8, 19, 255]),
+                (60, 75, [99, 88, 77, 255]),
+                (121, 128, [2, 22, 222, 255]),
+            ] {
+                let at = (y * 130 + x) * 4;
+                src.pixels[at..at + 4].copy_from_slice(&pixel);
+                src.touch_region(Rect {
+                    x: x as i64,
+                    y: y as i64,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+        let updated = native_scene_pixels_cropped_with_damage(view, 130, 140, crop).unwrap();
+        assert_eq!(
+            original.as_ref(),
+            &baseline,
+            "GPU reader's source was mutated"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&original, &updated.0));
+        assert_ne!(updated.1, first.1);
+        assert_eq!(updated.2.unwrap().from_revision, first.1);
+        assert_eq!(
+            NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed),
+            count + 1
+        );
+        for (x, y, pixel) in [
+            (6usize, 8usize, [3, 8, 19, 255]),
+            (60, 75, [99, 88, 77, 255]),
+            (121, 128, [2, 22, 222, 255]),
+        ] {
+            let at = (((y - 7) * 117) + (x - 5)) * 4;
+            assert_eq!(&updated.0[at..at + 4], &pixel);
+        }
+        // Marking identical texels as dirty must retain content identity.
+        {
+            let mut sources = VIEW_STORES.lock().unwrap();
+            sources
+                .as_mut()
+                .unwrap()
+                .get_mut(&(view as usize))
+                .unwrap()
+                .touch_region(Rect {
+                    x: 60,
+                    y: 75,
+                    width: 1,
+                    height: 1,
+                });
+        }
+        let same = native_scene_pixels_cropped_with_damage(view, 130, 140, crop).unwrap();
+        assert_eq!(same.1, updated.1);
+        assert_eq!(same.2, None);
+        drop(first);
+        drop(original);
+        drop(updated);
+        drop(same);
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn incremental_plain_capture_rejects_alpha_change_and_incomplete_journal() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(24, 16);
+        store.pixels = [44, 55, 66, 255].repeat(24 * 16);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: 24,
+            height: 16,
+        };
+        let old = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
+        let patches = NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed);
+        {
+            let mut views = VIEW_STORES.lock().unwrap();
+            let src = views.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            src.pixels[(3 * 24 + 7) * 4..(3 * 24 + 7) * 4 + 4].copy_from_slice(&[25, 50, 75, 128]);
+            src.touch_region(Rect {
+                x: 7,
+                y: 3,
+                width: 1,
+                height: 1,
+            });
+        }
+        let alpha = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
+        assert_eq!(NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed), patches);
+        assert_eq!(
+            &alpha.0[(3 * 24 + 7) * 4..(3 * 24 + 7) * 4 + 4],
+            &[25, 50, 75, 128]
+        );
+        assert_eq!(old.0[(3 * 24 + 7) * 4 + 3], 255);
+        {
+            let mut views = VIEW_STORES.lock().unwrap();
+            let src = views.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            src.pixels[(3 * 24 + 7) * 4..(3 * 24 + 7) * 4 + 4].copy_from_slice(&[25, 50, 75, 255]);
+            src.touch_region(Rect {
+                x: 7,
+                y: 3,
+                width: 1,
+                height: 1,
+            });
+        }
+        let opaque = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
+        assert_eq!(opaque.0[(3 * 24 + 7) * 4 + 3], 255);
+        assert_eq!(
+            NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed),
+            patches,
+            "no opaque chunk-hash cache existed after translucent capture"
+        );
+        {
+            let mut views = VIEW_STORES.lock().unwrap();
+            let src = views.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            for index in 0..36 {
+                let at = (index % (24 * 16)) * 4;
+                src.pixels[at] = index as u8;
+                src.touch_region(Rect {
+                    x: ((index / 4) % 24) as i64,
+                    y: (index % 4) as i64,
+                    width: 1,
+                    height: 1,
+                });
+            }
+        }
+        let recovered = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
+        assert_eq!(
+            NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed),
+            patches,
+            "a lost producer generation must fall back to full capture"
+        );
+        assert!(recovered.0[0] != opaque.0[0]);
+        drop(old);
+        drop(alpha);
+        drop(opaque);
+        drop(recovered);
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
     fn plain_view_capture_carries_exact_dirty_pixel_provenance() {
         crate::bootstrap();
         let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
@@ -4886,13 +5252,10 @@ fn changing_six_k_native_store_capture_costs() {
         }
     }
     assert_eq!(tiles.len(), 6);
+    let retained = std::env::var_os("ROSEMARY_BENCH_NATIVE_RETAIN_OLD").is_some();
     let mut prior = tiles
         .iter()
-        .map(|rect| {
-            native_scene_pixels_cropped_with_damage(view, W, H, *rect)
-                .unwrap()
-                .1
-        })
+        .map(|rect| native_scene_pixels_cropped_with_damage(view, W, H, *rect).unwrap())
         .collect::<Vec<_>>();
     let mut measured = Vec::new();
     for revision in 1..=24 {
@@ -4916,10 +5279,14 @@ fn changing_six_k_native_store_capture_costs() {
         for (i, rect) in tiles.iter().enumerate() {
             let (pixels, version, damage) =
                 native_scene_pixels_cropped_with_damage(view, W, H, *rect).unwrap();
-            assert_eq!(damage.unwrap().from_revision, prior[i]);
+            assert_eq!(damage.unwrap().from_revision, prior[i].1);
             let at = ((rect.height / 2 * rect.width + rect.width / 2) * 4) as usize;
             assert_eq!(pixels[at], revision as u8);
-            prior[i] = version;
+            if retained {
+                prior[i] = (pixels, version, damage);
+            } else {
+                prior[i].1 = version;
+            }
         }
         measured.push(started.elapsed().as_secs_f64() * 1000.);
     }
