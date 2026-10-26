@@ -3538,6 +3538,84 @@ fn full_six_k_unary_twenty_four_level_ca_chain_makes_progress_without_scratch() 
 
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress() {
+    if isolate_vulkan_graphical_test(
+        "irreducible_six_k_group_scene_is_terminal_but_changed_scene_can_progress",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let width = 6016u32;
+    let height = 3384u32;
+    let window =
+        sdl3::video::create_window(c"irreducible CA scratch", width as i32, height as i32, 0)
+            .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let frame = DirectFrame::from_frame(&test_full_frame(window, width, height));
+    let mut live = Vec::new();
+    // Each ancestor has both its own independently retained child source
+    // and the next nested group, requiring seven simultaneous 6K isolation
+    // surfaces. Unlike a unary alpha chain this is irreducible under 512 MiB.
+    for depth in 0..8 {
+        live.push(ScenePlacement {
+            id: 0x7200 + depth,
+            opacity_groups: (0..=depth)
+                .map(|n| appkit::view::OpacityGroup {
+                    id: 0x6200 + n,
+                    opacity: 0.5,
+                })
+                .collect(),
+            frame,
+            opacity: 1.0,
+            opaque: true,
+            clip: None,
+            rounded: vec![],
+            occluded: Some(vec![]),
+            native: None,
+        });
+    }
+    state.layers.extend(live.iter().map(|item| item.id));
+    state.scene_placements = live;
+    assert_eq!(
+        state.prepare_opacity_group_targets(0).unwrap_err(),
+        TERMINAL_GROUP_BUDGET
+    );
+    assert!(
+        state.group_targets.iter().all(Vec::is_empty),
+        "terminal preflight must not leave a partially allocated group"
+    );
+    // A different scene without seven branching levels is not poisoned by
+    // the rejected proposal; it can prepare and make forward progress.
+    state.scene_placements.truncate(1);
+    state.layers.truncate(1);
+    state.prepare_opacity_group_targets(0).unwrap();
+    assert!(state.group_targets.iter().all(Vec::is_empty));
+    drop(state);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn two_overlapping_full_six_k_sources_inside_twenty_four_ancestors_progress() {
     if isolate_vulkan_graphical_test(
         "two_overlapping_full_six_k_sources_inside_twenty_four_ancestors_progress",

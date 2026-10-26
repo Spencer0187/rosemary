@@ -1512,6 +1512,36 @@ impl Swapchain {
             extent.0 = extent.0.max(region.width as u32);
             extent.1 = extent.1.max(region.height as u32);
         }
+        // Compare a *lower bound* on the completed scene, excluding reusable
+        // scratch still referenced by earlier frame slots. This is distinct
+        // from transient GPU pressure: no amount of fence polling can make
+        // this proposed scene renderable under the 512 MiB scene ceiling.
+        let mut existing = std::collections::HashSet::new();
+        let resident_scratch = self
+            .group_targets
+            .iter()
+            .flatten()
+            .filter(|lease| existing.insert(Arc::as_ptr(lease) as usize))
+            .map(|lease| scene_image_bytes(PresentSource::from(&lease.image)))
+            .sum::<u64>();
+        let persistent = self
+            .committed_scene_bytes()
+            .saturating_sub(resident_scratch)
+            .saturating_sub(self.transaction_retiring_bytes);
+        let minimum_scratch = requirements
+            .iter()
+            .map(|&(width, height)| {
+                scene_image_bytes(PresentSource {
+                    image: vk::Image::null(),
+                    width,
+                    height,
+                    format: self.format,
+                })
+            })
+            .sum::<u64>();
+        if !fits_scene_budget(persistent, minimum_scratch) {
+            return Err(TERMINAL_GROUP_BUDGET.into());
+        }
         // A completed frame slot may release its scratch, but a submitted
         // one may still read it. Never steal an in-flight image on pressure.
         let description = Self::composite_description(self.format, self.extent, false);

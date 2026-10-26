@@ -127,6 +127,11 @@ fn gpu_image_payload_bytes(width: u32, height: u32, format: vk::Format) -> u64 {
 /// The accumulator submissions must not reuse their command buffers while
 /// those small copies are still in the GPU queue.
 const FRAMES_IN_FLIGHT: usize = 8;
+// A proposed scene whose immutable sources plus one scratch per *actual*
+// isolation depth cannot fit the retained-scene budget is not made valid by
+// waiting for fences. Preserve the last complete scene until the producer
+// publishes a different proposal rather than retrying that exact image.
+const TERMINAL_GROUP_BUDGET: &str = "Core Animation isolation scene irreducible under GPU budget";
 
 // Keep the historical Vulkan image handle at `.image` for callers while
 // retaining the actual allocation and its ledger charge behind an Arc.
@@ -3186,6 +3191,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                 .take();
             let mut retry_delay = None;
             let mut device_lost = false;
+            let mut terminal_group_budget = false;
             let mut admitted_update: Option<Vec<(usize, u64)>> = None;
             if let Some(live) = snapshot {
                 // Remember the AppKit publication identity *before* clipping
@@ -3226,7 +3232,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             let lost = error.contains("ERROR_DEVICE_LOST")
                                 || entry.gpu.lost.load(Ordering::Acquire);
                             gpu::trace(format!("direct scene transition deferred: {error}"));
-                            if !lost {
+                            if !lost && !error.contains(TERMINAL_GROUP_BUDGET) {
                                 requeue_scene(&entry.pending_scene, live);
                             }
                             drop(state);
@@ -3390,6 +3396,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                             gpu::trace(format!("native AppKit scene staging failed: {reason}"));
                             device_lost = reason.contains("ERROR_DEVICE_LOST")
                                 || entry.gpu.lost.load(Ordering::Acquire);
+                            terminal_group_budget = reason.contains(TERMINAL_GROUP_BUDGET);
                             native_ready = false;
                             break;
                         }
@@ -3420,7 +3427,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                     state.scene_repaint_needed = true;
                     state.scene_restore_pending = true;
                     if !device_lost {
-                        requeue_scene(&entry.pending_scene, effective);
+                        // Terminal capacity is a permanent inability to show
+                        // this exact immutable scene within the 512 MiB ceiling.
+                        // Retain its previous complete frame and await changed
+                        // producer metadata, not a busy polling/requeue loop.
+                        if !terminal_group_budget {
+                            requeue_scene(&entry.pending_scene, effective);
+                        }
                         retry_delay = Some(Duration::from_millis(10));
                     }
                 } else {
@@ -3463,7 +3476,13 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                                     // A transient recording/submission error must
                                     // not discard scene-only damage. Keep any
                                     // newer AppKit snapshot ahead of this retry.
-                                    requeue_scene(&entry.pending_scene, effective.clone());
+                                    if !error.contains(TERMINAL_GROUP_BUDGET) {
+                                        requeue_scene(&entry.pending_scene, effective.clone());
+                                    } else {
+                                        gpu::trace(
+                                            "Core Animation group scene permanently refused at the retained GPU memory ceiling",
+                                        );
+                                    }
                                     retry_delay = Some(Duration::from_millis(10));
                                 }
                             }
