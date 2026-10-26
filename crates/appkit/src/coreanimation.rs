@@ -4306,6 +4306,46 @@ mod tests {
     }
 
     #[test]
+    fn clipped_native_capture_reuses_only_matching_full_logical_geometry() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let view: Id = send(view, "initWithFrame:", rect(0., 0., 4., 2.));
+        send::<u8, ()>(view, "setWantsLayer:", 1);
+        let layer: Id = send(view, "layer", ());
+        let surface = surface();
+        send::<Id, ()>(layer, "setContents:", surface as Id);
+        set_gravity(layer, Gravity::Right);
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: 3,
+            height: 2,
+        };
+        let first = crate::backing::native_scene_pixels_cropped(view, 4, 2, crop)
+            .expect("right-anchored contents visible in clipped crop");
+        let before = crate::backing::native_render_count_for_tests();
+        let cached = crate::backing::native_scene_pixels_cropped(view, 4, 2, crop)
+            .expect("same source dimensions should reuse capture");
+        assert!(std::sync::Arc::ptr_eq(&first.0, &cached.0));
+        assert_eq!(crate::backing::native_render_count_for_tests(), before);
+        send::<NSRect, ()>(view, "setFrame:", rect(0., 0., 8., 2.));
+        // The viewport/crop stays identical but the source's right edge
+        // moves four pixels, so gravity must move this surface offscreen.
+        let changed = crate::backing::native_scene_pixels_cropped(view, 8, 2, crop);
+        assert!(
+            changed.is_none(),
+            "reused stale pixels from prior 4px-wide view"
+        );
+        assert!(crate::backing::native_render_count_for_tests() > before);
+        send::<NSRect, ()>(view, "setFrame:", rect(0., 0., 4., 2.));
+        let restored = crate::backing::native_scene_pixels_cropped(view, 4, 2, crop).unwrap();
+        assert_eq!(&*restored.0, &*first.0);
+        unsafe { corefoundation::api::CFRelease(surface) };
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
     fn metal_group_opacity_is_applied_after_overlapping_child_composition() {
         crate::bootstrap();
         let pool = objc::arc::pool_push();

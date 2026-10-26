@@ -294,7 +294,7 @@ struct NativeCapture {
     revision: u64,
     damage: Option<NativeCpuDamage>,
 }
-type CaptureKey = (usize, i64, i64, u32, u32, bool, u64);
+type CaptureKey = (usize, i64, i64, u32, u32, u32, u32, bool, u64);
 const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -1131,7 +1131,7 @@ pub(crate) fn forget(view: Id) {
     NATIVE_CAPTURES
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .retain(|(owner, _, _, _, _, _, _), _| *owner != key);
+        .retain(|(owner, _, _, _, _, _, _, _, _), _| *owner != key);
     crate::view::forget_native_tile_ids(view);
     NEEDS_DISPLAY
         .lock()
@@ -1732,6 +1732,8 @@ pub(crate) fn native_scene_pixels_cropped_with_damage(
         crop.y,
         crop.width as u32,
         crop.height as u32,
+        width,
+        height,
         false,
         0,
     );
@@ -1807,6 +1809,8 @@ fn native_scene_pixels_impl(
         crop.y,
         crop.width as u32,
         crop.height as u32,
+        width,
+        height,
         metal_children,
         selection_hash,
     );
@@ -1882,6 +1886,30 @@ fn native_scene_pixels_impl(
         && overlay.is_none()
         && !crate::coreanimation::has_tree(layer)
         && source.is_some();
+    // For a producer-verified local edit, other cached tiles remain
+    // bit-identical. Advance their generation without re-rasterizing or
+    // hashing a full tile; missing damage history fails closed below.
+    if plain_store && let Some(src) = source {
+        let mut captures = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(prior) = captures.get_mut(&key)
+            && prior.plain_store
+            && prior.layer == layer as usize
+            && prior.overlay_generation == overlay_generation
+            && prior.ca_content_revision == ca_content_revision
+            && prior.ca_descendant_revision == ca_descendant_revision
+            && prior.view_generation.is_some()
+            && src.width == width
+            && src.height == height
+            && src
+                .damage_since(prior.view_generation.unwrap())
+                .is_some_and(|region| region.intersection(&crop).is_empty())
+        {
+            prior.view_generation = view_generation;
+            prior.damage = None;
+            return Some((std::sync::Arc::clone(&prior.pixels), prior.revision));
+        }
+    }
+
     let damage = if plain_store && let Some(source) = source {
         NATIVE_CAPTURES
             .lock()
@@ -3838,6 +3866,61 @@ mod tests {
             None,
             "resize invalidates previous extent authority"
         );
+    }
+
+    #[test]
+    fn unchanged_native_tiles_reuse_pixels_after_disjoint_producer_damage() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(8, 4);
+        store.pixels = [0, 0, 255, 255].repeat(8 * 4);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let left = Rect {
+            x: 0,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let right = Rect {
+            x: 4,
+            y: 0,
+            width: 4,
+            height: 4,
+        };
+        let old_left = native_scene_pixels_cropped(view, 8, 4, left).unwrap();
+        let old_right = native_scene_pixels_cropped(view, 8, 4, right).unwrap();
+        let before = native_render_count_for_tests();
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            src.pixels[(1 * 8 + 6) * 4..(1 * 8 + 6) * 4 + 4].copy_from_slice(&[255, 0, 0, 255]);
+            src.touch_region(Rect {
+                x: 6,
+                y: 1,
+                width: 1,
+                height: 1,
+            });
+        }
+        let new_left = native_scene_pixels_cropped_with_damage(view, 8, 4, left).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&old_left.0, &new_left.0));
+        assert_eq!(new_left.1, old_left.1);
+        assert_eq!(new_left.2, None);
+        assert_eq!(
+            native_render_count_for_tests(),
+            before,
+            "unaffected tile was rasterized or rehashed"
+        );
+        let new_right = native_scene_pixels_cropped_with_damage(view, 8, 4, right).unwrap();
+        assert_eq!(new_right.2.unwrap().from_revision, old_right.1);
+        assert_ne!(new_right.1, old_right.1);
+        assert_eq!(native_render_count_for_tests(), before + 1);
+        forget(view);
+        objc::arc::release(view);
     }
 
     #[test]
