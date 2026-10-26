@@ -525,16 +525,19 @@ impl Parser<'_> {
             };
         }
         self.expect(">")?;
-        // Vulkan's sampled type is a 32-bit scalar, so a `half` or `short`
-        // texture reads and writes 32-bit texels, which an assignment or a
-        // constructor then narrows.
-        // FIXME (ACCURACY): arithmetic directly on a `half` texture's result
-        // runs at float precision rather than half.
+        // A `half` or `short` texture keeps its width here; the SPIR-V
+        // emitter converts at the image access, since Vulkan's sampled type is
+        // always 32-bit.
         let (texel, signed) = match element {
-            Ty::Scalar(Scalar::Float { .. }) => (Type::Float { bits: 32 }, false),
-            Ty::Scalar(Scalar::Int { signed, bits }) if bits >= 16 => (
+            Ty::Scalar(Scalar::Float {
+                bits: bits @ (16 | 32),
+            }) => (Type::Float { bits }, false),
+            Ty::Scalar(Scalar::Int {
+                signed,
+                bits: bits @ (16 | 32),
+            }) => (
                 Type::Int {
-                    bits: 32,
+                    bits,
                     signed: false,
                 },
                 signed,

@@ -743,8 +743,31 @@ fn source_msl_rejects_an_unknown_constexpr_sampler_argument() {
     );
 }
 
+/// The width of the float or integer type `id` names.
+fn scalar_width(module: &rspirv::dr::Module, id: u32) -> Option<u32> {
+    let ty = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.result_id == Some(id))?;
+    match ty.class.opcode {
+        Op::TypeFloat | Op::TypeInt => Some(ty.operands[0].unwrap_literal_bit32()),
+        Op::TypeVector => scalar_width(module, ty.operands[0].unwrap_id_ref()),
+        _ => None,
+    }
+}
+
+fn image_sampled_width(module: &rspirv::dr::Module) -> Option<u32> {
+    let image = module
+        .types_global_values
+        .iter()
+        .find(|instruction| instruction.class.opcode == Op::TypeImage)?;
+    scalar_width(module, image.operands[0].unwrap_id_ref())
+}
+
+/// Vulkan's sampled type is 32-bit, so a `half` texture samples through a
+/// 32-bit image and narrows the result before computing with it.
 #[test]
-fn source_msl_a_half_texture_samples_through_a_32_bit_image() {
+fn source_msl_a_half_texture_computes_at_half_precision() {
     let source = "#include <metal_stdlib>\n\
         using namespace metal;\n\
         struct Varyings { float4 pos [[position]]; float2 uv; };\n\
@@ -752,8 +775,7 @@ fn source_msl_a_half_texture_samples_through_a_32_bit_image() {
             texture2d<half, access::sample> tex [[ texture(0) ]],\n\
             sampler s [[ sampler(0) ]])\n\
         {\n\
-            half4 color = tex.sample(s, input.uv);\n\
-            return color;\n\
+            return tex.sample(s, input.uv) * 3.0h;\n\
         }\0";
     let target = TargetProfile {
         shader_float16: true,
@@ -761,19 +783,84 @@ fn source_msl_a_half_texture_samples_through_a_32_bit_image() {
     };
     let library = translate_msl(source, &target).unwrap();
     let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
-    let image = module
-        .types_global_values
-        .iter()
-        .find(|instruction| instruction.class.opcode == Op::TypeImage)
-        .expect("an image type");
-    let sampled = image.operands[0].unwrap_id_ref();
-    let float32 = module.types_global_values.iter().any(|instruction| {
-        instruction.result_id == Some(sampled)
-            && instruction.class.opcode == Op::TypeFloat
-            && instruction.operands[0] == rspirv::dr::Operand::LiteralBit32(32)
-    });
-    assert!(float32, "Vulkan requires a 32-bit sampled type");
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [sample] = &body_instructions(&module, Op::ImageSampleImplicitLod)[..] else {
+        panic!("expected one sample");
+    };
+    let convert = body_instructions(&module, Op::FConvert)
+        .into_iter()
+        .find(|convert| convert.operands[0].unwrap_id_ref() == sample.result_id.unwrap())
+        .expect("the sample is narrowed");
+    assert_eq!(
+        scalar_width(&module, convert.result_type.unwrap()),
+        Some(16)
+    );
+    let [multiply] = &body_instructions(&module, Op::FMul)[..] else {
+        panic!("expected one multiply");
+    };
+    assert_eq!(
+        scalar_width(&module, multiply.result_type.unwrap()),
+        Some(16)
+    );
 }
+
+/// A `ushort` texture reads and writes 32-bit texels and computes with
+/// 16-bit ones, so an addition wraps as Metal's does.
+#[test]
+fn source_msl_a_short_texture_computes_at_short_width() {
+    let target = TargetProfile {
+        shader_int16: true,
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(SHORT_TEXTURE_KERNEL, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    assert_eq!(image_sampled_width(&module), Some(32));
+    let [read] = &body_instructions(&module, Op::ImageRead)[..] else {
+        panic!("expected one read");
+    };
+    assert_eq!(scalar_width(&module, read.result_type.unwrap()), Some(32));
+    let [add] = &body_instructions(&module, Op::IAdd)[..] else {
+        panic!("expected one addition");
+    };
+    assert_eq!(scalar_width(&module, add.result_type.unwrap()), Some(16));
+    let [write] = &body_instructions(&module, Op::ImageWrite)[..] else {
+        panic!("expected one write");
+    };
+    let written = write.operands[2].unwrap_id_ref();
+    let widen = body_instructions(&module, Op::UConvert)
+        .into_iter()
+        .find(|convert| convert.result_id == Some(written))
+        .expect("the written texel is widened");
+    assert_eq!(scalar_width(&module, widen.result_type.unwrap()), Some(32));
+}
+
+/// Without `shaderInt16` a `ushort` texture's texels are computed as `uint`
+/// rather than rejected.
+#[test]
+fn source_msl_a_short_texture_widens_without_shader_int16() {
+    let target = TargetProfile {
+        shader_storage_image_read_without_format: true,
+        shader_storage_image_write_without_format: true,
+        ..TargetProfile::vulkan_1_3()
+    };
+    let library = translate_msl(SHORT_TEXTURE_KERNEL, &target).unwrap();
+    let module = rspirv::dr::load_words(&library.entries[0].words).unwrap();
+    let [add] = &body_instructions(&module, Op::IAdd)[..] else {
+        panic!("expected one addition");
+    };
+    assert_eq!(scalar_width(&module, add.result_type.unwrap()), Some(32));
+    assert!(body_instructions(&module, Op::UConvert).is_empty());
+}
+
+const SHORT_TEXTURE_KERNEL: &str = "#include <metal_stdlib>\n\
+    using namespace metal;\n\
+    kernel void add(texture2d<ushort, access::read_write> counts [[ texture(0) ]],\n\
+        uint2 gid [[ thread_position_in_grid ]])\n\
+    {\n\
+        counts.write(counts.read(gid) + ushort4(1), gid);\n\
+    }\0";
 
 #[test]
 fn source_msl_loops_leave_through_one_block() {

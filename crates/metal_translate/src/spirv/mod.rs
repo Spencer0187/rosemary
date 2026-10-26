@@ -1,7 +1,7 @@
 mod cfg;
 mod emit;
-mod half;
 mod structurize;
+mod widen;
 
 use cfg::{Merge, control_flow_merges};
 use emit::Emitter;
@@ -267,16 +267,13 @@ pub fn emit_spirv(
         ));
     }
     let widened;
-    let module = match target.shader_float16 {
-        false => match half::widen(module) {
-            Some(module) => {
-                module.verify()?;
-                widened = module;
-                &widened
-            }
-            None => module,
-        },
-        true => module,
+    let module = match widen::widen(module, target) {
+        Some(module) => {
+            module.verify()?;
+            widened = module;
+            &widened
+        }
+        None => module,
     };
     let entries = module
         .entries

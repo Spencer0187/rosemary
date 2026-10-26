@@ -158,13 +158,15 @@ impl TextureType {
     }
 
     /// The scalar type Vulkan's image type names, which carries the
-    /// signedness `texel` leaves out.
+    /// signedness `texel` leaves out. Vulkan only admits a 32-bit sampled
+    /// type, so a 16-bit texel is converted at each image access.
     pub fn sampled_scalar(&self) -> Type {
         match *self.texel {
-            Type::Int { bits, .. } => Type::Int {
-                bits,
+            Type::Int { .. } => Type::Int {
+                bits: 32,
                 signed: self.signed,
             },
+            Type::Float { .. } => Type::Float { bits: 32 },
             ref texel => texel.clone(),
         }
     }

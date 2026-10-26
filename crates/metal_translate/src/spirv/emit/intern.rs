@@ -111,7 +111,7 @@ impl Emitter {
         }
         let ty_id = self.type_id(ty)?;
         let id = match ty {
-            Type::Int { bits: 1..=32, .. } | Type::Float { bits: 32 } => {
+            Type::Int { bits: 1..=32, .. } | Type::Float { bits: 16 | 32 } => {
                 self.builder.constant_bit32(ty_id, value as u32)
             }
             Type::Int { bits: 33..=64, .. } => self.builder.constant_bit64(ty_id, value),
