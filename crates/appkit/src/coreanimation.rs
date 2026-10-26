@@ -2651,6 +2651,103 @@ pub(crate) enum Pass {
 
 /// Draw `view`'s layer tree into `store`, where the view sits at `rect` and
 /// may show within `clip`. Whether anything in it is still animating.
+// Bound aggregate CA mask and opacity-isolation snapshots separately
+// from the output Store.
+const CA_CAPTURE_SCRATCH_BUDGET: usize = 32 * 1024 * 1024;
+
+fn capture_scratch_clips(root: Id, store: &Store, clip: Rect) -> Vec<Rect> {
+    let area = clip.intersection(&Rect {
+        x: 0,
+        y: 0,
+        width: i64::from(store.width),
+        height: i64::from(store.height),
+    });
+    if area.is_empty() {
+        return Vec::new();
+    }
+    let max_snapshots = read_all_nodes(|nodes| {
+        fn walk(nodes: &HashMap<usize, Node>, id: usize, depth: usize) -> usize {
+            if depth > 64 {
+                return 0;
+            }
+            let Some(node) = nodes.get(&id) else { return 0 };
+            let local = usize::from(node.masks_to_bounds)
+                + usize::from(node.opacity != 1.0 || !node.animations.is_empty());
+            local
+                + node
+                    .sublayers
+                    .iter()
+                    .map(|child| walk(nodes, *child, depth + 1))
+                    .max()
+                    .unwrap_or(0)
+        }
+        walk(nodes, root as usize, 0)
+    });
+    if max_snapshots == 0
+        || (area.width as u64)
+            .saturating_mul(area.height as u64)
+            .saturating_mul(4)
+            .saturating_mul(max_snapshots as u64)
+            <= CA_CAPTURE_SCRATCH_BUDGET as u64
+    {
+        return vec![area];
+    }
+    let pixels = CA_CAPTURE_SCRATCH_BUDGET / (4 * max_snapshots);
+    let edge = (pixels as f64).sqrt().floor().max(1.0) as i64;
+    let mut clips = Vec::new();
+    let mut y = area.y;
+    while y < area.y + area.height {
+        let mut x = area.x;
+        while x < area.x + area.width {
+            clips.push(Rect {
+                x,
+                y,
+                width: edge.min(area.x + area.width - x),
+                height: edge.min(area.y + area.height - y),
+            });
+            x += edge;
+        }
+        y += edge;
+    }
+    clips
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_CA_CAPTURE_SCRATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEAK_CA_CAPTURE_SCRATCH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct CaptureScratchCharge {
+    #[cfg(test)]
+    bytes: usize,
+}
+impl CaptureScratchCharge {
+    fn new(bytes: usize) -> Self {
+        #[cfg(test)]
+        LIVE_CA_CAPTURE_SCRATCH.with(|live| {
+            let value = live
+                .get()
+                .checked_add(bytes)
+                .expect("scratch accounting overflow");
+            live.set(value);
+            PEAK_CA_CAPTURE_SCRATCH.with(|peak| peak.set(peak.get().max(value)));
+        });
+        #[cfg(not(test))]
+        let _ = bytes;
+        Self {
+            #[cfg(test)]
+            bytes,
+        }
+    }
+}
+impl Drop for CaptureScratchCharge {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        LIVE_CA_CAPTURE_SCRATCH.with(|live| live.set(live.get() - self.bytes));
+    }
+}
+
 pub(crate) fn render(view: Id, store: &mut Store, rect: Rect, clip: Rect, pass: Pass) -> bool {
     render_with_root_opacity(view, store, rect, clip, pass, None)
 }
@@ -2718,17 +2815,19 @@ pub(crate) fn render_with_root_opacity(
                 x: view_bounds.origin.x - root_presented.bounds_origin.x,
                 y: view_bounds.origin.y - root_presented.bounds_origin.y,
             };
-            for child in root_presented.sublayers {
-                animating |= draw_layer(
-                    store,
-                    &mapping,
-                    child as Id,
-                    origin,
-                    clip,
-                    root_presented.opacity,
-                    now,
-                    0,
-                );
+            for tile in capture_scratch_clips(root, store, clip) {
+                for &child in &root_presented.sublayers {
+                    animating |= draw_layer(
+                        store,
+                        &mapping,
+                        child as Id,
+                        origin,
+                        tile,
+                        root_presented.opacity,
+                        now,
+                        0,
+                    );
+                }
             }
             animating
         }
@@ -2826,6 +2925,7 @@ fn paint_rounded_contribution(
         let start = (row as usize * store.width as usize + area.x as usize) * 4;
         before.extend_from_slice(&store.pixels[start..start + row_bytes]);
     }
+    let _scratch = CaptureScratchCharge::new(before.len());
     paint(store);
     for (row, source) in before.chunks_exact(row_bytes).enumerate() {
         let y = area.y + row as i64;
@@ -2918,6 +3018,7 @@ fn draw_layer_filtered(
         }
         saved
     });
+    let _opacity_scratch = CaptureScratchCharge::new(before.as_ref().map_or(0, Vec::len));
     let opacity = opacity
         * if isolated || isolated_on_gpu {
             1.0
@@ -3279,23 +3380,25 @@ pub(crate) fn render_metal_sublayers_selected(
         y: mapping.view_bounds.origin.y - presented.bounds_origin.y,
     };
     let mut animating = false;
-    for child in presented.sublayers {
-        if excluded.contains(&child) {
-            continue;
+    for tile in capture_scratch_clips(root, store, clip) {
+        for &child in &presented.sublayers {
+            if excluded.contains(&child) {
+                continue;
+            }
+            animating |= draw_layer_filtered(
+                store,
+                &mapping,
+                child as Id,
+                origin,
+                tile,
+                1.0,
+                now,
+                0,
+                &excluded,
+                selected,
+                gpu_groups,
+            );
         }
-        animating |= draw_layer_filtered(
-            store,
-            &mapping,
-            child as Id,
-            origin,
-            clip,
-            1.0,
-            now,
-            0,
-            &excluded,
-            selected,
-            gpu_groups,
-        );
     }
     animating
 }
@@ -4982,6 +5085,134 @@ mod tests {
         unsafe { corefoundation::api::CFRelease(surface) };
         objc::arc::release(a);
         objc::arc::release(b);
+        objc::arc::pool_pop(pool);
+    }
+
+    #[test]
+    fn deep_large_rounded_masks_bound_aggregate_cpu_scratch_and_match_untiled_pixels() {
+        crate::bootstrap();
+        let pool = objc::arc::pool_push();
+        let view_class = objc::class::lookup(c"NSView").unwrap();
+        let metal_class = objc::class::ptr(objc::class::lookup(c"CAMetalLayer").unwrap()) as Id;
+        let ca_class = objc::class::ptr(objc::class::lookup(c"CALayer").unwrap()) as Id;
+        let green = [0, 255, 0, 255];
+        for (depth, width, height, metal_backed) in [
+            (24usize, 3840usize, 2160usize, true),
+            (64, 2048, 2048, true),
+            (64, 1024, 1024, false),
+        ] {
+            let view: Id = send(
+                objc::object::create_instance(view_class, 0),
+                "initWithFrame:",
+                rect(0., 0., width as f64, height as f64),
+            );
+            let root: Id = send(
+                if metal_backed { metal_class } else { ca_class },
+                "layer",
+                (),
+            );
+            send::<Id, ()>(view, "setLayer:", root);
+            let mut parent = root;
+            for n in 0..depth {
+                let layer: Id = send(ca_class, "layer", ());
+                send::<NSRect, ()>(
+                    layer,
+                    "setFrame:",
+                    rect(0., 0., width as f64, height as f64),
+                );
+                send::<u8, ()>(layer, "setMasksToBounds:", 1);
+                send::<f64, ()>(layer, "setCornerRadius:", 32.);
+                if n % 8 == 0 {
+                    send::<f32, ()>(layer, "setOpacity:", 0.75);
+                }
+                send::<Id, ()>(parent, "addSublayer:", layer);
+                parent = layer;
+            }
+            let red = unsafe { crate::cgcontext::CGColorCreateGenericRGB(1., 0., 0., 1.) };
+            let blue = unsafe { crate::cgcontext::CGColorCreateGenericRGB(0., 0., 1., 0.5) };
+            for color in [red, blue] {
+                let child: Id = send(ca_class, "layer", ());
+                send::<NSRect, ()>(
+                    child,
+                    "setFrame:",
+                    rect(0., 0., width as f64, height as f64),
+                );
+                send::<CFTypeRef, ()>(child, "setBackgroundColor:", color);
+                send::<Id, ()>(parent, "addSublayer:", child);
+            }
+            let entire = Rect {
+                x: 0,
+                y: 0,
+                width: width as i64,
+                height: height as i64,
+            };
+            let make_store = || {
+                let mut store = Store::for_tests(width as u32, height as u32);
+                for pixel in store.pixels.chunks_exact_mut(4) {
+                    pixel.copy_from_slice(&green);
+                }
+                store
+            };
+            let mut tiled = make_store();
+            LIVE_CA_CAPTURE_SCRATCH.with(|live| assert_eq!(live.get(), 0));
+            PEAK_CA_CAPTURE_SCRATCH.with(|peak| peak.set(0));
+            let began = std::time::Instant::now();
+            if metal_backed {
+                render_metal_sublayers_selected(view, &mut tiled, entire, entire, &[], &[]);
+            } else {
+                render(view, &mut tiled, entire, entire, Pass::Sublayers);
+            }
+            let duration = began.elapsed();
+            let peak = PEAK_CA_CAPTURE_SCRATCH.with(|peak| peak.get());
+            let live = LIVE_CA_CAPTURE_SCRATCH.with(|live| live.get());
+            assert_eq!(live, 0, "scratch must retire after capture");
+            assert!(
+                peak <= CA_CAPTURE_SCRATCH_BUDGET,
+                "depth={depth}: accumulated {peak} CPU scratch bytes exceeded {}",
+                CA_CAPTURE_SCRATCH_BUDGET
+            );
+            let mut reference = make_store();
+            for region in [
+                Rect {
+                    x: 0,
+                    y: 0,
+                    width: 64,
+                    height: 64,
+                },
+                Rect {
+                    x: width as i64 / 2 - 32,
+                    y: height as i64 / 2 - 32,
+                    width: 64,
+                    height: 64,
+                },
+                Rect {
+                    x: width as i64 - 64,
+                    y: height as i64 - 64,
+                    width: 64,
+                    height: 64,
+                },
+            ] {
+                // An exact, untiled 64x64 subtree render of the SAME
+                // geometry is an independent pixel oracle for each tile.
+                if metal_backed {
+                    render_metal_sublayers_selected(view, &mut reference, entire, region, &[], &[]);
+                } else {
+                    render(view, &mut reference, entire, region, Pass::Sublayers);
+                }
+                for y in region.y as usize..(region.y + region.height) as usize {
+                    let start = (y * width + region.x as usize) * 4;
+                    let end = start + region.width as usize * 4;
+                    assert_eq!(
+                        &tiled.pixels[start..end],
+                        &reference.pixels[start..end],
+                        "depth={depth}, mismatched premultiplied nested mask at y={y}"
+                    );
+                }
+            }
+            eprintln!(
+                "nested CPU rounded mask: {width}x{height}, depth={depth}, metal={metal_backed}, peak_scratch={peak} bytes, capture={duration:?}"
+            );
+        }
         objc::arc::pool_pop(pool);
     }
 
