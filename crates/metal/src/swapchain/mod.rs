@@ -23,6 +23,7 @@ use crate::gpu::{self, Gpu, GpuImage, ImageDescription};
 // limits cannot guarantee a hard aggregate when both own images for a window.
 // A retired image stays charged until its last GPU fence-held Arc is dropped.
 const WINDOW_GPU_PAYLOAD_BUDGET: u64 = 768 * 1024 * 1024;
+const NATIVE_SCENE_GPU_BUDGET_EXHAUSTED: &str = "native AppKit GPU scene budget exhausted";
 struct WindowGpuBudget {
     held: std::sync::atomic::AtomicU64,
 }
@@ -2363,6 +2364,70 @@ fn stage_native_scene_source(
 static TILED_NATIVE_GPU_COPY_COUNT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+// Use the same producer proof for upload selection and physical-memory preflight.
+// An uncertain predecessor requires a complete, independent upload.
+fn tiled_native_predecessor(
+    state: &Swapchain,
+    layer: &ScenePlacement,
+) -> Option<(Arc<BackingImageLease>, appkit::backing::Rect)> {
+    let native = layer.native.as_ref()?;
+    let tiles = native.tiles.as_ref()?;
+    let damage = native.cpu_capture?.damage?;
+    let rect = damage.rect;
+    if rect.x < 0
+        || rect.y < 0
+        || rect.width <= 0
+        || rect.height <= 0
+        || rect.x.checked_add(rect.width)? > i64::from(tiles.width)
+        || rect.y.checked_add(rect.height)? > i64::from(tiles.height)
+    {
+        return None;
+    }
+    let changed_bytes = (rect.width as u64)
+        .saturating_mul(rect.height as u64)
+        .saturating_mul(4);
+    if changed_bytes >= tiles.len() as u64 / 2 {
+        return None;
+    }
+    let prior = state.scene_layers.iter().find(|source| {
+        source.id == layer.id
+            && source.ready
+            && source.frame.width == layer.frame.width
+            && source.frame.height == layer.frame.height
+            && source.native_revision == Some(damage.from_revision)
+            && source.native_dma_sample.is_none()
+    })?;
+    Some((Arc::clone(&prior.snapshot), rect))
+}
+
+fn tiled_native_staging_bytes(state: &Swapchain, layer: &ScenePlacement) -> u64 {
+    let tiles = layer
+        .native
+        .as_ref()
+        .and_then(|native| native.tiles.as_ref());
+    let whole = tiles.map_or(0, |tiles| tiles.len() as u64);
+    let upload = tiled_native_predecessor(state, layer).map_or(whole, |(_, rect)| {
+        (rect.width as u64)
+            .saturating_mul(rect.height as u64)
+            .saturating_mul(4)
+    });
+    whole.saturating_add(upload)
+}
+
+// Both representations preserve the only Metal source when it lives in the
+// flattened window accumulator instead of a retained scene snapshot.
+fn accept_staged_native_image(
+    state: &mut Swapchain,
+    layer: &ScenePlacement,
+    image: Arc<BackingImageLease>,
+) -> Result<(), String> {
+    if state.layers.len() == 1 && state.scene_layers.is_empty() && state.layers[0] != layer.id {
+        state.capture_single_scene_from_composite()?;
+    }
+    state.accept_native_gpu_snapshot(layer, image);
+    Ok(())
+}
+
 /// Stage an immutable row-banded CPU source without ever flattening its
 /// entire image in host RAM. After the first full staging upload, known dirty
 /// generations copy the previous *GPU* snapshot into a new private lease and
@@ -2383,50 +2448,14 @@ fn stage_tiled_native_source(
         return Err("invalid tiled native source image".into());
     }
     let whole_bytes = tiles.len() as u64;
-    // A partial transfer is valid only when the retained GPU image is a
-    // successfully committed generation of this source, with equal geometry.
-    let old = native
-        .cpu_capture
-        .and_then(|capture| capture.damage)
-        .and_then(|damage| {
-            let r = damage.rect;
-            (r.x >= 0
-                && r.y >= 0
-                && r.width > 0
-                && r.height > 0
-                && r.x.checked_add(r.width)? <= i64::from(tiles.width)
-                && r.y.checked_add(r.height)? <= i64::from(tiles.height))
-            .then_some((damage.from_revision, r))
-        })
-        .and_then(|(prior, r)| {
-            state
-                .scene_layers
-                .iter()
-                .find(|source| {
-                    source.id == layer.id
-                        && source.ready
-                        && source.frame.width == layer.frame.width
-                        && source.frame.height == layer.frame.height
-                        && source.native_revision == Some(prior)
-                        && source.native_dma_sample.is_none()
-                })
-                .map(|old| (Arc::clone(&old.snapshot), r))
-        });
-    // At or above half-frame damage, copying the complete predecessor
-    // image only to overwrite most of it costs extra GPU bandwidth.
-    let old = old.filter(|(_, rect)| {
-        let bytes = (rect.width as u64)
-            .saturating_mul(rect.height as u64)
-            .saturating_mul(4);
-        bytes < whole_bytes / 2
-    });
+    let old = tiled_native_predecessor(state, layer);
     let patch = old.as_ref().map(|(_, rect)| *rect);
     let upload = patch.map_or(whole_bytes, |r| {
         (r.width as u64)
             .saturating_mul(r.height as u64)
             .saturating_mul(4)
     });
-    let incoming = whole_bytes.saturating_add(upload);
+    let incoming = tiled_native_staging_bytes(state, layer);
     state.retire_copied();
     if !scene::fits_scene_budget(state.budgeted_scene_bytes(), incoming) {
         state.shed_scene_spares();
@@ -2434,7 +2463,7 @@ fn stage_tiled_native_source(
             return if scene::fits_scene_budget(state.projected_committed_scene_bytes(), incoming) {
                 Ok(None)
             } else {
-                Err("tiled native scene GPU budget exhausted".into())
+                Err(NATIVE_SCENE_GPU_BUDGET_EXHAUSTED.into())
             };
         }
     }
@@ -2598,7 +2627,7 @@ fn stage_tiled_native_source(
             &[visible],
         );
     })?;
-    state.accept_native_gpu_snapshot(layer, lease);
+    accept_staged_native_image(state, layer, lease)?;
     Ok(StagedNativeIdentity::from_placement(layer))
 }
 
@@ -2720,7 +2749,7 @@ fn stage_native_scene_source_effective(
             // Only a committed, non-evictable footprint is a hard failure.
             // A temporarily pinned generation must never poison importer
             // capability for the next attempt after GPU fence retirement.
-            return Err("native AppKit GPU scene budget exhausted".into());
+            return Err(NATIVE_SCENE_GPU_BUDGET_EXHAUSTED.into());
         }
     }
     // Unlike an impossible committed-scene footprint, transient backing
@@ -3036,14 +3065,8 @@ fn stage_native_scene_source_effective(
         }
     }
     let source = blended.unwrap_or(lease);
-    // The CPU upload or completed DMA blend is already a GPU-owned native
-    // snapshot. Retain it without allocating/copying a second per-tile image.
-    // A previously flattened single Metal layer must be captured first or its
-    // static background disappears when the first native foreground joins.
-    if state.layers.len() == 1 && state.scene_layers.is_empty() && state.layers[0] != layer.id {
-        state.capture_single_scene_from_composite()?;
-    }
-    state.accept_native_gpu_snapshot(layer, source);
+    // The uploaded CPU source or completed DMA blend is already a GPU image.
+    accept_staged_native_image(state, layer, source)?;
     Ok(StagedNativeIdentity::from_placement(layer))
 }
 
@@ -3131,12 +3154,17 @@ fn stage_native_transaction_source(
                 let pixels = u64::from(layer.frame.width)
                     .saturating_mul(u64::from(layer.frame.height))
                     .saturating_mul(4);
-                let sources = if cached_native_cpu_base(state, layer).is_some() {
-                    1
+                let required = if native.tiles.is_some() {
+                    tiled_native_staging_bytes(state, layer)
                 } else {
-                    1 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty())
+                    let sources = if cached_native_cpu_base(state, layer).is_some() {
+                        1
+                    } else {
+                        1 + u64::from(native.dmabuf.is_some()) + u64::from(!native.bytes.is_empty())
+                    };
+                    pixels.saturating_mul(sources)
                 };
-                !window_gpu_capacity_available(state.window, pixels.saturating_mul(sources))
+                !window_gpu_capacity_available(state.window, required)
             });
         if physical_pressure
             || matches!(result.as_ref(), Err(reason)
@@ -3628,7 +3656,7 @@ fn layer_compositor_worker(window: usize, entry: Arc<WindowSwapchain>) {
                         }
                         Err(reason)
                             if reason == "native-dmabuf-import-refused"
-                                || reason == "native AppKit GPU scene budget exhausted"
+                                || reason == NATIVE_SCENE_GPU_BUDGET_EXHAUSTED
                                 || reason
                                     == "native AppKit atomic GPU transition peak exhausted" =>
                         {

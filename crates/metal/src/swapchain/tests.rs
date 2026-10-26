@@ -6143,6 +6143,261 @@ fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
 /// seams and later static-Metal membership changes.
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn tiled_native_foreground_preserves_flattened_single_metal_background() {
+    if isolate_vulkan_graphical_test(
+        "tiled_native_foreground_preserves_flattened_single_metal_background",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let background = test_opaque_metal_placement(0x9031, DirectFrame::from_frame(&whole));
+    state.layers.push(background.id);
+    state.note_scene_frame(background.id, &whole);
+    state.scene_placements.push(background.clone());
+    let accumulated = state.composite().unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, accumulated, [0.0, 1.0, 0.0, 1.0]);
+    })
+    .unwrap();
+    assert!(
+        state.scene_layers.is_empty(),
+        "fixture must begin with flattened Metal"
+    );
+
+    let pixels = [0u8, 0, 255, 255].repeat(40 * 32);
+    let tiles =
+        Arc::new(appkit::backing::NativePixelTiles::from_opaque_bgra(40, 32, &pixels).unwrap());
+    let foreground_frame = appkit::view::Frame {
+        x: 34,
+        y: 23,
+        width: 40,
+        height: 32,
+        ..whole
+    };
+    let mut foreground =
+        test_opaque_metal_placement(0x9032, DirectFrame::from_frame(&foreground_frame));
+    foreground.opaque = false;
+    foreground.native = Some(scene::NativeCpuSceneSource {
+        bytes: Arc::new(Vec::new()),
+        tiles: Some(Arc::clone(&tiles)),
+        revision: tiles.revision,
+        cpu_capture: None,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    assert_eq!(stage_native_scene_source(&mut state, &foreground), Ok(true));
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|layer| layer.id == background.id)
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|layer| layer.id == foreground.id)
+    );
+    state.synchronize_scene(window as usize, &[background, foreground]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 4, 4),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 40, 30),
+        [255, 0, 0, 255]
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_scene_budget_exhaustion_uses_terminal_refusal() {
+    if isolate_vulkan_graphical_test("tiled_native_scene_budget_exhaustion_uses_terminal_refusal") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for index in 0..32usize {
+        let source = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.seed_accepted_native_for_budget_test(
+            0x7000 + index,
+            DirectFrame::from_frame(&whole),
+            source,
+        );
+    }
+    assert_eq!(state.projected_committed_scene_bytes(), 512 * 1024 * 1024);
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            40,
+            32,
+            &[0u8, 0, 255, 255].repeat(40 * 32),
+        )
+        .unwrap(),
+    );
+    let frame = appkit::view::Frame {
+        width: 40,
+        height: 32,
+        ..whole
+    };
+    let mut proposed = test_opaque_metal_placement(0xfed0, DirectFrame::from_frame(&frame));
+    proposed.opaque = false;
+    proposed.native = Some(scene::NativeCpuSceneSource {
+        bytes: Arc::new(Vec::new()),
+        tiles: Some(Arc::clone(&tiles)),
+        revision: tiles.revision,
+        cpu_capture: None,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    assert_eq!(
+        stage_native_scene_source(&mut state, &proposed),
+        Err(NATIVE_SCENE_GPU_BUDGET_EXHAUSTED.to_owned()),
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .all(|layer| layer.id != proposed.id)
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_staging_escrows_retired_gpu_image_when_upload_buffer_is_pressured() {
+    if isolate_vulkan_graphical_test(
+        "tiled_native_staging_escrows_retired_gpu_image_when_upload_buffer_is_pressured",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let width = 64u32;
+    let height = 64u32;
+    let image_bytes = u64::from(width) * u64::from(height) * 4;
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width,
+        height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let old_image = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, old_image.image.image, [0.0, 0.0, 1.0, 1.0]);
+    })
+    .unwrap();
+    let id = 0xbe80;
+    let frame = DirectFrame::from_frame(&appkit::view::Frame {
+        width,
+        height,
+        ..whole
+    });
+    state.seed_accepted_native_for_budget_test(id, frame, old_image);
+    let mut rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    state.transaction_pinned = state
+        .scene_layers
+        .iter()
+        .map(|layer| Arc::clone(&layer.snapshot))
+        .collect();
+    state.transaction_retiring_bytes = image_bytes;
+    let mut proposed = state.scene_placements.clone();
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            width,
+            height,
+            &[255u8, 0, 0, 255].repeat((width * height) as usize),
+        )
+        .unwrap(),
+    );
+    let native = proposed[0].native.as_mut().unwrap();
+    native.revision = tiles.revision;
+    native.tiles = Some(tiles);
+    assert_eq!(
+        tiled_native_staging_bytes(&state, &proposed[0]),
+        image_bytes * 2
+    );
+    let held = state.scene_gpu_bytes();
+    let free = image_bytes + image_bytes / 2;
+    let blocker =
+        GpuCharge::reserve(window as usize, WINDOW_GPU_PAYLOAD_BUDGET - held - free).unwrap();
+    assert!(window_gpu_capacity_available(window as usize, image_bytes));
+    assert!(!window_gpu_capacity_available(
+        window as usize,
+        image_bytes * 2
+    ));
+    assert_eq!(
+        stage_native_transaction_source(&mut state, &proposed[0], &mut rollback, &proposed),
+        Ok(StagedNativeIdentity::from_placement(&proposed[0])),
+    );
+    assert!(
+        rollback[0].resident().is_none(),
+        "retired GPU image was not escrowed"
+    );
+    assert_eq!(
+        state.scene_layers[0].native_revision,
+        Some(proposed[0].native.as_ref().unwrap().revision)
+    );
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.scene_layers[0].snapshot.image.image,
+            width,
+            height,
+            20,
+            20
+        ),
+        [255, 0, 0, 255],
+    );
+    drop(blocker);
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(rollback);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image() {
     if isolate_vulkan_graphical_test(
         "immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image",
