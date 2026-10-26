@@ -137,10 +137,11 @@ pub const NAMES: &[(&str, &str)] = &[
     ("open", "the O_ flags differ"),
     ("openat", "the O_ flags differ"),
     // Their ABI agrees, but their effect on the emulated per-socket
-    // `SO_NOSIGPIPE` state must be observed. See `crate::net::descriptor`.
-    ("close", "must discard emulated per-descriptor socket state"),
-    ("dup", "must inherit emulated per-descriptor socket state"),
-    ("dup2", "must replace emulated per-descriptor socket state"),
+    // `SO_NOSIGPIPE` state and on the kqueue table must be observed. See
+    // `crate::net::descriptor`.
+    ("close", "must discard emulated per-descriptor state"),
+    ("dup", "must inherit emulated per-descriptor state"),
+    ("dup2", "must replace emulated per-descriptor state"),
     // Darwin's `struct passwd` has BSD's `pw_change` and `pw_class` in the middle,
     // so `pw_dir` is at offset 48 - past the end of this host's whole structure.
     // `crate::passwd` answers the two lookups; the reentrant pair stay denied.
