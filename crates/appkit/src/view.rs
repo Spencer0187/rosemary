@@ -134,6 +134,14 @@ pub struct MetalSceneLayer {
     pub native_owner: usize,
 }
 
+impl MetalSceneLayer {
+    /// Whether the GPU worker gets CPU pixels for this layer, contiguous or
+    /// row-banded.
+    pub fn has_native_cpu_source(&self) -> bool {
+        self.native_pixels.is_some() || self.native_tiles.is_some()
+    }
+}
+
 static NATIVE_TILE_IDS: std::sync::LazyLock<Mutex<HashMap<(usize, u32), usize>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 static NATIVE_NEXT_TILE: AtomicUsize = AtomicUsize::new(1);
@@ -641,7 +649,7 @@ pub(crate) fn native_metal_scene_active(window: sdl3::Window) -> bool {
         .is_some_and(|scene| {
             scene
                 .iter()
-                .any(|item| item.native_pixels.is_none() && item.native_dmabuf.is_none())
+                .any(|item| !item.has_native_cpu_source() && item.native_dmabuf.is_none())
         })
 }
 
@@ -1244,9 +1252,7 @@ fn visit_metal_scene(
                                         revision,
                                         damage,
                                     }),
-                                native_pixels: cpu.map(|(pixels, _, _)| pixels).or_else(|| {
-                                    tiled.as_ref().map(|_| std::sync::Arc::new(Vec::new()))
-                                }),
+                                native_pixels: cpu.map(|(pixels, _, _)| pixels),
                                 native_tiles: tiled.map(|(tiles, _, _)| tiles),
                                 native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
                                 native_dma_sample: sample,
@@ -1337,6 +1343,7 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
                 && a.native_revision == b.native_revision
                 && a.native_dma_sample == b.native_dma_sample
                 && a.native_pixels.is_some() == b.native_pixels.is_some()
+                && a.native_tiles.is_some() == b.native_tiles.is_some()
                 && a.native_dmabuf.is_some() == b.native_dmabuf.is_some()
                 && a.rounded.len() == b.rounded.len()
                 && a.rounded
@@ -3581,7 +3588,7 @@ mod tests {
         let admitted = metal_scene(sdl)
             .unwrap_or_default()
             .into_iter()
-            .filter(|p| p.native_pixels.is_some() || p.native_dmabuf.is_some())
+            .filter(|p| p.has_native_cpu_source() || p.native_dmabuf.is_some())
             .map(|p| (p.layer, p.native_revision))
             .collect::<Vec<_>>();
         crate::backing::set_native_gpu_admission(sdl, &admitted);
@@ -6080,7 +6087,6 @@ mod tests {
         let mut total = 0u64;
         for tile in &tiles {
             assert!(ids.insert(tile.layer), "two tiles shared one GPU layer ID");
-            assert!(tile.native_pixels.as_ref().unwrap().len() <= 64 * 1024 * 1024);
             if let Some(snapshot) = tile.native_tiles.as_ref() {
                 assert_eq!(
                     snapshot.len(),
@@ -6089,8 +6095,9 @@ mod tests {
                 let mut first = [0u8; 4];
                 snapshot.copy_rect_to(0, 0, 1, 1, &mut first).unwrap();
                 assert_eq!(first, [0, 0, 255, 255]);
-                assert!(tile.native_pixels.as_ref().unwrap().is_empty());
+                assert!(tile.native_pixels.is_none());
             } else {
+                assert!(tile.native_pixels.as_ref().unwrap().len() <= 64 * 1024 * 1024);
                 assert_eq!(
                     tile.native_pixels.as_ref().unwrap().len(),
                     tile.frame.width as usize * tile.frame.height as usize * 4
@@ -6135,12 +6142,7 @@ mod tests {
         let first_capture = crate::backing::native_render_count_for_tests();
         let old: Vec<_> = tiles
             .iter()
-            .map(|p| {
-                (
-                    p.native_pixels.as_ref().unwrap().clone(),
-                    p.native_tiles.clone(),
-                )
-            })
+            .map(|p| (p.native_pixels.clone(), p.native_tiles.clone()))
             .collect();
         for _ in 0..3 {
             invalidate_metal_scene_for_window(sdl);
@@ -6152,12 +6154,16 @@ mod tests {
                 .collect();
             assert_eq!(actual.len(), old.len());
             for (tile, (pixels, snapshot)) in actual.iter().zip(old.iter()) {
+                let same_pixels = match (&tile.native_pixels, pixels) {
+                    (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
+                    _ => false,
+                };
+                let same_tiles = match (&tile.native_tiles, snapshot) {
+                    (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
+                    _ => false,
+                };
                 assert!(
-                    std::sync::Arc::ptr_eq(tile.native_pixels.as_ref().unwrap(), pixels)
-                        || match (&tile.native_tiles, snapshot) {
-                            (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
-                            _ => false,
-                        },
+                    same_pixels || same_tiles,
                     "unchanged 6K tile rerendered instead of using retained Arc"
                 );
             }

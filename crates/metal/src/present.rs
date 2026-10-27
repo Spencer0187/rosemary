@@ -2982,7 +2982,7 @@ mod drawable_pool_tests {
         let admitted = appkit::view::metal_scene(sdl)
             .unwrap_or_default()
             .into_iter()
-            .filter(|p| p.native_pixels.is_some() || p.native_dmabuf.is_some())
+            .filter(|p| p.has_native_cpu_source() || p.native_dmabuf.is_some())
             .map(|p| (p.layer, p.native_revision))
             .collect::<Vec<_>>();
         assert!(!admitted.is_empty());

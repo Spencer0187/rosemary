@@ -2010,7 +2010,6 @@ fn native_scene_source(
     }
     let pixels = match (pixels, dmabuf.as_ref()) {
         (Some(pixels), _) if pixels.len() as u64 == bytes => pixels,
-        (Some(pixels), _) if pixels.is_empty() && tiles.is_some() => pixels,
         (None, _) if tiles.is_some() => Arc::new(Vec::new()),
         // An empty byte slice means an entirely transparent native CPU base.
         // The GPU clears the staging target; no full-resolution zero-filled

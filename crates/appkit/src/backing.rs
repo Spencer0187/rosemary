@@ -2869,7 +2869,7 @@ fn admitted_native_in_published_scene(
         let relevant = if dma_only {
             layer.native_dmabuf.is_some()
         } else {
-            layer.native_pixels.is_some() || layer.native_dmabuf.is_some()
+            layer.has_native_cpu_source() || layer.native_dmabuf.is_some()
         };
         if !relevant {
             continue;
