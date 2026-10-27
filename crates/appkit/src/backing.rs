@@ -123,7 +123,7 @@ impl Store {
             2 => true,
             _ => {
                 #[cfg(test)]
-                OPAQUE_ALPHA_SCANS.fetch_add(1, Ordering::Relaxed);
+                OPAQUE_ALPHA_SCANS.with(|count| count.set(count.get() + 1));
                 let opaque = self
                     .pixels
                     .as_chunks::<4>()
@@ -263,10 +263,13 @@ pub struct Hole {
 }
 
 #[cfg(test)]
-static OPAQUE_ALPHA_SCANS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    // Test probes must count only work performed by their own test thread.
+    static OPAQUE_ALPHA_SCANS: Cell<usize> = const { Cell::new(0) };
+}
 #[cfg(test)]
 pub(crate) fn opaque_alpha_scan_count_for_tests() -> usize {
-    OPAQUE_ALPHA_SCANS.load(Ordering::Relaxed)
+    OPAQUE_ALPHA_SCANS.with(Cell::get)
 }
 
 /// Each window's composite, keyed by the SDL window's address.
@@ -446,7 +449,6 @@ impl NativePixelTiles {
                 let band_start = band_index * NATIVE_TILE_ROWS;
                 let from = start_y.max(band_start);
                 let to = end_y.min(band_start + NATIVE_TILE_ROWS);
-                let pixels = std::sync::Arc::make_mut(next.bands.get_mut(band_index)?);
                 for row in from..to {
                     let src_at = ((crop.y as usize + row) * source.width as usize
                         + crop.x as usize
@@ -455,11 +457,19 @@ impl NativePixelTiles {
                     let dst_at = (row - band_start)
                         .checked_mul(stride)?
                         .checked_add(start_x.checked_mul(4)?)?;
-                    pixels
-                        .get_mut(dst_at..dst_at + columns * 4)?
-                        .copy_from_slice(source.pixels.get(src_at..src_at + columns * 4)?);
+                    let count = columns.checked_mul(4)?;
+                    let authored = source.pixels.get(src_at..src_at.checked_add(count)?)?;
+                    let prior = next
+                        .bands
+                        .get(band_index)?
+                        .get(dst_at..dst_at.checked_add(count)?)?;
+                    if authored != prior {
+                        std::sync::Arc::make_mut(next.bands.get_mut(band_index)?)
+                            .get_mut(dst_at..dst_at + count)?
+                            .copy_from_slice(authored);
+                        touched[band_index] = true;
+                    }
                 }
-                touched[band_index] = true;
             }
         }
         for (band, changed) in touched.into_iter().enumerate() {
@@ -852,8 +862,8 @@ fn update_plain_opaque_capture(
     });
     #[cfg(test)]
     {
-        NATIVE_RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
-        NATIVE_INCREMENTAL_PATCHES.fetch_add(1, Ordering::Relaxed);
+        NATIVE_RENDER_COUNT.with(|count| count.set(count.get() + 1));
+        NATIVE_INCREMENTAL_PATCHES.with(|count| count.set(count.get() + 1));
     }
     Some((std::sync::Arc::clone(&prior.pixels), prior.revision))
 }
@@ -862,14 +872,16 @@ const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
 static NATIVE_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeCapture>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 #[cfg(test)]
-static NATIVE_RENDER_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-#[cfg(test)]
-static NATIVE_INCREMENTAL_PATCHES: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+thread_local! {
+    // Process-global test counters make unrelated parallel view captures
+    // indistinguishable from the exact operation under test.
+    static NATIVE_RENDER_COUNT: Cell<usize> = const { Cell::new(0) };
+    static NATIVE_INCREMENTAL_PATCHES: Cell<usize> = const { Cell::new(0) };
+}
 
 #[cfg(test)]
 pub(crate) fn native_render_count_for_tests() -> usize {
-    NATIVE_RENDER_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    NATIVE_RENDER_COUNT.with(Cell::get)
 }
 
 /// What a window's composite is waiting on: the part of it views have drawn
@@ -2623,7 +2635,7 @@ fn native_scene_pixels_impl(
         None
     };
     #[cfg(test)]
-    NATIVE_RENDER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    NATIVE_RENDER_COUNT.with(|count| count.set(count.get() + 1));
     // A plain fully opaque backing store has exactly the same BGRA texels
     // after blending over a transparent native background. Allocate/copy its
     // crop directly; the existing compositor path handles alpha and CA.
@@ -4845,6 +4857,90 @@ mod tests {
     }
 
     #[test]
+    fn identical_native_row_band_damage_reuses_all_reader_allocations() {
+        const W: usize = 512;
+        const H: usize = 128;
+        let mut source = Store::new(W as u32, H as u32);
+        source.pixels = [17u8, 31, 79, 255].repeat(W * H);
+        source.touch();
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: W as i64,
+            height: H as i64,
+        };
+        let original = NativePixelTiles::new_from_opaque_store(&source, crop).unwrap();
+        let retained = original.clone();
+        let identical = Rect {
+            x: 19,
+            y: 40,
+            width: 1,
+            height: 1,
+        };
+        // Real producers can invalidate an unchanged pixel every frame.
+        // The output must reuse every band, including the supposedly dirty one.
+        let started = std::time::Instant::now();
+        let mut current = original.clone();
+        for _ in 0..200 {
+            source.touch_region(identical);
+            let next = current
+                .patched_regions(&source, crop, &[identical])
+                .unwrap();
+            assert_eq!(next.revision, original.revision);
+            assert!(
+                next.bands
+                    .iter()
+                    .zip(&original.bands)
+                    .all(|(a, b)| { std::sync::Arc::ptr_eq(a, b) })
+            );
+            current = next;
+        }
+        eprintln!(
+            "200 unchanged 1px row-band updates: {:?}",
+            started.elapsed()
+        );
+        // A batch with one genuine edit and one identical region clones only
+        // the genuinely touched band; old GPU readers still see old pixels.
+        let changed = Rect {
+            x: 11,
+            y: 72,
+            width: 1,
+            height: 1,
+        };
+        let at = (72 * W + 11) * 4;
+        source.pixels[at] = 201;
+        source.touch_region(changed);
+        let patched = current
+            .patched_regions(&source, crop, &[identical, changed])
+            .unwrap();
+        assert_ne!(patched.revision, original.revision);
+        assert_eq!(patched.bands.len(), original.bands.len());
+        for index in 0..patched.bands.len() {
+            assert_eq!(
+                std::sync::Arc::ptr_eq(&patched.bands[index], &original.bands[index]),
+                index != 2,
+                "only the truly changed band may be cloned"
+            );
+        }
+        let mut old_pixel = [0u8; 4];
+        let mut new_pixel = [0u8; 4];
+        retained.copy_rect_to(11, 72, 1, 1, &mut old_pixel).unwrap();
+        patched.copy_rect_to(11, 72, 1, 1, &mut new_pixel).unwrap();
+        assert_eq!(old_pixel, [17, 31, 79, 255]);
+        assert_eq!(new_pixel, [201, 31, 79, 255]);
+        // Repeating the already applied edit must not copy a second band.
+        let same_again = patched.patched_regions(&source, crop, &[changed]).unwrap();
+        assert_eq!(same_again.revision, patched.revision);
+        assert!(
+            same_again
+                .bands
+                .iter()
+                .zip(&patched.bands)
+                .all(|(a, b)| { std::sync::Arc::ptr_eq(a, b) })
+        );
+    }
+
+    #[test]
     fn native_row_bands_preserve_unmodified_chunks_and_full_content_identity() {
         let width = 128;
         let height = 100;
@@ -5097,7 +5193,7 @@ mod tests {
         let first = native_scene_pixels_cropped_with_damage(view, 130, 140, crop).unwrap();
         let original = std::sync::Arc::clone(&first.0); // GPU reader
         let baseline = original.as_ref().clone();
-        let count = NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed);
+        let count = NATIVE_INCREMENTAL_PATCHES.with(Cell::get);
         {
             let mut sources = VIEW_STORES.lock().unwrap();
             let src = sources.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
@@ -5125,10 +5221,7 @@ mod tests {
         assert!(!std::sync::Arc::ptr_eq(&original, &updated.0));
         assert_ne!(updated.1, first.1);
         assert_eq!(updated.2.unwrap().from_revision, first.1);
-        assert_eq!(
-            NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed),
-            count + 1
-        );
+        assert_eq!(NATIVE_INCREMENTAL_PATCHES.with(Cell::get), count + 1);
         for (x, y, pixel) in [
             (6usize, 8usize, [3, 8, 19, 255]),
             (60, 75, [99, 88, 77, 255]),
@@ -5182,7 +5275,7 @@ mod tests {
             height: 16,
         };
         let old = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
-        let patches = NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed);
+        let patches = NATIVE_INCREMENTAL_PATCHES.with(Cell::get);
         {
             let mut views = VIEW_STORES.lock().unwrap();
             let src = views.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
@@ -5195,7 +5288,7 @@ mod tests {
             });
         }
         let alpha = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
-        assert_eq!(NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed), patches);
+        assert_eq!(NATIVE_INCREMENTAL_PATCHES.with(Cell::get), patches);
         assert_eq!(
             &alpha.0[(3 * 24 + 7) * 4..(3 * 24 + 7) * 4 + 4],
             &[25, 50, 75, 128]
@@ -5215,7 +5308,7 @@ mod tests {
         let opaque = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
         assert_eq!(opaque.0[(3 * 24 + 7) * 4 + 3], 255);
         assert_eq!(
-            NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed),
+            NATIVE_INCREMENTAL_PATCHES.with(Cell::get),
             patches,
             "no opaque chunk-hash cache existed after translucent capture"
         );
@@ -5235,7 +5328,7 @@ mod tests {
         }
         let recovered = native_scene_pixels_cropped_with_damage(view, 24, 16, crop).unwrap();
         assert_eq!(
-            NATIVE_INCREMENTAL_PATCHES.load(Ordering::Relaxed),
+            NATIVE_INCREMENTAL_PATCHES.with(Cell::get),
             patches,
             "a lost producer generation must fall back to full capture"
         );
@@ -5720,6 +5813,28 @@ mod tests {
             changes: VecDeque::new(),
             alpha_class: AtomicU8::new(0),
         }
+    }
+
+    #[test]
+    fn native_capture_test_counters_ignore_parallel_thread_work() {
+        let before_scan = opaque_alpha_scan_count_for_tests();
+        let before_render = native_render_count_for_tests();
+        let before_patches = NATIVE_INCREMENTAL_PATCHES.with(Cell::get);
+        let worker = std::thread::spawn(|| {
+            let mut store = Store::new(16, 8);
+            store
+                .pixels
+                .chunks_exact_mut(4)
+                .for_each(|pixel| pixel[3] = 255);
+            assert!(store.fully_opaque());
+            assert_eq!(opaque_alpha_scan_count_for_tests(), 1);
+            NATIVE_RENDER_COUNT.with(|count| count.set(count.get() + 1));
+            NATIVE_INCREMENTAL_PATCHES.with(|count| count.set(count.get() + 1));
+        });
+        worker.join().unwrap();
+        assert_eq!(opaque_alpha_scan_count_for_tests(), before_scan);
+        assert_eq!(native_render_count_for_tests(), before_render);
+        assert_eq!(NATIVE_INCREMENTAL_PATCHES.with(Cell::get), before_patches);
     }
 
     #[test]
