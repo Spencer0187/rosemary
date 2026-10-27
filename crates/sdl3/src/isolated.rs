@@ -13,16 +13,30 @@ const CHILD: &str = "ROSEMARY_ISOLATED_TEST";
 /// libtest thread, so that renaming it or its module cannot leave the child
 /// running nothing.
 pub fn run_here() -> bool {
+    run_here_with_video_driver(None)
+}
+
+/// Isolate a clipboard-only test from both libtest threads and the host's real
+/// desktop clipboard. SDL's dummy video backend keeps clipboard contents local
+/// to the subprocess; parallel text tests cannot overwrite each other's data.
+pub fn run_here_with_dummy_video() -> bool {
+    run_here_with_video_driver(Some("dummy"))
+}
+
+fn run_here_with_video_driver(video_driver: Option<&str>) -> bool {
     if std::env::var_os(CHILD).is_some() {
         return true;
     }
     let current = std::thread::current();
     let name = current.name().expect("a test on its libtest thread");
-    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+    let mut command = std::process::Command::new(std::env::current_exe().expect("the test binary"));
+    command
         .args(["--exact", name, "--test-threads=1"])
-        .env(CHILD, "1")
-        .output()
-        .expect("start the test in its own process");
+        .env(CHILD, "1");
+    if let Some(driver) = video_driver {
+        command.env("SDL_VIDEODRIVER", driver);
+    }
+    let output = command.output().expect("start the test in its own process");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("1 passed; 0 failed"),

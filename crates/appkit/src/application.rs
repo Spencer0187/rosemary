@@ -1597,6 +1597,9 @@ mod tests {
     /// `-run` turns the run loop, and `-stop:` ends it.
     #[test]
     fn run_services_the_run_loop_until_it_is_stopped() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         static FIRED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         static APP: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1635,6 +1638,9 @@ mod tests {
 
     #[test]
     fn what_a_turn_autoreleases_is_released_when_it_ends() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         static OBJECT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         thread_local! {

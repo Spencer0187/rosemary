@@ -1740,6 +1740,9 @@ mod tests {
 
     #[test]
     fn reentrant_event_pump_hook_returns_before_refresh_deadlines() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         use std::sync::atomic::{AtomicUsize, Ordering};
         static NESTED: AtomicUsize = AtomicUsize::new(0);
         fn reenter() {

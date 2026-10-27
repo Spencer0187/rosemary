@@ -681,6 +681,9 @@ mod tests {
 
     #[test]
     fn general_pasteboard_keeps_string_data_and_type_order() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
         crate::bootstrap();
         let board = unsafe {
             general_pasteboard(std::ptr::null_mut(), objc::sel::get("generalPasteboard"))

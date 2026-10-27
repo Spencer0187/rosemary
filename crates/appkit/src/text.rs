@@ -1704,6 +1704,9 @@ mod tests {
 
     #[test]
     fn paste_inserts_general_pasteboard_text_at_the_selection() {
+        if !sdl3::isolated::run_here_with_dummy_video() {
+            return;
+        }
         let view = text_view();
         let board_class =
             objc::class::ptr(objc::class::lookup(c"NSPasteboard").expect("NSPasteboard")) as Id;
