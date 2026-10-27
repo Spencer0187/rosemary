@@ -2301,6 +2301,9 @@ fn store_terminal_outcome(window: sdl3::Window) -> appkit::backing::PresentOutco
 #[cfg(test)]
 #[test]
 fn converted_vulkan_window_preserves_dirty_store_after_gpu_failure() {
+    if !sdl3::isolated::run_here() {
+        return;
+    }
     use appkit::backing::PresentOutcome::{Deferred, Fallback};
     let Some(window) = sdl3::video::create_window(c"GPU fallback state", 80, 64, 0) else {
         return;
@@ -3256,6 +3259,9 @@ mod drawable_pool_tests {
 #[cfg(test)]
 #[test]
 fn appkit_backing_upload_remains_responsive_with_another_window_holding_the_gpu_queue() {
+    if !sdl3::isolated::run_here() {
+        return;
+    }
     use appkit::backing::PresentOutcome::{Deferred, Displayed};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, Instant};

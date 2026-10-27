@@ -13950,6 +13950,9 @@ fn native_atomic_escrow_defers_busy_scene_reader_without_refusal() {
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
     if isolate_vulkan_graphical_test("atomic_native_replacement_commits_after_768mib_gpu_peak") {
         return;
     }
@@ -14096,6 +14099,9 @@ fn atomic_native_replacement_commits_after_768mib_gpu_peak() {
 #[test]
 #[cfg(target_os = "linux")]
 fn rejected_linear_dma_worker_commits_original_publication() {
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
     if isolate_vulkan_graphical_test("rejected_linear_dma_worker_commits_original_publication") {
         return;
     }

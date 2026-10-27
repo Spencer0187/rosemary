@@ -4033,6 +4033,9 @@ mod tests {
 
     #[test]
     fn unchanged_native_tiles_reuse_pixels_after_disjoint_producer_damage() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
         let mut store = Store::new(8, 4);
@@ -4561,6 +4564,9 @@ mod tests {
 
     #[test]
     fn opaque_classification_is_cached_until_pixels_or_extent_change() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         let mut store = Store::new(32, 12);
         let scanned = opaque_alpha_scan_count_for_tests();
         for _ in 0..100 {

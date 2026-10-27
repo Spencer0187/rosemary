@@ -4413,6 +4413,9 @@ pub mod video {
     #[cfg(test)]
     #[test]
     fn destroying_an_sdl_window_invalidates_flags_before_pointer_reuse() {
+        if !crate::isolated::run_here() {
+            return;
+        }
         if !super::may_pump() {
             return;
         }
@@ -4456,6 +4459,9 @@ pub mod video {
     #[cfg(test)]
     #[test]
     fn retry_does_not_lose_an_initializer_window_lifetime_token() {
+        if !crate::isolated::run_here() {
+            return;
+        }
         if !super::may_pump() {
             return;
         }

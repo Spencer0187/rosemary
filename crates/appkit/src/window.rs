@@ -990,6 +990,9 @@ pub(crate) fn pixel_clip_from_surface(
 #[cfg(test)]
 #[test]
 fn physical_pixel_rects_share_independent_edge_rounding_at_one_and_two_x() {
+    if !sdl3::isolated::run_here() {
+        return;
+    }
     let bounds = NSRect {
         origin: NSPoint { x: 0.5, y: 0.5 },
         size: NSSize {
@@ -4240,6 +4243,9 @@ mod tests {
     /// keeps its identity and its place when it does.
     #[test]
     fn a_window_rebuilt_for_opengl_keeps_what_it_had() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let object =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);
@@ -4863,6 +4869,9 @@ mod tests {
     /// gets - the two conversions agreeing on the difference.
     #[test]
     fn a_titled_window_is_its_content_plus_the_chrome() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let object =
             objc::object::create_instance(objc::class::lookup(c"NSWindow").expect("NSWindow"), 0);

@@ -4075,6 +4075,9 @@ mod tests {
 
     #[test]
     fn first_native_draw_rect_after_static_metal_publishes_independent_scene() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -4169,6 +4172,9 @@ mod tests {
 
     #[test]
     fn opaque_native_occlusion_responds_to_ancestor_ca_opacity() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -4324,6 +4330,9 @@ mod tests {
 
     #[test]
     fn metal_root_nonview_ca_sublayers_are_independent_ordered_native_pixels() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -4462,6 +4471,9 @@ mod tests {
 
     #[test]
     fn unmasked_metal_root_child_extends_beyond_view_and_masks_clip_it() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -4563,6 +4575,9 @@ mod tests {
 
     #[test]
     fn metal_ca_sublayers_interleave_view_backings_in_effective_order() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -4673,6 +4688,9 @@ mod tests {
 
     #[test]
     fn interleaved_view_and_native_children_share_one_isolated_ca_opacity_group() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -4850,6 +4868,9 @@ mod tests {
 
     #[test]
     fn transparent_ca_sibling_is_neutral_to_admitted_native_foreground() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -5010,6 +5031,9 @@ mod tests {
 
     #[test]
     fn native_cpu_pixels_are_separate_above_metal_and_underneath_below_it() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -5218,6 +5242,9 @@ mod tests {
     /// views must disappear from its scene before their next drawable.
     #[test]
     fn metal_scene_tracks_sibling_order_hiding_and_removal() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -5647,6 +5674,9 @@ mod tests {
     /// transaction should make one O(N) capture, not N O(N) captures.
     #[test]
     fn batch_metal_scene_capture_cost() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         if std::env::var_os("ROSEMARY_BENCH_APPKIT_SCENE").is_none() {
             return;
         }
@@ -5729,6 +5759,9 @@ mod tests {
     /// it is skipped where no window can be made.
     #[test]
     fn a_subviews_frame_reaches_the_window_in_pixels() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         // SDL belongs to the video thread. Concurrent window tests can claim
         // it first; on another thread the presentation cache cannot be built.
@@ -5789,6 +5822,9 @@ mod tests {
     /// origin/width rounding is permitted in the fallback.
     #[test]
     fn zero_sized_presentation_fallback_preserves_fractional_surface_edges() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         let class = objc::class::lookup(c"NSWindow").unwrap();
         let window = objc::object::create_instance(class, 0);
@@ -5867,6 +5903,9 @@ mod tests {
 
     #[test]
     fn animated_ca_ancestor_position_and_bounds_republish_static_metal_clipping() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6004,6 +6043,9 @@ mod tests {
 
     #[test]
     fn fully_visible_six_k_cpu_foreground_tiles_above_opaque_metal() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6210,6 +6252,9 @@ mod tests {
 
     #[test]
     fn oversized_native_cpu_foreground_crops_visible_pixels_above_metal() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6320,6 +6365,9 @@ mod tests {
 
     #[test]
     fn changing_one_native_view_does_not_recapture_other_windows() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6438,6 +6486,9 @@ mod tests {
 
     #[test]
     fn independent_dma_overlays_preserve_view_ownership_and_oversize_fallback() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6581,6 +6632,9 @@ mod tests {
 
     #[test]
     fn flattened_root_ca_opacity_animation_refreshes_underlay_and_final_tick() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6683,6 +6737,9 @@ mod tests {
 
     #[test]
     fn destroyed_view_only_evicts_its_window_underlay() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6769,6 +6826,9 @@ mod tests {
 
     #[test]
     fn native_foreground_revision_changes_require_gpu_acknowledgment() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6868,6 +6928,9 @@ mod tests {
 
     #[test]
     fn native_pixel_cache_does_not_invalidate_from_another_window_ca_tree() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -6932,6 +6995,9 @@ mod tests {
 
     #[test]
     fn intermediate_ca_superlayer_mask_updates_static_metal_scene() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -7112,6 +7178,9 @@ mod native_partial_draw_regression {
 
     #[test]
     fn live_draw_rect_partial_invalidation_preserves_old_pixels_and_capture_damage() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;

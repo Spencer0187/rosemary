@@ -4990,6 +4990,9 @@ mod tests {
 
     #[test]
     fn iosurface_poll_tracks_only_owner_view_through_reparent_and_many_idle_pumps() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
@@ -5272,6 +5275,9 @@ mod tests {
 
     #[test]
     fn metal_ca_iosurface_in_place_publication_invalidates_cached_pixels() {
+        if !sdl3::isolated::run_here() {
+            return;
+        }
         crate::bootstrap();
         if !sdl3::may_pump() {
             return;
