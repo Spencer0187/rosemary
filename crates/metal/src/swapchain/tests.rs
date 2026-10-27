@@ -5040,6 +5040,7 @@ fn nsview_parent_alpha_groups_two_opaque_metal_children() {
                 occluded: Some(vec![]),
                 native: native_scene_source(
                     item.native_pixels,
+                    item.native_tiles,
                     item.native_dmabuf,
                     item.native_revision,
                     item.frame.width,
@@ -5721,6 +5722,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
     let red: Vec<u8> =
         [0u8, 0, 128, 128].repeat((native_frame.width * native_frame.height) as usize);
     let native_source = scene::NativeCpuSceneSource {
+        tiles: None,
         cpu_capture: None,
         bytes: Arc::new(red),
         revision: 1,
@@ -5828,6 +5830,7 @@ fn independent_translucent_native_scene_respects_metal_order_and_motion() {
         opacity_groups: Vec::new(),
         frame: DirectFrame::from_frame(&resized_frame),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(
                 [0u8, 0, 128, 128].repeat((resized_frame.width * resized_frame.height) as usize),
@@ -6140,6 +6143,855 @@ fn animated_geometry_mask_recomposes_static_metal_gpu_pixels() {
 /// seams and later static-Metal membership changes.
 #[test]
 #[cfg(not(target_os = "macos"))]
+fn tiled_native_foreground_preserves_flattened_single_metal_background() {
+    if isolate_vulkan_graphical_test(
+        "tiled_native_foreground_preserves_flattened_single_metal_background",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let background = test_opaque_metal_placement(0x9031, DirectFrame::from_frame(&whole));
+    state.layers.push(background.id);
+    state.note_scene_frame(background.id, &whole);
+    state.scene_placements.push(background.clone());
+    let accumulated = state.composite().unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, accumulated, [0.0, 1.0, 0.0, 1.0]);
+    })
+    .unwrap();
+    assert!(
+        state.scene_layers.is_empty(),
+        "fixture must begin with flattened Metal"
+    );
+
+    let pixels = [0u8, 0, 255, 255].repeat(40 * 32);
+    let tiles =
+        Arc::new(appkit::backing::NativePixelTiles::from_opaque_bgra(40, 32, &pixels).unwrap());
+    let foreground_frame = appkit::view::Frame {
+        x: 34,
+        y: 23,
+        width: 40,
+        height: 32,
+        ..whole
+    };
+    let mut foreground =
+        test_opaque_metal_placement(0x9032, DirectFrame::from_frame(&foreground_frame));
+    foreground.opaque = false;
+    foreground.native = Some(scene::NativeCpuSceneSource {
+        bytes: Arc::new(Vec::new()),
+        tiles: Some(Arc::clone(&tiles)),
+        revision: tiles.revision,
+        cpu_capture: None,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    assert_eq!(stage_native_scene_source(&mut state, &foreground), Ok(true));
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|layer| layer.id == background.id)
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .any(|layer| layer.id == foreground.id)
+    );
+    state.synchronize_scene(window as usize, &[background, foreground]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let image = state.composite.as_ref().unwrap().image;
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 4, 4),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, image, whole.width, whole.height, 40, 30),
+        [255, 0, 0, 255]
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_scene_budget_exhaustion_uses_terminal_refusal() {
+    if isolate_vulkan_graphical_test("tiled_native_scene_budget_exhaustion_uses_terminal_refusal") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    for index in 0..32usize {
+        let source = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.seed_accepted_native_for_budget_test(
+            0x7000 + index,
+            DirectFrame::from_frame(&whole),
+            source,
+        );
+    }
+    assert_eq!(state.projected_committed_scene_bytes(), 512 * 1024 * 1024);
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            40,
+            32,
+            &[0u8, 0, 255, 255].repeat(40 * 32),
+        )
+        .unwrap(),
+    );
+    let frame = appkit::view::Frame {
+        width: 40,
+        height: 32,
+        ..whole
+    };
+    let mut proposed = test_opaque_metal_placement(0xfed0, DirectFrame::from_frame(&frame));
+    proposed.opaque = false;
+    proposed.native = Some(scene::NativeCpuSceneSource {
+        bytes: Arc::new(Vec::new()),
+        tiles: Some(Arc::clone(&tiles)),
+        revision: tiles.revision,
+        cpu_capture: None,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    assert_eq!(
+        stage_native_scene_source(&mut state, &proposed),
+        Err(NATIVE_SCENE_GPU_BUDGET_EXHAUSTED.to_owned()),
+    );
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .all(|layer| layer.id != proposed.id)
+    );
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// A tiled upload must reclaim an unrelated flat CPU/DMA base cache before
+/// deferring at the physical window allocation ledger. The base is optional;
+/// no accepted native GPU source or reader may be evicted with it.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_physical_pressure_sheds_optional_flat_cpu_base() {
+    if isolate_vulkan_graphical_test("tiled_native_physical_pressure_sheds_optional_flat_cpu_base")
+    {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 64,
+        height: 64,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    // A flat native view owns an accepted snapshot and an optional cached
+    // CPU base. Only the base is eligible for eviction.
+    let accepted = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    let accepted_image = accepted.image.image;
+    let flat_id = 0x1011;
+    state.seed_accepted_native_for_budget_test(flat_id, DirectFrame::from_frame(&whole), accepted);
+    state.native_cpu_bases.push(NativeCpuBaseCache {
+        id: flat_id,
+        source: std::sync::Weak::new(),
+        cpu_revision: Some(1),
+        image: BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap(),
+    });
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            40,
+            32,
+            &[0u8, 0, 255, 255].repeat(40 * 32),
+        )
+        .unwrap(),
+    );
+    let mut tiled = test_opaque_metal_placement(
+        0x1012,
+        DirectFrame::from_frame(&appkit::view::Frame {
+            width: 40,
+            height: 32,
+            ..whole
+        }),
+    );
+    tiled.opaque = false;
+    tiled.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(tiles.clone()),
+        cpu_capture: None,
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    let incoming = tiled_native_staging_bytes(&state, &tiled);
+    assert_eq!(incoming, 2 * 40 * 32 * 4);
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let ledger = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let held = ledger.held.load(Ordering::Acquire);
+    let free = incoming / 2;
+    let temporary_pressure =
+        GpuCharge::reserve(window as usize, WINDOW_GPU_PAYLOAD_BUDGET - held - free).unwrap();
+    assert!(!window_gpu_capacity_available(window as usize, incoming));
+    assert_eq!(state.native_cpu_bases.len(), 1);
+    assert_eq!(stage_native_scene_source(&mut state, &tiled), Ok(true));
+    assert!(
+        state.native_cpu_bases.is_empty(),
+        "optional flat base was not released"
+    );
+    assert_eq!(state.scene_layers.len(), 2);
+    assert_eq!(state.scene_layers[0].snapshot.image.image, accepted_image);
+    assert_eq!(state.scene_layers[1].native_revision, Some(tiles.revision));
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.scene_layers[1].snapshot.image.image,
+            40,
+            32,
+            13,
+            11
+        ),
+        [0, 0, 255, 255]
+    );
+    drop(temporary_pressure);
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// External GPU reservations may clear on unrelated fence retirement.
+/// They must defer tiled staging, not permanently refuse the same revision.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_external_physical_pressure_defers_then_recovers() {
+    if isolate_vulkan_graphical_test("tiled_native_external_physical_pressure_defers_then_recovers")
+    {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            40,
+            32,
+            &[0, 0, 255, 255].repeat(40 * 32),
+        )
+        .unwrap(),
+    );
+    let mut source = test_opaque_metal_placement(
+        0x1013,
+        DirectFrame::from_frame(&appkit::view::Frame {
+            width: 40,
+            height: 32,
+            ..whole
+        }),
+    );
+    source.opaque = false;
+    source.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(tiles.clone()),
+        cpu_capture: None,
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    let incoming = tiled_native_staging_bytes(&state, &source);
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let held = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap()
+        .held
+        .load(Ordering::Acquire);
+    let pressure = GpuCharge::reserve(
+        window as usize,
+        WINDOW_GPU_PAYLOAD_BUDGET - held - incoming / 2,
+    )
+    .unwrap();
+    assert_eq!(stage_native_scene_source(&mut state, &source), Ok(false));
+    assert!(state.scene_layers.is_empty());
+    drop(pressure);
+    assert_eq!(stage_native_scene_source(&mut state, &source), Ok(true));
+    assert_eq!(state.scene_layers[0].native_revision, Some(tiles.revision));
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// No escrow candidate and a pinned old+new physical floor exceed the 768MiB
+/// ledger. Waiting cannot make progress; the staged tiled revision must be
+/// terminally refused rather than periodically requeued.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_atomic_floor_without_escrow_is_terminal() {
+    if isolate_vulkan_graphical_test("tiled_native_atomic_floor_without_escrow_is_terminal") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let mut old = Vec::new();
+    for n in 0..28usize {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        old.push(Arc::clone(&lease));
+        state.seed_accepted_native_for_budget_test(
+            0x3000 + n,
+            DirectFrame::from_frame(&whole),
+            lease,
+        );
+    }
+    state.transaction_pinned = old.clone();
+    // These images have not been acknowledged to AppKit. They are required
+    // for rollback but are not eligible for completed-revision CPU escrow.
+    for layer in &mut state.scene_layers {
+        layer.native_published_revision = None;
+    }
+    for n in 0..19 {
+        let replacement =
+            BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.scene_layers[n].snapshot = replacement;
+        state.scene_layers[n].native_revision = Some(2);
+    }
+    state.transaction_retiring_bytes = 19 * 16 * 1024 * 1024;
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            2048,
+            2048,
+            &[0, 0, 255, 255].repeat(2048 * 2048),
+        )
+        .unwrap(),
+    );
+    let mut proposed = test_opaque_metal_placement(
+        0x4000,
+        DirectFrame::from_frame(&appkit::view::Frame {
+            width: 2048,
+            height: 2048,
+            ..whole
+        }),
+    );
+    proposed.opaque = false;
+    proposed.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(tiles.clone()),
+        cpu_capture: None,
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    let required = tiled_native_staging_bytes(&state, &proposed);
+    assert_eq!(required, 32 * 1024 * 1024);
+    assert_eq!(state.atomic_transition_gpu_floor(), 47 * 16 * 1024 * 1024);
+    assert!(scene::fits_scene_budget(
+        state.budgeted_scene_bytes(),
+        required
+    ));
+    assert!(!window_gpu_capacity_available(window as usize, required));
+    assert_eq!(
+        stage_native_scene_source(&mut state, &proposed),
+        Err("native AppKit atomic GPU transition peak exhausted".to_string())
+    );
+    let mut rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    // Seeded leases have no producer-published revision; escrow is forbidden.
+    assert_eq!(
+        stage_native_transaction_source(&mut state, &proposed, &mut rollback, &[proposed.clone()]),
+        Err("native AppKit atomic GPU transition peak exhausted".to_string())
+    );
+    assert!(rollback.iter().all(|entry| entry.escrow_bytes() == 0));
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .all(|layer| layer.id != proposed.id)
+    );
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(rollback);
+    drop(old);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_staging_escrows_retired_gpu_image_when_upload_buffer_is_pressured() {
+    if isolate_vulkan_graphical_test(
+        "tiled_native_staging_escrows_retired_gpu_image_when_upload_buffer_is_pressured",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let width = 64u32;
+    let height = 64u32;
+    let image_bytes = u64::from(width) * u64::from(height) * 4;
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width,
+        height,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let old_image = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, old_image.image.image, [0.0, 0.0, 1.0, 1.0]);
+    })
+    .unwrap();
+    let id = 0xbe80;
+    let frame = DirectFrame::from_frame(&appkit::view::Frame {
+        width,
+        height,
+        ..whole
+    });
+    state.seed_accepted_native_for_budget_test(id, frame, old_image);
+    let mut rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    state.transaction_pinned = state
+        .scene_layers
+        .iter()
+        .map(|layer| Arc::clone(&layer.snapshot))
+        .collect();
+    state.transaction_retiring_bytes = image_bytes;
+    let mut proposed = state.scene_placements.clone();
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            width,
+            height,
+            &[255u8, 0, 0, 255].repeat((width * height) as usize),
+        )
+        .unwrap(),
+    );
+    let native = proposed[0].native.as_mut().unwrap();
+    native.revision = tiles.revision;
+    native.tiles = Some(tiles);
+    assert_eq!(
+        tiled_native_staging_bytes(&state, &proposed[0]),
+        image_bytes * 2
+    );
+    let held = state.scene_gpu_bytes();
+    let free = image_bytes + image_bytes / 2;
+    let blocker =
+        GpuCharge::reserve(window as usize, WINDOW_GPU_PAYLOAD_BUDGET - held - free).unwrap();
+    assert!(window_gpu_capacity_available(window as usize, image_bytes));
+    assert!(!window_gpu_capacity_available(
+        window as usize,
+        image_bytes * 2
+    ));
+    assert_eq!(
+        stage_native_transaction_source(&mut state, &proposed[0], &mut rollback, &proposed),
+        Ok(StagedNativeIdentity::from_placement(&proposed[0])),
+    );
+    assert!(
+        rollback[0].resident().is_none(),
+        "retired GPU image was not escrowed"
+    );
+    assert_eq!(
+        state.scene_layers[0].native_revision,
+        Some(proposed[0].native.as_ref().unwrap().revision)
+    );
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.scene_layers[0].snapshot.image.image,
+            width,
+            height,
+            20,
+            20
+        ),
+        [255, 0, 0, 255],
+    );
+    drop(blocker);
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(rollback);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// Failed tiled uploads must preserve committed pixels, quarantine uncertain
+/// submissions and reclaim every window-ledger reservation after retirement.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_stage_failure_retries_after_rollback_and_reclaims_gpu_charges() {
+    if isolate_vulkan_graphical_test(
+        "tiled_stage_failure_retries_after_rollback_and_reclaims_gpu_charges",
+    ) {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let (width, height) = (96u32, 96u32);
+    let frame = DirectFrame::from_frame(&appkit::view::Frame {
+        width,
+        height,
+        ..whole
+    });
+    let mut proposed = test_opaque_metal_placement(0x8cc1, frame);
+    proposed.opaque = false;
+    let pixels = [0u8, 0, 255, 255].repeat((width * height) as usize);
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &pixels).unwrap(),
+    );
+    proposed.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(Arc::clone(&tiles)),
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        cpu_capture: Some(appkit::backing::NativeCpuCapture {
+            revision: tiles.revision,
+            damage: None,
+        }),
+        dmabuf: None,
+        dma_sample: None,
+    });
+    assert_eq!(stage_native_scene_source(&mut state, &proposed), Ok(true));
+    state.synchronize_scene(window as usize, &[proposed.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let old = Arc::clone(&state.scene_layers[0].snapshot);
+    let original_revision = state.scene_layers[0].native_revision;
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let ledger = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let baseline = ledger.held.load(Ordering::Acquire);
+    let mut next_pixels = pixels;
+    let change = ((31 * width + 23) * 4) as usize;
+    next_pixels[change..change + 4].copy_from_slice(&[255, 0, 0, 255]);
+    let next_tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &next_pixels).unwrap(),
+    );
+    let next = proposed.native.as_mut().unwrap();
+    next.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+        revision: next_tiles.revision,
+        damage: Some(appkit::backing::NativeCpuDamage {
+            from_revision: tiles.revision,
+            rect: appkit::backing::Rect {
+                x: 23,
+                y: 31,
+                width: 1,
+                height: 1,
+            },
+        }),
+    });
+    next.revision = next_tiles.revision;
+    next.tiles = Some(next_tiles);
+    let rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    TILED_NATIVE_FAIL_AFTER_ALLOCATION.store(true, Ordering::Release);
+    let err = stage_native_scene_source(&mut state, &proposed).unwrap_err();
+    assert!(err.contains("injected tiled native staging failure after allocation"));
+    assert_eq!(ledger.held.load(Ordering::Acquire), baseline);
+    assert_eq!(state.scene_layers[0].native_revision, original_revision);
+    assert!(Arc::ptr_eq(&state.scene_layers[0].snapshot, &old));
+    assert_eq!(
+        read_scene_pixel(gpu, old.image.image, width, height, 23, 31),
+        [0, 0, 255, 255]
+    );
+    gpu.inject_immediate_wait_failure_for_test();
+    let err = stage_native_scene_source(&mut state, &proposed).unwrap_err();
+    assert!(err.contains("injected immediate fence wait error"));
+    assert!(gpu.immediate_quarantine_count_for_test() > 0);
+    assert!(ledger.held.load(Ordering::Acquire) > baseline);
+    assert_eq!(state.scene_layers[0].native_revision, original_revision);
+    assert_eq!(
+        read_scene_pixel(gpu, old.image.image, width, height, 23, 31),
+        [0, 0, 255, 255]
+    );
+    gpu.wait_first_quarantined_for_test().unwrap();
+    gpu.one_shot(|_, _| {}).unwrap();
+    assert_eq!(gpu.immediate_quarantine_count_for_test(), 0);
+    assert_eq!(ledger.held.load(Ordering::Acquire), baseline);
+    state.pending_scene_rollback = Some(rollback);
+    restore_native_rollback(&mut state).unwrap();
+    assert_eq!(state.scene_layers[0].native_revision, original_revision);
+    assert_eq!(stage_native_scene_source(&mut state, &proposed), Ok(true));
+    state.synchronize_scene(window as usize, &[proposed.clone()]);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            whole.width,
+            whole.height,
+            23,
+            31
+        ),
+        [0, 0, 255, 255]
+    );
+    drop(old);
+    drop(state);
+    assert_eq!(ledger.held.load(Ordering::Acquire), 1);
+    drop(account);
+    assert_eq!(ledger.held.load(Ordering::Acquire), 0);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image() {
+    if isolate_vulkan_graphical_test(
+        "immutable_cpu_row_bands_patch_only_dirty_gpu_region_and_retain_old_image",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let (width, height) = (128u32, 96u32);
+    let window =
+        sdl3::video::create_window(c"immutable CPU native rows", width as i32, height as i32, 0)
+            .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D { width, height },
+        surface,
+        instance,
+    )
+    .unwrap();
+    let frame = test_full_frame(window, width, height);
+    let make = |tiles: std::sync::Arc<appkit::backing::NativePixelTiles>, damage| {
+        let mut p = test_opaque_metal_placement(0x9caf, DirectFrame::from_frame(&frame));
+        p.opaque = false;
+        p.native = Some(scene::NativeCpuSceneSource {
+            bytes: Arc::new(Vec::new()),
+            tiles: Some(std::sync::Arc::clone(&tiles)),
+            revision: tiles.revision,
+            cpu_capture: Some(appkit::backing::NativeCpuCapture {
+                revision: tiles.revision,
+                damage,
+            }),
+            dmabuf: None,
+            dma_sample: None,
+        });
+        p
+    };
+    let first_pixels = [0u8, 0, 255, 255].repeat((width * height) as usize);
+    let before = std::sync::Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &first_pixels).unwrap(),
+    );
+    let first = make(std::sync::Arc::clone(&before), None);
+    state.synchronize_scene(window as usize, &[first.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &first), Ok(true));
+    let old_gpu = Arc::clone(
+        &state
+            .scene_layers
+            .iter()
+            .find(|item| item.id == first.id)
+            .unwrap()
+            .snapshot,
+    );
+    let old = read_scene_pixel(gpu, old_gpu.image.image, width, height, 77, 40);
+    assert_eq!(old, [0, 0, 255, 255]);
+    let mut next_pixels = first_pixels.clone();
+    let at = ((40 * width + 77) * 4) as usize;
+    next_pixels[at..at + 4].copy_from_slice(&[255, 0, 0, 255]);
+    let after = std::sync::Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &next_pixels).unwrap(),
+    );
+    let proof = appkit::backing::NativeCpuDamage {
+        from_revision: before.revision,
+        rect: appkit::backing::Rect {
+            x: 77,
+            y: 40,
+            width: 1,
+            height: 1,
+        },
+    };
+    let second = make(after, Some(proof));
+    assert_ne!(
+        first.native.as_ref().unwrap().revision,
+        second.native.as_ref().unwrap().revision
+    );
+    state.synchronize_scene(window as usize, &[second.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &second), Ok(true));
+    let accepted = Arc::clone(
+        &state
+            .scene_layers
+            .iter()
+            .find(|item| item.id == second.id)
+            .unwrap()
+            .snapshot,
+    );
+    assert!(!Arc::ptr_eq(&accepted, &old_gpu));
+    assert_eq!(
+        read_scene_pixel(gpu, accepted.image.image, width, height, 77, 40),
+        [255, 0, 0, 255],
+        "dirty CPU texel did not reach native GPU image"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, accepted.image.image, width, height, 7, 8),
+        [0, 0, 255, 255],
+        "untouched pixel was destroyed by partial GPU upload"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, old_gpu.image.image, width, height, 77, 40),
+        [0, 0, 255, 255],
+        "old GPU generation was mutated before rollback lease release"
+    );
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            width,
+            height,
+            77,
+            40
+        ),
+        [0, 0, 255, 255],
+        "new scene did not present dirty CPU texel (RGBA accumulator)"
+    );
+    let copied_after_small_patch = TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed);
+    assert!(
+        copied_after_small_patch > 0,
+        "small edit did not use GPU prior-frame copy"
+    );
+    let full_pixels = [0u8, 255, 0, 255].repeat((width * height) as usize);
+    let full = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(width, height, &full_pixels).unwrap(),
+    );
+    let full_damage = appkit::backing::NativeCpuDamage {
+        from_revision: second.native.as_ref().unwrap().revision,
+        rect: appkit::backing::Rect {
+            x: 0,
+            y: 0,
+            width: width as i64,
+            height: height as i64,
+        },
+    };
+    let third = make(full, Some(full_damage));
+    let second_gpu = Arc::clone(&accepted);
+    state.synchronize_scene(window as usize, &[third.clone()]);
+    assert_eq!(stage_native_scene_source(&mut state, &third), Ok(true));
+    assert_eq!(
+        TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed),
+        copied_after_small_patch,
+        "complete source replacement copied old GPU image unnecessarily"
+    );
+    let latest = &state
+        .scene_layers
+        .iter()
+        .find(|i| i.id == third.id)
+        .unwrap()
+        .snapshot;
+    assert_eq!(
+        read_scene_pixel(gpu, latest.image.image, width, height, 77, 40),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, latest.image.image, width, height, 7, 8),
+        [0, 255, 0, 255]
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, second_gpu.image.image, width, height, 77, 40),
+        [255, 0, 0, 255],
+        "old GPU image mutated during full replacement"
+    );
+    assert_eq!(
+        read_scene_pixel(gpu, old_gpu.image.image, width, height, 77, 40),
+        [0, 0, 255, 255],
+        "initial GPU image mutated during full replacement"
+    );
+    drop(second_gpu);
+    drop(old_gpu);
+    drop(state);
+    sdl3::video::destroy_window(window);
+}
+
+#[test]
+#[cfg(not(target_os = "macos"))]
 fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
     if isolate_vulkan_graphical_test(
         "fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal",
@@ -6233,6 +7085,7 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
                 rounded: vec![],
                 occluded: Some(vec![]),
                 native: Some(scene::NativeCpuSceneSource {
+                    tiles: None,
                     cpu_capture: None,
                     bytes: Arc::new([0u8, 0, 128, 128].repeat(tw as usize * th as usize)),
                     revision: 91 + tile_no as u64,
@@ -6283,6 +7136,473 @@ fn fully_visible_six_k_cpu_native_tiles_overlay_static_opaque_metal() {
     );
     drop(state);
     gpu.destroy_image(source);
+    sdl3::video::destroy_window(window);
+}
+
+/// Exercise the actual row-banded representation across all six 6K WSI
+/// partitions. Previous GPU generations remain live across dirty updates.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn six_k_row_banded_native_sources_patch_independently_and_present() {
+    if isolate_vulkan_graphical_test(
+        "six_k_row_banded_native_sources_patch_independently_and_present",
+    ) {
+        return;
+    }
+    if std::env::var_os("ROSEMARY_TEST_VULKAN").is_none() {
+        return;
+    }
+    const WIDTH: u32 = 6016;
+    const HEIGHT: u32 = 3384;
+    let gpu = crate::vulkan::adapters()
+        .unwrap()
+        .first()
+        .unwrap()
+        .gpu()
+        .unwrap();
+    let window = sdl3::video::create_window(
+        c"6K six immutable row bands",
+        WIDTH as i32,
+        HEIGHT as i32,
+        0,
+    )
+    .unwrap();
+    sdl3::video::show_window(window);
+    sdl3::video::presentation_window(window).unwrap();
+    let instance = crate::vulkan::instance_handle().unwrap();
+    let surface =
+        sdl3::video::vulkan::create_surface(window, instance, crate::vulkan::library()).unwrap();
+    let mut state = Swapchain::create(
+        gpu,
+        window,
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
+        surface,
+        instance,
+    )
+    .unwrap();
+    assert!(uses_layer_compositor(state.present_mode));
+    let metal = test_render_target(gpu, WIDTH, HEIGHT).unwrap();
+    gpu.one_shot(|device, cb| unsafe {
+        cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
+    })
+    .unwrap();
+    let whole = test_full_frame(window, WIDTH, HEIGHT);
+    let background = test_opaque_metal_placement(0x6a00, DirectFrame::from_frame(&whole));
+    state.layers.push(background.id);
+    state.synchronize_scene(window as usize, &[background.clone()]);
+    assert_eq!(
+        state.stage_composite_source(
+            background.id,
+            &whole,
+            PresentSource::from(&metal),
+            None,
+            &mut SourceOwner(None),
+            false,
+            true
+        ),
+        Ok(Some(true))
+    );
+    let mut initial = vec![background.clone()];
+    let mut cpu_pixels = Vec::new();
+    let mut positions = Vec::new();
+    let full_start = Instant::now();
+    let mut full_gpu_stage = Duration::ZERO;
+    for y in (0..HEIGHT).step_by(2048) {
+        for x in (0..WIDTH).step_by(2048) {
+            let tw = (WIDTH - x).min(2048);
+            let th = (HEIGHT - y).min(2048);
+            let n = positions.len();
+            let pixels = [0u8, 0, 255, 255].repeat((tw * th) as usize);
+            let tiles = Arc::new(
+                appkit::backing::NativePixelTiles::from_opaque_bgra(tw, th, &pixels).unwrap(),
+            );
+            let mut placement = test_opaque_metal_placement(
+                (3usize << (usize::BITS - 2)) | (n + 0x4000),
+                DirectFrame::from_frame(&appkit::view::Frame {
+                    x: x as i32,
+                    y: y as i32,
+                    width: tw,
+                    height: th,
+                    ..whole
+                }),
+            );
+            placement.opaque = false;
+            placement.native = Some(scene::NativeCpuSceneSource {
+                tiles: Some(Arc::clone(&tiles)),
+                bytes: Arc::new(Vec::new()),
+                cpu_capture: Some(appkit::backing::NativeCpuCapture {
+                    revision: tiles.revision,
+                    damage: None,
+                }),
+                revision: tiles.revision,
+                dmabuf: None,
+                dma_sample: None,
+            });
+            let gpu_stage_start = Instant::now();
+            assert_eq!(stage_native_scene_source(&mut state, &placement), Ok(true));
+            full_gpu_stage += gpu_stage_start.elapsed();
+            positions.push((x, y, tw, th));
+            cpu_pixels.push(pixels);
+            initial.push(placement);
+        }
+    }
+    assert_eq!(positions.len(), 6);
+    let full_stage = full_start.elapsed();
+    state.synchronize_scene(window as usize, &initial);
+    let full_recompose_start = Instant::now();
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let full_recompose = full_recompose_start.elapsed();
+    let full_present_start = Instant::now();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    let full_present = full_present_start.elapsed();
+    let original = state
+        .scene_layers
+        .iter()
+        .filter(|l| l.id != background.id)
+        .map(|l| (l.id, Arc::clone(&l.snapshot)))
+        .collect::<Vec<_>>();
+    assert_eq!(original.len(), 6);
+    if std::env::var_os("ROSEMARY_BENCH_TILED_STAGE").is_some() {
+        let mut gpu_copy_ns = Vec::new();
+        for (_, old_image) in &original {
+            let image = &old_image.image;
+            let pool = gpu.timestamp_pool();
+            if pool == vk::QueryPool::null() {
+                eprintln!("6K GPU copy timestamps unsupported by selected Vulkan queue");
+                break;
+            }
+            let dest = BackingImageLease::create_for_window(
+                gpu,
+                window as usize,
+                &ImageDescription {
+                    image_type: vk::ImageType::TYPE_2D,
+                    view_type: vk::ImageViewType::TYPE_2D,
+                    format: vk::Format::B8G8R8A8_UNORM,
+                    width: image.width,
+                    height: image.height,
+                    depth: 1,
+                    levels: 1,
+                    layers: 1,
+                    samples: 1,
+                    usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+                    cube: false,
+                    components: vk::ComponentMapping::default(),
+                },
+            )
+            .unwrap();
+            gpu.one_shot(|device, cb| unsafe {
+                device.cmd_reset_query_pool(cb, pool, 0, 2);
+                device.cmd_write_timestamp(cb, vk::PipelineStageFlags::TOP_OF_PIPE, pool, 0);
+                let region = vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                };
+                let source_barrier = vk::ImageMemoryBarrier::default()
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image.image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                device.cmd_pipeline_barrier(
+                    cb,
+                    vk::PipelineStageFlags::ALL_COMMANDS,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[source_barrier],
+                );
+                device.cmd_copy_image(
+                    cb,
+                    image.image,
+                    vk::ImageLayout::GENERAL,
+                    dest.image.image,
+                    vk::ImageLayout::GENERAL,
+                    &[vk::ImageCopy::default()
+                        .src_subresource(region)
+                        .dst_subresource(region)
+                        .extent(vk::Extent3D {
+                            width: image.width,
+                            height: image.height,
+                            depth: 1,
+                        })],
+                );
+                device.cmd_write_timestamp(cb, vk::PipelineStageFlags::BOTTOM_OF_PIPE, pool, 1);
+            })
+            .unwrap();
+            let mut ticks = [0u64; 2];
+            unsafe {
+                gpu.device.get_query_pool_results(
+                    pool,
+                    0,
+                    &mut ticks,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+            }
+            .unwrap();
+            let mask = match gpu.timestamp_valid_bits() {
+                64.. => u64::MAX,
+                bits => (1u64 << bits) - 1,
+            };
+            let ns = (ticks[1].wrapping_sub(ticks[0]) & mask) as f64 * gpu.timestamp_period();
+            gpu_copy_ns.push(ns);
+            gpu.release_timestamp_pool(pool);
+        }
+        if !gpu_copy_ns.is_empty() {
+            let total: f64 = gpu_copy_ns.iter().sum();
+            eprintln!(
+                "6K six source GPU-only full-image copy timestamps: {gpu_copy_ns:?} ns, total={total:.0}ns, excluding host allocation, queue wait and WSI"
+            );
+        }
+    }
+    for &(x, y, tw, th) in &positions {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x + tw / 2,
+                y + th / 2
+            ),
+            [255, 0, 0, 255]
+        );
+    }
+    let mut updated = initial.clone();
+    let mut dirty = Vec::new();
+    let copies_before = TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed);
+    let patch_start = Instant::now();
+    let mut patch_gpu_stage = Duration::ZERO;
+    for (n, &(x, y, tw, th)) in positions.iter().enumerate() {
+        let px = 11 + n as u32 * 23;
+        let py = 17 + n as u32 * 19;
+        let pixels = &mut cpu_pixels[n];
+        let index = ((py * tw + px) * 4) as usize;
+        pixels[index..index + 4].copy_from_slice(&[255, 0, 0, 255]);
+        let tiles =
+            Arc::new(appkit::backing::NativePixelTiles::from_opaque_bgra(tw, th, pixels).unwrap());
+        let placement = &mut updated[n + 1];
+        let native = placement.native.as_mut().unwrap();
+        let previous_revision = native.revision;
+        assert_ne!(tiles.revision, previous_revision);
+        native.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+            revision: tiles.revision,
+            damage: Some(appkit::backing::NativeCpuDamage {
+                from_revision: previous_revision,
+                rect: appkit::backing::Rect {
+                    x: px as i64,
+                    y: py as i64,
+                    width: 1,
+                    height: 1,
+                },
+            }),
+        });
+        native.revision = tiles.revision;
+        native.tiles = Some(tiles);
+        assert_eq!(
+            tiled_native_staging_bytes(&state, placement),
+            u64::from(tw) * u64::from(th) * 4 + 4
+        );
+        let gpu_stage_start = Instant::now();
+        assert_eq!(stage_native_scene_source(&mut state, placement), Ok(true));
+        patch_gpu_stage += gpu_stage_start.elapsed();
+        dirty.push((x + px, y + py, n));
+    }
+    let patch_stage = patch_start.elapsed();
+    assert_eq!(
+        TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed) - copies_before,
+        6
+    );
+    state.synchronize_scene(window as usize, &updated);
+    let patch_recompose_start = Instant::now();
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let patch_recompose = patch_recompose_start.elapsed();
+    let patch_present_start = Instant::now();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    let patch_present = patch_present_start.elapsed();
+    for &(x, y, n) in &dirty {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x,
+                y
+            ),
+            [0, 0, 255, 255],
+            "dirty tile {n} lost in composite"
+        );
+        let (id, old_image) = &original[n];
+        assert_eq!(*id, updated[n + 1].id);
+        let (_, _, tw, _) = positions[n];
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                old_image.image.image,
+                tw,
+                positions[n].3,
+                x - positions[n].0,
+                y - positions[n].1
+            ),
+            [0, 0, 255, 255],
+            "old GPU generation {n} mutated"
+        );
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                positions[n].0 + tw - 5,
+                positions[n].1 + positions[n].3 - 5
+            ),
+            [255, 0, 0, 255],
+            "untouched texel {n} corrupted"
+        );
+    }
+    // A second independently attested round retains both older GPU generations.
+    // This exercises 18 real tiled image versions, not only one update per tile.
+    let prior_patches = state
+        .scene_layers
+        .iter()
+        .filter(|l| l.id != background.id)
+        .map(|l| (l.id, Arc::clone(&l.snapshot)))
+        .collect::<Vec<_>>();
+    assert_eq!(prior_patches.len(), 6);
+    let second_copy_before = TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed);
+    let second_start = Instant::now();
+    let mut second_gpu_stage = Duration::ZERO;
+    let mut second_dirty = Vec::new();
+    for (n, &(x, y, tw, th)) in positions.iter().enumerate() {
+        let px = 41 + n as u32 * 17;
+        let py = 63 + n as u32 * 13;
+        let pixels = &mut cpu_pixels[n];
+        let index = ((py * tw + px) * 4) as usize;
+        pixels[index..index + 4].copy_from_slice(&[0, 255, 0, 255]);
+        let tiles =
+            Arc::new(appkit::backing::NativePixelTiles::from_opaque_bgra(tw, th, pixels).unwrap());
+        let placement = &mut updated[n + 1];
+        let native = placement.native.as_mut().unwrap();
+        let old_revision = native.revision;
+        native.cpu_capture = Some(appkit::backing::NativeCpuCapture {
+            revision: tiles.revision,
+            damage: Some(appkit::backing::NativeCpuDamage {
+                from_revision: old_revision,
+                rect: appkit::backing::Rect {
+                    x: px as i64,
+                    y: py as i64,
+                    width: 1,
+                    height: 1,
+                },
+            }),
+        });
+        native.revision = tiles.revision;
+        native.tiles = Some(tiles);
+        let gpu_stage_start = Instant::now();
+        assert_eq!(stage_native_scene_source(&mut state, placement), Ok(true));
+        second_gpu_stage += gpu_stage_start.elapsed();
+        second_dirty.push((x + px, y + py, n));
+    }
+    let second_elapsed = second_start.elapsed();
+    assert_eq!(
+        TILED_NATIVE_GPU_COPY_COUNT.load(Ordering::Relaxed) - second_copy_before,
+        6
+    );
+    state.synchronize_scene(window as usize, &updated);
+    let second_scene_start = Instant::now();
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    let second_scene = second_scene_start.elapsed();
+    let second_present_start = Instant::now();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    let second_present = second_present_start.elapsed();
+    for &(x, y, n) in &second_dirty {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x,
+                y
+            ),
+            [0, 255, 0, 255],
+            "second dirty tile {n} not presented"
+        );
+        let (id, old_gpu) = &prior_patches[n];
+        assert_eq!(*id, updated[n + 1].id);
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                old_gpu.image.image,
+                positions[n].2,
+                positions[n].3,
+                x - positions[n].0,
+                y - positions[n].1
+            ),
+            [0, 0, 255, 255],
+            "second prior generation {n} mutated"
+        );
+    }
+    for &(x, y, n) in &dirty {
+        assert_eq!(
+            read_scene_pixel(
+                gpu,
+                state.composite.as_ref().unwrap().image,
+                WIDTH,
+                HEIGHT,
+                x,
+                y
+            ),
+            [0, 0, 255, 255],
+            "second update erased first dirty region {n}"
+        );
+    }
+    // The last tile can disappear without a fresh Metal drawable.
+    updated.pop();
+    state.synchronize_scene(window as usize, &updated);
+    assert_eq!(state.redisplay_scene(window as usize), Ok(true));
+    state.idle();
+    state.flush_composite(window).unwrap();
+    state.idle();
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.composite.as_ref().unwrap().image,
+            WIDTH,
+            HEIGHT,
+            5000,
+            3000
+        ),
+        [0, 255, 0, 255]
+    );
+    eprintln!(
+        "6K real Vulkan 6-source: initial producer+stage={full_stage:?} stage-only={full_gpu_stage:?} scene={full_recompose:?} WSI-submission={full_present:?}; first six 1px producer+stage={patch_stage:?} stage-only={patch_gpu_stage:?} scene={patch_recompose:?} WSI-submission={patch_present:?}; second six 1px producer+stage={second_elapsed:?} stage-only={second_gpu_stage:?} scene={second_scene:?} WSI-submission={second_present:?}"
+    );
+    drop(prior_patches);
+    drop(original);
+    drop(state);
+    gpu.destroy_image(metal);
     sdl3::video::destroy_window(window);
 }
 
@@ -6340,6 +7660,7 @@ fn twelve_retained_native_replacements_commit_with_old_generations_pinned() {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new([0u8, 0, 255, 255].repeat(20 * 18)),
                 revision: 1,
@@ -6485,6 +7806,7 @@ fn twelve_transaction_pinned_gpu_generations_count_toward_scene_budget() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 1,
@@ -6556,6 +7878,7 @@ fn native_overlay_joins_last_direct_wsi_image_without_new_metal_drawable() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(
                 [0u8, 0, 128, 128].repeat((child_frame.width * child_frame.height) as usize),
@@ -6625,6 +7948,7 @@ fn rounded_native_opaque_overlay_preserves_metal_corners() {
         }],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat((whole.width * whole.height) as usize)),
             revision: 1,
@@ -6675,12 +7999,21 @@ fn large_native_dma_source_requires_no_event_thread_pixel_allocation() {
         modifier: 0,
         planes: vec![],
     });
-    let admitted = native_scene_source(None, Some(Arc::clone(&picture)), 7, 6016, 3384, None, None)
-        .expect("6K DMA-BUF-only sources must bypass the 64 MiB CPU cap");
+    let admitted = native_scene_source(
+        None,
+        None,
+        Some(Arc::clone(&picture)),
+        7,
+        6016,
+        3384,
+        None,
+        None,
+    )
+    .expect("6K DMA-BUF-only sources must bypass the 64 MiB CPU cap");
     assert!(admitted.bytes.is_empty());
     assert!(Arc::ptr_eq(admitted.dmabuf.as_ref().unwrap(), &picture));
     assert_eq!(admitted.revision, 7);
-    assert!(native_scene_source(None, Some(picture), 7, 9000, 9000, None, None).is_none());
+    assert!(native_scene_source(None, None, Some(picture), 7, 9000, 9000, None, None).is_none());
 }
 
 #[cfg(target_os = "linux")]
@@ -6881,6 +8214,7 @@ fn six_k_mixed_cpu_and_translucent_gbm_dma_preserves_native_background() {
                 rounded: vec![],
                 occluded: Some(vec![]),
                 native: Some(scene::NativeCpuSceneSource {
+                    tiles: None,
                     cpu_capture: producer_damage.then_some(appkit::backing::NativeCpuCapture {
                         revision: 7 + count as u64,
                         damage: None,
@@ -7211,6 +8545,7 @@ fn many_offscreen_six_k_dma_views_stage_in_bounded_visible_gpu_budget() {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new(Vec::new()),
                 revision: n as u64 + 1,
@@ -7284,8 +8619,9 @@ fn oversized_external_dma_buff_composes_actual_source_pixels() {
     ));
     let picture = real_gbm_picture_with_pixels(width, height, |_, _| [0, 0, 255, 255]);
     unsafe {
-        let native_source = native_scene_source(None, Some(picture), 1, width, height, None, None)
-            .expect("a 6K DMA-only layer must enter retained composition");
+        let native_source =
+            native_scene_source(None, None, Some(picture), 1, width, height, None, None)
+                .expect("a 6K DMA-only layer must enter retained composition");
         assert!(native_source.bytes.is_empty());
         gpu.one_shot(|device, cb| {
             cmd_test_clear_color(device, cb, metal.image, [0.0, 1.0, 0.0, 1.0]);
@@ -7412,6 +8748,7 @@ fn linear_dma_fallback_maps_only_far_visible_rows_and_keeps_texel_offsets() {
         rounded: vec![],
         occluded: None,
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 1,
@@ -7567,6 +8904,7 @@ fn rejected_linear_dma_without_prior_native_image_stays_in_final_pixels() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 1,
@@ -7683,6 +9021,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 11,
@@ -7782,6 +9121,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     let cpu = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 128, 128].repeat(30 * 25)),
             revision: 12,
@@ -7797,6 +9137,7 @@ fn refused_native_dma_buff_does_not_block_later_cpu_scene() {
     let second_invalid = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 13,
@@ -7976,6 +9317,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 71,
@@ -8001,6 +9343,7 @@ fn exercise_direct_first_native_rejection(busy_restore: bool) {
                 ..bframe
             }),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
                 revision: 72,
@@ -8197,6 +9540,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 11,
@@ -8224,6 +9568,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
         id: earlier_id,
         frame: DirectFrame::from_frame(&earlier_frame),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 9,
@@ -8268,6 +9613,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     let earlier = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 24)),
             revision: 10,
@@ -8385,6 +9731,7 @@ fn unreadable_dma_rejection_keeps_last_complete_scene_until_cpu_replacement() {
     let real = ScenePlacement {
         opacity_groups: Vec::new(),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 12,
@@ -8466,6 +9813,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 24)),
             revision: 7,
@@ -8519,6 +9867,7 @@ fn guest_metal_present_cannot_commit_unadmitted_native_geometry_before_dma_refus
             radius: 9.0,
         }],
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 8,
@@ -8646,6 +9995,7 @@ fn pinned_scene_generation_budget_defers_dma_and_recovers_after_retirement() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 11,
@@ -8851,6 +10201,7 @@ fn appkit_moving_six_k_dma_source_updates_static_metal_window_pixels() {
         occluded: Some(vec![]),
         native: native_scene_source(
             item.native_pixels,
+            item.native_tiles,
             item.native_dmabuf,
             item.native_revision,
             item.frame.width,
@@ -8942,6 +10293,7 @@ fn moving_static_large_dma_source_changes_retained_gpu_pixels() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 42,
@@ -9064,6 +10416,7 @@ fn replacing_obsolete_native_gpu_generations_makes_forward_progress() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(2048 * 2048)),
             revision: 2,
@@ -9200,6 +10553,7 @@ fn same_native_id_near_scene_budget_replaces_real_dma_pixels() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255, 0, 0, 255].repeat(2048 * 2048)),
             revision: 2,
@@ -9337,6 +10691,7 @@ fn atomic_scene_replacement_peak_reports_nonprogressing_physical_pressure() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(vec![0u8; 16 * 1024 * 1024]),
             revision: 2,
@@ -9402,6 +10757,7 @@ fn temporary_window_gpu_budget_pressure_defers_native_without_hard_refusal() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0, 0, 255, 255].repeat((48 * 44) as usize)),
             revision: 1,
@@ -9501,6 +10857,7 @@ fn large_cpu_native_views_crop_to_visible_window_and_keep_wsi_progress() {
             rounded: vec![],
             occluded: Some(vec![]),
             native: Some(scene::NativeCpuSceneSource {
+                tiles: None,
                 cpu_capture: None,
                 bytes: Arc::new([index as u8, 0, 255, 255].repeat(4096 * 4096)),
                 revision: index as u64 + 1,
@@ -9797,6 +11154,7 @@ fn oversized_cpu_native_view_keeps_foreground_in_final_vulkan_framebuffer() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: capture.0,
             revision: capture.1,
@@ -9907,6 +11265,7 @@ fn rectangular_intermediate_ca_clip_does_not_erase_lower_metal_pixels() {
         native: None,
     };
     let native_source = scene::NativeCpuSceneSource {
+        tiles: None,
         cpu_capture: None,
         bytes: Arc::new([0u8, 0, 255, 255].repeat((frame.width * frame.height) as usize)),
         revision: 1,
@@ -14186,6 +15545,7 @@ fn rejected_linear_dma_worker_commits_original_publication() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new(Vec::new()),
             revision: 17,
@@ -14293,6 +15653,7 @@ fn native_upload_failed_fence_wait_retains_gpu_resources_until_completion() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([0u8, 0, 255, 255].repeat(32 * 32)),
             revision: 1,
@@ -14367,6 +15728,7 @@ fn native_dma_failed_fence_wait_keeps_descriptor_and_import_alive() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             cpu_capture: None,
             bytes: Arc::new([255u8, 0, 0, 255].repeat(32 * 32)),
             revision: 1,
@@ -14567,6 +15929,7 @@ fn native_cpu_producer_damage_reuses_only_exact_gpu_base_and_rolls_back_on_faile
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(old_pixels.clone()),
             revision: 1,
             cpu_capture: Some(appkit::backing::NativeCpuCapture {
@@ -14758,6 +16121,7 @@ fn extra_native_window_crop_invalidates_damage_before_mixed_dma_gpu_upload() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(pixels.clone()),
             revision: 7,
             cpu_capture: Some(appkit::backing::NativeCpuCapture {
@@ -14875,6 +16239,7 @@ fn transient_native_dma_import_retries_new_gpu_only_producer_without_window_blac
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 17,
             cpu_capture: None,
@@ -15119,6 +16484,7 @@ fn compositor_worker_retries_same_dma_revision_after_temporary_import_failure() 
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 63,
             cpu_capture: None,
@@ -15218,6 +16584,7 @@ fn cached_unsupported_dma_uses_cpu_fallback_on_metadata_only_scene_change() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 89,
             cpu_capture: None,
@@ -15363,6 +16730,7 @@ fn unsupported_device_modifier_is_hard_refusal_not_endless_dma_retry() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 92,
             cpu_capture: None,
@@ -15443,6 +16811,7 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
         rounded: vec![],
         occluded: Some(vec![]),
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 18,
             cpu_capture: None,
@@ -15469,6 +16838,7 @@ fn invalid_supported_dma_plane_layout_is_not_retried() {
         opacity_groups: Vec::new(),
         id: native.id + 1,
         native: Some(scene::NativeCpuSceneSource {
+            tiles: None,
             bytes: Arc::new(Vec::new()),
             revision: 19,
             cpu_capture: None,
@@ -15797,6 +17167,7 @@ fn metal_root_ca_only_child_recomposes_actual_vulkan_pixels_without_new_drawable
                 occluded: Some(vec![]),
                 native: native_scene_source(
                     item.native_pixels,
+                    item.native_tiles,
                     item.native_dmabuf,
                     item.native_revision,
                     item.frame.width,
@@ -16452,6 +17823,7 @@ fn metadata_only_animation_over_static_metal_recomposition_benchmark() {
                 rounded: vec![],
                 occluded: Some(vec![]),
                 native: Some(scene::NativeCpuSceneSource {
+                    tiles: None,
                     bytes: Arc::clone(&pixel),
                     revision: 7,
                     cpu_capture: None,

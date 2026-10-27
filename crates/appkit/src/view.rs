@@ -119,6 +119,9 @@ pub struct MetalSceneLayer {
     /// Independent CPU-backed native content stacked above a Metal layer.
     /// None for actual CAMetalLayers. The GPU worker uploads immutable bytes.
     pub native_pixels: Option<std::sync::Arc<Vec<u8>>>,
+    /// Large plain opaque sources are represented as immutable row bands.
+    /// A present CPU snapshot never materializes a full contiguous image.
+    pub native_tiles: Option<std::sync::Arc<crate::backing::NativePixelTiles>>,
     pub native_cpu_capture: Option<crate::backing::NativeCpuCapture>,
     pub native_dmabuf: Option<std::sync::Arc<crate::backing::Dmabuf>>,
     pub native_revision: u64,
@@ -129,6 +132,14 @@ pub struct MetalSceneLayer {
     /// Original NSView pointer that owns an independent CPU/DMA image. A
     /// large view can publish multiple tiles with distinct GPU layer IDs.
     pub native_owner: usize,
+}
+
+impl MetalSceneLayer {
+    /// Whether the GPU worker gets CPU pixels for this layer, contiguous or
+    /// row-banded.
+    pub fn has_native_cpu_source(&self) -> bool {
+        self.native_pixels.is_some() || self.native_tiles.is_some()
+    }
 }
 
 static NATIVE_TILE_IDS: std::sync::LazyLock<Mutex<HashMap<(usize, u32), usize>>> =
@@ -638,7 +649,7 @@ pub(crate) fn native_metal_scene_active(window: sdl3::Window) -> bool {
         .is_some_and(|scene| {
             scene
                 .iter()
-                .any(|item| item.native_pixels.is_none() && item.native_dmabuf.is_none())
+                .any(|item| !item.has_native_cpu_source() && item.native_dmabuf.is_none())
         })
 }
 
@@ -892,6 +903,7 @@ fn capture_metal_subtree_segment(
                     occluded: Vec::new(),
                     native_cpu_capture: None,
                     native_pixels: Some(pixels),
+                    native_tiles: None,
                     native_dmabuf: None,
                     native_revision: revision,
                     native_dma_sample: None,
@@ -1044,6 +1056,7 @@ fn visit_metal_scene(
                     rounded: rounded.clone(),
                     occluded: Vec::new(),
                     native_pixels: None,
+                    native_tiles: None,
                     native_cpu_capture: None,
                     native_dmabuf: None,
                     native_revision: 0,
@@ -1148,8 +1161,6 @@ fn visit_metal_scene(
                 let visible = ca_clip.map_or(intersect_scene_clips(frame, viewport), |clip| {
                     intersect_scene_clips(intersect_scene_clips(frame, viewport), clip)
                 });
-                let bounded =
-                    crate::backing::native_scene_extent_supported(frame.width, frame.height);
                 let dma =
                     crate::backing::native_scene_dma_extent_supported(frame.width, frame.height)
                         .then(|| crate::backing::native_dma_overlay(view))
@@ -1159,6 +1170,12 @@ fn visit_metal_scene(
                 // same paint order, each with an independent GPU lease.
                 let large_visible =
                     !crate::backing::native_scene_extent_supported(visible.width, visible.height);
+                let tiled_candidate = dma.is_none()
+                    && crate::backing::native_scene_tiled_candidate(
+                        view,
+                        frame.width,
+                        frame.height,
+                    );
                 let tile_edge = if large_visible { 2048 } else { u32::MAX };
                 let mut index = 0u32;
                 let mut y = 0u32;
@@ -1180,18 +1197,18 @@ fn visit_metal_scene(
                             width: i64::from(width),
                             height: i64::from(height),
                         };
-                        let cpu = if bounded
-                            && part.x == frame.x
-                            && part.y == frame.y
-                            && part.width == frame.width
-                            && part.height == frame.height
-                        {
-                            crate::backing::native_scene_pixels_cropped_with_damage(
+                        let tiled = if tiled_candidate {
+                            crate::backing::native_scene_tiled_pixels_cropped_with_damage(
                                 view,
                                 frame.width,
                                 frame.height,
                                 cropped,
                             )
+                        } else {
+                            None
+                        };
+                        let cpu = if tiled.is_some() {
+                            None
                         } else {
                             crate::backing::native_scene_pixels_cropped_with_damage(
                                 view,
@@ -1202,7 +1219,7 @@ fn visit_metal_scene(
                         };
                         // A DMA source remains one coherent GPU image. A CPU
                         // tile never borrows a DMA producer's unrelated frame.
-                        if cpu.is_some() || dma.is_some() {
+                        if cpu.is_some() || tiled.is_some() || dma.is_some() {
                             let sample = dma.as_ref().map(|_| {
                                 (
                                     frame.width,
@@ -1215,6 +1232,7 @@ fn visit_metal_scene(
                             // visible output frame unchanged while changing
                             // which producer texels are sampled.
                             let revision = cpu.as_ref().map_or(0, |(_, rev, _)| *rev)
+                                ^ tiled.as_ref().map_or(0, |(_, rev, _)| *rev)
                                 ^ dma.as_ref().map_or(0, |(_, rev)| rev.rotate_left(19))
                                 ^ sample.map_or(0, |(w, h, x, y)| {
                                     (u64::from(w) << 32 | u64::from(h)).rotate_left(11)
@@ -1230,13 +1248,18 @@ fn visit_metal_scene(
                                 clip: ca_clip,
                                 rounded: rounded.clone(),
                                 occluded: Vec::new(),
-                                native_cpu_capture: cpu.as_ref().map(|(_, rev, damage)| {
-                                    crate::backing::NativeCpuCapture {
-                                        revision: *rev,
-                                        damage: *damage,
-                                    }
-                                }),
+                                native_cpu_capture: cpu
+                                    .as_ref()
+                                    .map(|(_, rev, damage)| (*rev, *damage))
+                                    .or_else(|| {
+                                        tiled.as_ref().map(|(_, rev, damage)| (*rev, *damage))
+                                    })
+                                    .map(|(revision, damage)| crate::backing::NativeCpuCapture {
+                                        revision,
+                                        damage,
+                                    }),
                                 native_pixels: cpu.map(|(pixels, _, _)| pixels),
+                                native_tiles: tiled.map(|(tiles, _, _)| tiles),
                                 native_dmabuf: dma.as_ref().map(|(p, _)| std::sync::Arc::clone(p)),
                                 native_dma_sample: sample,
                                 native_revision: revision,
@@ -1326,6 +1349,7 @@ fn same_metal_scene(a: &[MetalSceneLayer], b: &[MetalSceneLayer]) -> bool {
                 && a.native_revision == b.native_revision
                 && a.native_dma_sample == b.native_dma_sample
                 && a.native_pixels.is_some() == b.native_pixels.is_some()
+                && a.native_tiles.is_some() == b.native_tiles.is_some()
                 && a.native_dmabuf.is_some() == b.native_dmabuf.is_some()
                 && a.rounded.len() == b.rounded.len()
                 && a.rounded
@@ -3570,7 +3594,7 @@ mod tests {
         let admitted = metal_scene(sdl)
             .unwrap_or_default()
             .into_iter()
-            .filter(|p| p.native_pixels.is_some() || p.native_dmabuf.is_some())
+            .filter(|p| p.has_native_cpu_source() || p.native_dmabuf.is_some())
             .map(|p| (p.layer, p.native_revision))
             .collect::<Vec<_>>();
         crate::backing::set_native_gpu_admission(sdl, &admitted);
@@ -6069,15 +6093,26 @@ mod tests {
         let mut total = 0u64;
         for tile in &tiles {
             assert!(ids.insert(tile.layer), "two tiles shared one GPU layer ID");
-            assert!(tile.native_pixels.as_ref().unwrap().len() <= 64 * 1024 * 1024);
-            assert_eq!(
-                tile.native_pixels.as_ref().unwrap().len(),
-                tile.frame.width as usize * tile.frame.height as usize * 4
-            );
-            assert_eq!(
-                &tile.native_pixels.as_ref().unwrap()[..4],
-                &[0, 0, 255, 255]
-            );
+            if let Some(snapshot) = tile.native_tiles.as_ref() {
+                assert_eq!(
+                    snapshot.len(),
+                    tile.frame.width as usize * tile.frame.height as usize * 4
+                );
+                let mut first = [0u8; 4];
+                snapshot.copy_rect_to(0, 0, 1, 1, &mut first).unwrap();
+                assert_eq!(first, [0, 0, 255, 255]);
+                assert!(tile.native_pixels.is_none());
+            } else {
+                assert!(tile.native_pixels.as_ref().unwrap().len() <= 64 * 1024 * 1024);
+                assert_eq!(
+                    tile.native_pixels.as_ref().unwrap().len(),
+                    tile.frame.width as usize * tile.frame.height as usize * 4
+                );
+                assert_eq!(
+                    &tile.native_pixels.as_ref().unwrap()[..4],
+                    &[0, 0, 255, 255]
+                );
+            }
             total += u64::from(tile.frame.width) * u64::from(tile.frame.height);
         }
         assert_eq!(
@@ -6113,7 +6148,7 @@ mod tests {
         let first_capture = crate::backing::native_render_count_for_tests();
         let old: Vec<_> = tiles
             .iter()
-            .map(|p| p.native_pixels.as_ref().unwrap().clone())
+            .map(|p| (p.native_pixels.clone(), p.native_tiles.clone()))
             .collect();
         for _ in 0..3 {
             invalidate_metal_scene_for_window(sdl);
@@ -6124,9 +6159,17 @@ mod tests {
                 .filter(|p| p.native_owner == above as usize)
                 .collect();
             assert_eq!(actual.len(), old.len());
-            for (tile, pixels) in actual.iter().zip(old.iter()) {
+            for (tile, (pixels, snapshot)) in actual.iter().zip(old.iter()) {
+                let same_pixels = match (&tile.native_pixels, pixels) {
+                    (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
+                    _ => false,
+                };
+                let same_tiles = match (&tile.native_tiles, snapshot) {
+                    (Some(now), Some(old)) => std::sync::Arc::ptr_eq(now, old),
+                    _ => false,
+                };
                 assert!(
-                    std::sync::Arc::ptr_eq(tile.native_pixels.as_ref().unwrap(), pixels),
+                    same_pixels || same_tiles,
                     "unchanged 6K tile rerendered instead of using retained Arc"
                 );
             }
@@ -6417,6 +6460,7 @@ mod tests {
             rounded: vec![],
             occluded: vec![],
             native_pixels: None,
+            native_tiles: None,
             native_cpu_capture: None,
             native_dmabuf: Some(std::sync::Arc::new(crate::backing::Dmabuf {
                 width: 6016,
