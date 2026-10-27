@@ -387,10 +387,7 @@ impl NativePixelTiles {
         let mut bands = Vec::new();
         let mut hashes = Vec::new();
         for band in pixels.chunks(stride * NATIVE_TILE_ROWS) {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            band.hash(&mut h);
-            hashes.push(h.finish());
+            hashes.push(hash_bytes(band));
             bands.push(std::sync::Arc::new(band.to_vec()));
         }
         let revision = opaque_capture_revision(&hashes, expected);
@@ -415,10 +412,7 @@ impl NativePixelTiles {
                 let offset = ((crop.y as usize + y) * source.width as usize + crop.x as usize) * 4;
                 data.extend_from_slice(source.pixels.get(offset..offset + stride)?);
             }
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            data.hash(&mut hasher);
-            hashes.push(hasher.finish());
+            hashes.push(hash_bytes(&data));
             bands.push(std::sync::Arc::new(data));
         }
         let revision = opaque_capture_revision(&hashes, stride * height);
@@ -475,10 +469,7 @@ impl NativePixelTiles {
         }
         for (band, changed) in touched.into_iter().enumerate() {
             if changed {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                next.bands[band].hash(&mut h);
-                next.hashes[band] = h.finish();
+                next.hashes[band] = hash_bytes(&next.bands[band]);
             }
         }
         next.revision = opaque_capture_revision(&next.hashes, next.len());
@@ -722,15 +713,19 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
 const NATIVE_HASH_CHUNK_BYTES: usize = 64 * 1024;
 
 fn opaque_capture_hashes(pixels: &[u8]) -> Vec<u64> {
-    use std::hash::{Hash, Hasher};
     pixels
         .chunks(NATIVE_HASH_CHUNK_BYTES)
-        .map(|chunk| {
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            chunk.hash(&mut hash);
-            hash.finish()
-        })
+        .map(hash_bytes)
         .collect()
+}
+
+// Every flat and tiled chunk hash must agree, or a revision computed one way
+// never matches a predecessor computed the other.
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hash);
+    hash.finish()
 }
 
 fn opaque_capture_revision(hashes: &[u64], bytes: usize) -> u64 {
@@ -846,10 +841,7 @@ fn update_plain_opaque_capture(
         if changed {
             let offset = index * NATIVE_HASH_CHUNK_BYTES;
             let end = pixels.len().min(offset + NATIVE_HASH_CHUNK_BYTES);
-            use std::hash::{Hash, Hasher};
-            let mut hash = std::collections::hash_map::DefaultHasher::new();
-            pixels[offset..end].hash(&mut hash);
-            hashes[index] = hash.finish();
+            hashes[index] = hash_bytes(&pixels[offset..end]);
         }
     }
     prior.revision = opaque_capture_revision(hashes, length);
