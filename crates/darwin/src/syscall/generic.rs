@@ -25,12 +25,8 @@ fn handle_unix_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         numbers::bsd::SYS_open => {
             unix_call!(unsafe crate::stat::open(args[0], args[1], args[2]))
         }
-        numbers::bsd::SYS_getpid => {
-            Ok(crate::process::getpid() as _)
-        }
-        numbers::bsd::SYS_getppid => {
-            Ok(crate::process::getppid() as _)
-        }
+        numbers::bsd::SYS_getpid => Ok(crate::process::getpid() as _),
+        numbers::bsd::SYS_getppid => Ok(crate::process::getppid() as _),
         _ => Err(errno::from_host(ENOSYS)),
     }
 }
