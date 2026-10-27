@@ -1,9 +1,5 @@
-/// Darwin's `errno` values, paired with this host's for the same name.
-///
-/// The first thirty-four agree and are still listed: the point of the table is
-/// that it is the whole answer, and a reader should not have to know where the
-/// agreement stops.
-///
+pub const DARWIN_ENOSYS: i32 = 78;
+
 /// Darwin's `EPROCLIM`, `EBADRPC`, `ERPCMISMATCH`, `EPROGUNAVAIL`,
 /// `EPROGMISMATCH`, `EPROCUNAVAIL`, `EFTYPE`, `EAUTH`, `ENEEDAUTH`, `EPWROFF`,
 /// `EDEVERR`, `EBADEXEC`, `EBADARCH`, `ESHLIBVERS`, `EBADMACHO`, `ENOPOLICY`
@@ -87,7 +83,7 @@ const NUMBERS: &[(i32, i32)] = &[
     (70, libc::ESTALE),
     (71, libc::EREMOTE),
     (77, libc::ENOLCK),
-    (78, libc::ENOSYS),
+    (DARWIN_ENOSYS, libc::ENOSYS),
     (84, libc::EOVERFLOW),
     (89, libc::ECANCELED),
     (90, libc::EIDRM),

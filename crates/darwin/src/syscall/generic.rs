@@ -1,7 +1,8 @@
-use libc::ENOSYS;
+use static_init::dynamic;
 
 use crate::{
-    errno, mach,
+    errno::{self, DARWIN_ENOSYS},
+    mach,
     syscall::numbers::{self, SYSCALL_CLASS_MACH, SYSCALL_CLASS_UNIX},
 };
 
@@ -17,6 +18,26 @@ macro_rules! unix_call {
     };
 }
 
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord)]
+enum SyscallTracingMode {
+    None,
+    All,
+    Unknown,
+}
+
+fn get_syscall_tracing_mode() -> SyscallTracingMode {
+    #[dynamic]
+    static MODE: SyscallTracingMode = {
+        match std::env::var("ROSEMARY_SYSCALL_TRACE").as_deref() {
+            Ok("all") => SyscallTracingMode::All,
+            Ok("unknown") => SyscallTracingMode::Unknown,
+            _ => SyscallTracingMode::None,
+        }
+    };
+
+    MODE.clone()
+}
+
 fn handle_unix_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
     match number {
         numbers::bsd::SYS_openat => {
@@ -25,9 +46,18 @@ fn handle_unix_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         numbers::bsd::SYS_open => {
             unix_call!(unsafe crate::stat::open(args[0], args[1], args[2]))
         }
+        numbers::bsd::SYS_close => {
+            unix_call!(unsafe crate::net::descriptor::close(args[0]))
+        }
+        numbers::bsd::SYS_dup => {
+            unix_call!(unsafe crate::net::descriptor::dup(args[0]))
+        }
+        numbers::bsd::SYS_dup2 => {
+            unix_call!(unsafe crate::net::descriptor::dup2(args[0], args[1]))
+        }
         numbers::bsd::SYS_getpid => Ok(crate::process::getpid() as _),
         numbers::bsd::SYS_getppid => Ok(crate::process::getppid() as _),
-        _ => Err(errno::from_host(ENOSYS)),
+        _ => Err(DARWIN_ENOSYS),
     }
 }
 
@@ -49,7 +79,7 @@ fn handle_mach_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         numbers::mach::task_name_for_pid | numbers::mach::task_for_pid => {
             Ok(unsafe { mach::tasks::task_for_pid(args[0] as _, args[1] as _, args[2] as _) } as _)
         }
-        _ => Err(errno::from_host(ENOSYS)),
+        _ => Err(DARWIN_ENOSYS),
     }
 }
 
@@ -59,9 +89,33 @@ fn handle_mach_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
 ///
 /// Must be async-signal-safe: it runs in the `SIGSYS` handler.
 pub(crate) fn generic_syscall_entry(class: u32, number: u32, args: [u64; 6]) -> Result<u64, i32> {
-    match class {
+    let tracing_mode = get_syscall_tracing_mode();
+
+    if tracing_mode == SyscallTracingMode::All {
+        eprintln!("rosemary: SYSCALL BEGIN: {number:#x} CLASS {class:#x} ARGS {args:?}");
+    }
+
+    let res = match class {
         SYSCALL_CLASS_UNIX => handle_unix_syscall(number, args),
         SYSCALL_CLASS_MACH => handle_mach_syscall(number, args),
-        _ => Err(errno::from_host(ENOSYS)),
+        _ => Err(DARWIN_ENOSYS),
+    };
+
+    if tracing_mode == SyscallTracingMode::All {
+        match res {
+            Ok(res) => {
+                eprintln!("rosemary: SYSCALL SUCCESS: {number:#x} CLASS {class:#x} RES {res}")
+            }
+            Err(errno) => {
+                eprintln!("rosemary: SYSCALL FAILED: {number:#x} CLASS {class:#x} ERR {errno}")
+            }
+        }
+    } else if tracing_mode == SyscallTracingMode::Unknown {
+        if let Err(errno) = res
+            && errno == DARWIN_ENOSYS
+        {
+            eprintln!("rosemary: UNRECOGNIZED SYSCALL {number:#x} CLASS {class:#x} ARGS {args:?}");
+        }
     }
+    res
 }
