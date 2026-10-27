@@ -1170,6 +1170,12 @@ fn visit_metal_scene(
                 // same paint order, each with an independent GPU lease.
                 let large_visible =
                     !crate::backing::native_scene_extent_supported(visible.width, visible.height);
+                let tiled_candidate = dma.is_none()
+                    && crate::backing::native_scene_tiled_candidate(
+                        view,
+                        frame.width,
+                        frame.height,
+                    );
                 let tile_edge = if large_visible { 2048 } else { u32::MAX };
                 let mut index = 0u32;
                 let mut y = 0u32;
@@ -1191,7 +1197,7 @@ fn visit_metal_scene(
                             width: i64::from(width),
                             height: i64::from(height),
                         };
-                        let tiled = if dma.is_none() {
+                        let tiled = if tiled_candidate {
                             crate::backing::native_scene_tiled_pixels_cropped_with_damage(
                                 view,
                                 frame.width,

@@ -148,6 +148,12 @@ impl Store {
         }
     }
 
+    /// Whether the store is already known to hold a translucent pixel,
+    /// without scanning it.
+    fn known_translucent(&self) -> bool {
+        self.alpha_class.load(Ordering::Relaxed) == ALPHA_TRANSLUCENT
+    }
+
     /// Record a translucent pixel found while checking only part of the
     /// store, so no later caller scans all of it to learn the same thing.
     fn found_translucent(&self) {
@@ -583,6 +589,32 @@ fn trim_native_capture_maps(
     }
 }
 
+/// Whether a view can take the row-banded path at all. None of this depends
+/// on the crop, so a publisher tests it once per view, not once per tile.
+pub(crate) fn native_scene_tiled_candidate(view: Id, width: u32, height: u32) -> bool {
+    let layer = crate::view::layer_of(view);
+    let stores = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
+    stores
+        .as_ref()
+        .and_then(|all| all.get(&(view as usize)))
+        .is_some_and(|source| tiled_view_eligible(view, layer, source, width, height))
+}
+
+fn tiled_view_eligible(view: Id, layer: Id, source: &Store, width: u32, height: u32) -> bool {
+    source.width == width
+        && source.height == height
+        && !source.known_translucent()
+        && !crate::coreanimation::has_tree(layer)
+        && !crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time())
+        // Both CPU and DMA-BUF overlays require the established blended
+        // contiguous path; banded sources have no mixed-DMA stage/fallback.
+        && !OVERLAYS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|(id, _)| *id == view as usize)
+}
+
 /// Publication path for large plain opaque NSView backing stores. The scene
 /// owns a row-banded value snapshot, never a borrowed mutable Store pointer.
 /// Any uncertain damage or alpha proof falls back to the existing full capture.
@@ -610,23 +642,9 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
         return None;
     }
     let layer = crate::view::layer_of(view);
-    if crate::coreanimation::has_tree(layer)
-        || crate::coreanimation::native_scene_content_animating(layer, darwin::mach::media_time())
-    {
-        return None;
-    }
     let stores = VIEW_STORES.lock().unwrap_or_else(|e| e.into_inner());
     let source = stores.as_ref()?.get(&(view as usize))?;
-    if source.width != width || source.height != height {
-        return None;
-    }
-    let overlay = OVERLAYS.lock().unwrap_or_else(|e| e.into_inner());
-    if overlay
-        .iter()
-        // Both CPU and DMA-BUF overlays require the established blended
-        // contiguous path; banded sources have no mixed-DMA stage/fallback.
-        .any(|(id, _)| *id == view as usize)
-    {
+    if !tiled_view_eligible(view, layer, source, width, height) {
         return None;
     }
     let overlay_revision = OVERLAY_REVISIONS
@@ -4922,6 +4940,35 @@ mod tests {
                 .keys()
                 .any(|key| key.0 == owner)
         );
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn a_view_known_to_be_translucent_is_not_a_tiled_candidate() {
+        const W: u32 = 512;
+        const H: u32 = 520;
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(W, H);
+        store.pixels = [10, 20, 30, 255].repeat((W * H) as usize);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        assert!(native_scene_tiled_candidate(view, W, H));
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            src.pixels[3] = 0;
+            src.touch();
+            assert!(!src.fully_opaque());
+        }
+        let scans = opaque_alpha_scan_count_for_tests();
+        assert!(!native_scene_tiled_candidate(view, W, H));
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scans);
         forget(view);
         objc::arc::release(view);
     }
