@@ -850,24 +850,22 @@ fn update_plain_opaque_capture(
         prior.last_used = next_native_capture_use();
         return Some((std::sync::Arc::clone(&prior.pixels), prior.revision));
     }
-    let old_revision = prior.revision;
-    let pixels = std::sync::Arc::make_mut(&mut prior.pixels);
+    // Arc::make_mut copies the whole frame while a GPU reader holds it. Take
+    // the entry out so that copy never runs under the shared cache lock; the
+    // caller's VIEW_STORES guard keeps any other publisher from racing it.
+    let mut entry = captures.remove(&key)?;
+    drop(captures);
+    let old_revision = entry.revision;
+    let pixels = std::sync::Arc::make_mut(&mut entry.pixels);
     let mut touched = vec![false; length.div_ceil(band_bytes)];
     for row in 0..h {
-        let src_at = (y + row)
-            .checked_mul(width)?
-            .checked_add(x)?
-            .checked_mul(4)?;
-        let dst_at = (dy + row)
-            .checked_mul(crop_width)?
-            .checked_add(dx)?
-            .checked_mul(4)?;
-        pixels
-            .get_mut(dst_at..dst_at + row_bytes)?
-            .copy_from_slice(source.pixels.get(src_at..src_at + row_bytes)?);
+        let src_at = ((y + row) * width + x) * 4;
+        let dst_at = ((dy + row) * crop_width + dx) * 4;
+        pixels[dst_at..dst_at + row_bytes]
+            .copy_from_slice(&source.pixels[src_at..src_at + row_bytes]);
         touched[(dy + row) / NATIVE_TILE_ROWS] = true;
     }
-    let hashes = prior.opaque_hashes.as_mut()?;
+    let hashes = entry.opaque_hashes.as_mut()?;
     for (index, changed) in touched.into_iter().enumerate() {
         if changed {
             let offset = index * band_bytes;
@@ -875,24 +873,31 @@ fn update_plain_opaque_capture(
             hashes[index] = hash_bytes(&pixels[offset..end]);
         }
     }
-    prior.revision = opaque_capture_revision(hashes, length);
-    prior.view_generation = Some(source.generation());
-    prior.last_used = next_native_capture_use();
-    prior.damage = (old_revision != prior.revision).then_some(NativeCpuDamage {
-        from_revision: old_revision,
-        rect: Rect {
-            x: region.x - crop.x,
-            y: region.y - crop.y,
-            width: region.width,
-            height: region.height,
-        },
-    });
+    entry.revision = opaque_capture_revision(hashes, length);
+    entry.view_generation = Some(source.generation());
+    entry.last_used = next_native_capture_use();
+    if old_revision != entry.revision {
+        entry.damage = Some(NativeCpuDamage {
+            from_revision: old_revision,
+            rect: Rect {
+                x: region.x - crop.x,
+                y: region.y - crop.y,
+                width: region.width,
+                height: region.height,
+            },
+        });
+    }
+    let snapshot = (std::sync::Arc::clone(&entry.pixels), entry.revision);
+    NATIVE_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, entry);
     #[cfg(test)]
     {
         NATIVE_RENDER_COUNT.with(|count| count.set(count.get() + 1));
         NATIVE_INCREMENTAL_PATCHES.with(|count| count.set(count.get() + 1));
     }
-    Some((std::sync::Arc::clone(&prior.pixels), prior.revision))
+    Some(snapshot)
 }
 
 const NATIVE_CAPTURE_CACHE_LIMIT: usize = 256 * 1024 * 1024;
