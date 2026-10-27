@@ -26,11 +26,15 @@ pub struct Store {
     generation: u64,
     // Bounded producer-authored changes. Missing generations mean full damage.
     changes: VecDeque<(u64, Rect)>,
-    /// 0 = unclassified, 1 = contains transparent pixels, 2 = fully opaque.
-    /// Invalidated by every Store::touch and Store::resize. Atomic so immutable
-    /// window snapshots remain shareable with the Vulkan worker.
+    /// One of the ALPHA_* classes. Invalidated by every Store::touch and
+    /// Store::resize. Atomic so immutable window snapshots remain shareable
+    /// with the Vulkan worker.
     alpha_class: AtomicU8,
 }
+
+const ALPHA_UNCLASSIFIED: u8 = 0;
+const ALPHA_TRANSLUCENT: u8 = 1;
+const ALPHA_OPAQUE: u8 = 2;
 
 impl Store {
     #[cfg(test)]
@@ -48,7 +52,7 @@ impl Store {
             dirty: false,
             generation: 0,
             changes: VecDeque::new(),
-            alpha_class: AtomicU8::new(0),
+            alpha_class: AtomicU8::new(ALPHA_UNCLASSIFIED),
         }
     }
 
@@ -68,7 +72,8 @@ impl Store {
 
     fn touch_region(&mut self, area: Rect) {
         const MAX_GENERATIONS: usize = 32;
-        self.alpha_class.store(0, Ordering::Relaxed);
+        self.alpha_class
+            .store(ALPHA_UNCLASSIFIED, Ordering::Relaxed);
         self.dirty = true;
         let next = self.generation.wrapping_add(1);
         if next <= self.generation {
@@ -119,8 +124,8 @@ impl Store {
 
     fn fully_opaque(&self) -> bool {
         match self.alpha_class.load(Ordering::Relaxed) {
-            1 => false,
-            2 => true,
+            ALPHA_TRANSLUCENT => false,
+            ALPHA_OPAQUE => true,
             _ => {
                 #[cfg(test)]
                 OPAQUE_ALPHA_SCANS.with(|count| count.set(count.get() + 1));
@@ -130,11 +135,23 @@ impl Store {
                     .0
                     .iter()
                     .all(|pixel| pixel[3] == 255);
-                self.alpha_class
-                    .store(if opaque { 2 } else { 1 }, Ordering::Relaxed);
+                self.alpha_class.store(
+                    if opaque {
+                        ALPHA_OPAQUE
+                    } else {
+                        ALPHA_TRANSLUCENT
+                    },
+                    Ordering::Relaxed,
+                );
                 opaque
             }
         }
+    }
+
+    /// Record a translucent pixel found while checking only part of the
+    /// store, so no later caller scans all of it to learn the same thing.
+    fn found_translucent(&self) {
+        self.alpha_class.store(ALPHA_TRANSLUCENT, Ordering::Relaxed);
     }
 
     /// Change the size, keeping what the top-left corner held.
@@ -157,7 +174,7 @@ impl Store {
             dirty: true,
             generation: self.generation.wrapping_add(1),
             changes: VecDeque::new(),
-            alpha_class: AtomicU8::new(0),
+            alpha_class: AtomicU8::new(ALPHA_UNCLASSIFIED),
         };
     }
 }
@@ -673,28 +690,31 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
                             .all(|pixel| pixel[3] == 255)
                     })
                 });
-                if opaque {
-                    let next = old.tiles.patched_regions(source, crop, &regions)?;
-                    let prior = old.tiles.revision;
-                    let revision = next.revision;
-                    // Preserve exact dirty rectangles for CPU patch work,
-                    // keep the old single-box GPU ABI conservative for now.
-                    let union = regions.iter().copied().reduce(|a, b| a.union(&b))?;
-                    if prior != revision {
-                        old.damage = Some(NativeCpuDamage {
-                            from_revision: prior,
-                            rect: Rect {
-                                x: union.x - crop.x,
-                                y: union.y - crop.y,
-                                width: union.width,
-                                height: union.height,
-                            },
-                        });
-                    }
-                    old.view_generation = source.generation();
-                    old.tiles = std::sync::Arc::new(next);
-                    return Some((std::sync::Arc::clone(&old.tiles), revision, old.damage));
+                if !opaque {
+                    source.found_translucent();
+                    cache.remove(&key);
+                    return None;
                 }
+                let next = old.tiles.patched_regions(source, crop, &regions)?;
+                let prior = old.tiles.revision;
+                let revision = next.revision;
+                // Preserve exact dirty rectangles for CPU patch work,
+                // keep the old single-box GPU ABI conservative for now.
+                let union = regions.iter().copied().reduce(|a, b| a.union(&b))?;
+                if prior != revision {
+                    old.damage = Some(NativeCpuDamage {
+                        from_revision: prior,
+                        rect: Rect {
+                            x: union.x - crop.x,
+                            y: union.y - crop.y,
+                            width: union.width,
+                            height: union.height,
+                        },
+                    });
+                }
+                old.view_generation = source.generation();
+                old.tiles = std::sync::Arc::new(next);
+                return Some((std::sync::Arc::clone(&old.tiles), revision, old.damage));
             }
         }
     }
@@ -815,6 +835,7 @@ fn update_plain_opaque_capture(
         let start = row.checked_mul(width)?.checked_add(x)?.checked_mul(4)?;
         let bytes = source.pixels.get(start..start + row_bytes)?;
         if bytes.chunks_exact(4).any(|pixel| pixel[3] != 255) {
+            source.found_translucent();
             return None; // Re-render through the general alpha-aware path.
         }
     }
@@ -2665,7 +2686,7 @@ fn native_scene_pixels_impl(
             dirty: false,
             generation: 0,
             changes: VecDeque::new(),
-            alpha_class: AtomicU8::new(2),
+            alpha_class: AtomicU8::new(ALPHA_OPAQUE),
         }
     } else {
         let mut output = Store::new(crop.width as u32, crop.height as u32);
@@ -4080,7 +4101,7 @@ fn compose(window: sdl3::Window, store: &Store) -> (Option<Store>, Vec<GpuOverla
             // An overlay that changes damages the store under it.
             generation: store.generation,
             changes: VecDeque::new(),
-            alpha_class: AtomicU8::new(0),
+            alpha_class: AtomicU8::new(ALPHA_UNCLASSIFIED),
         });
         blend_overlay_clipped(
             target,
@@ -4803,6 +4824,48 @@ mod tests {
         touch([1, 2, 3, 255]);
         let identical = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
         assert_eq!((identical.1, identical.2), (patched.1, Some(damage)));
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn a_translucent_dirty_pixel_disproves_opacity_without_a_full_scan() {
+        const W: u32 = 512;
+        const H: u32 = 520;
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(W, H);
+        store.pixels = [10, 20, 30, 255].repeat((W * H) as usize);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(W),
+            height: i64::from(H),
+        };
+        native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        native_scene_pixels_cropped(view, W, H, crop).unwrap();
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            let at = (400 * W as usize + 3) * 4;
+            src.pixels[at..at + 4].copy_from_slice(&[0, 0, 0, 0]);
+            src.touch_region(Rect {
+                x: 3,
+                y: 400,
+                width: 1,
+                height: 1,
+            });
+        }
+        let scans = opaque_alpha_scan_count_for_tests();
+        assert!(native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).is_none());
+        native_scene_pixels_cropped(view, W, H, crop).unwrap();
+        assert_eq!(opaque_alpha_scan_count_for_tests(), scans);
         forget(view);
         objc::arc::release(view);
     }
@@ -6070,7 +6133,7 @@ mod tests {
             dirty: false,
             generation: 0,
             changes: VecDeque::new(),
-            alpha_class: AtomicU8::new(0),
+            alpha_class: AtomicU8::new(ALPHA_UNCLASSIFIED),
         }
     }
 
