@@ -8,10 +8,10 @@ use std::{
 
 use starnix::process::Region;
 
-use crate::syscall::{
+use crate::{errno, syscall::{
     generic::generic_syscall_entry,
     scope::{SELECTOR, ScopedHostSyscallContext},
-};
+}};
 
 const PR_SET_SYSCALL_USER_DISPATCH: c_int = 59;
 const PR_SYS_DISPATCH_OFF: c_ulong = 0;
@@ -177,6 +177,9 @@ extern "C" fn handle_sigsys(signum: c_int, info: *mut libc::siginfo_t, context: 
         forward(signum, info, context);
         return;
     }
+    // We don't want to mess with the guest's errno if we call into a Darwin function to handle
+    // a system call.
+    let _errno_guard = errno::Held::now();
     let _host = ScopedHostSyscallContext::new();
     let regs = &mut ucontext.uc_mcontext.gregs;
     let reg = |index: c_int| regs[index as usize] as u64;
