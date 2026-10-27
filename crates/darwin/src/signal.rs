@@ -1526,7 +1526,7 @@ pub mod entry {
 
         #[test]
         fn signal_zero_probes_existence_rather_than_being_translated() {
-            let me = starnix::process::me();
+            let me = crate::process::host_self();
             assert_eq!(kill_(me, 0), 0);
             assert_eq!(kill_(me, 99), -1, "not a signal");
         }
@@ -1805,7 +1805,7 @@ mod tests {
         let (info, mcsize, pc, mask) = SEEN.lock().unwrap().take().expect("the handler ran");
         assert_eq!(info.signo, signum::SIGURG);
         assert_eq!(info.code, 0x10001, "SI_USER");
-        assert_eq!(info.pid, starnix::process::me());
+        assert_eq!(info.pid, crate::process::host_self());
         assert_eq!(mcsize, size_of::<Mcontext>() as u64);
         assert_ne!(pc, 0);
         assert_eq!(

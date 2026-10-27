@@ -173,7 +173,7 @@ pub fn publish_page_size() {
 /// host's per-process accounting rounds to a clock tick.
 fn measure(task: Name, flavor: i32) -> Option<Usage> {
     let pid = space::task_pid(task)?;
-    let me = pid == starnix::process::me();
+    let me = pid == crate::process::host_self();
     let mut usage = match me && sizes_only(flavor) {
         true => own_sizes(matches!(flavor, TASK_VM_INFO | TASK_VM_INFO_PURGEABLE))?,
         false => crate::process::usage(pid)?,
@@ -207,7 +207,7 @@ fn sizes_only(flavor: i32) -> bool {
 /// This process's sizes, and its region count if asked for. Only the fields
 /// the flavours of [`sizes_only`] read are filled; the times come after.
 fn own_sizes(regions: bool) -> Option<Usage> {
-    let footprint = starnix::process::footprint(starnix::process::me())?;
+    let footprint = starnix::process::footprint(crate::process::host_self())?;
     Some(Usage {
         virtual_size: footprint.virtual_size,
         resident_size: footprint.resident_size,
@@ -220,6 +220,7 @@ fn own_sizes(regions: bool) -> Option<Usage> {
 
 /// How many mappings this process has
 fn region_count() -> u32 {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let count = starnix::process::regions().map_or(0, |regions| regions.len() as u32);
     count
 }

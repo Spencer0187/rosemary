@@ -40,6 +40,7 @@ pub fn id() -> u32 {
     }
     #[cfg(target_os = "linux")]
     {
+        let _host = crate::syscall::ScopedHostSyscallContext::new();
         rustix::thread::gettid().as_raw_pid() as u32
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
@@ -679,7 +680,7 @@ pub unsafe extern "C" fn mach_thread_np(thread: u64) -> u32 {
         if unsafe { threadid_np(thread, (&raw mut tid) as usize as u64) } != 0 {
             return 0;
         }
-        return crate::mach::space::borrow_thread(starnix::process::me(), tid as i32);
+        return crate::mach::space::borrow_thread(crate::process::host_self(), tid as i32);
     }
     #[cfg(not(target_os = "macos"))]
     {

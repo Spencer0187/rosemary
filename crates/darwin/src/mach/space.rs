@@ -380,7 +380,7 @@ fn thread_name(pid: i32, tid: i32, add_reference: bool) -> Name {
 }
 
 fn own_pid() -> i32 {
-    starnix::process::me()
+    crate::process::host_self()
 }
 
 /// The pid of the task `name` is a right to.

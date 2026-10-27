@@ -68,7 +68,7 @@ pub unsafe extern "C" fn proc_pidinfo(
     buffer: *mut c_void,
     size: c_int,
 ) -> c_int {
-    let me = starnix::process::me();
+    let me = crate::process::host_self();
     let pid = if pid == 0 {
         me
     } else {
@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn the_wakeups_monitor_reads_as_disabled() {
         let (mut rate, mut flags) = (0, 0);
-        let me = crate::process::guest_pid(starnix::process::me());
+        let me = crate::process::guest_pid(crate::process::host_self());
         let rc = unsafe { proc_get_wakemon_params(me, &mut rate, &mut flags) };
         assert_eq!((rc, rate, flags), (0, -1, WAKEMON_DISABLE));
         let rc = unsafe { proc_get_wakemon_params(me, std::ptr::null_mut(), &mut flags) };

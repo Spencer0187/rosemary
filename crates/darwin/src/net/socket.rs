@@ -250,6 +250,7 @@ pub(super) struct PeerIds {
 /// `host_uid` is the peer's real uid, and only a peer still running as it, not
 /// one that became another virtual user, is answered this way.
 fn as_launchd_owner(ids: PeerIds, host_uid: u32) -> PeerIds {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     // SAFETY: `getpid` and `getuid` take nothing and cannot fail.
     let (me, owner) = unsafe { (libc::getpid(), libc::getuid()) };
     if server::client::launchd() != Some(me) || host_uid != owner || ids.euid != owner {
@@ -273,6 +274,7 @@ fn as_launchd_owner(ids: PeerIds, host_uid: u32) -> PeerIds {
 /// answered the way a Mac would. A peer the server does not know is the host
 /// user at the other end.
 pub(super) fn peer_ids(fd: i32) -> Option<PeerIds> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     /// Names the guest's descriptor without owning it, or asserting it is valid.
     struct Raw(i32);
     impl std::os::fd::AsRawFd for Raw {

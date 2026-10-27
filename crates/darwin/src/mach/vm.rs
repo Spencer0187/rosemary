@@ -100,6 +100,7 @@ const _: () = {
 /// Another task's map is the host's to say, and the server asks it: reading a
 /// map needs no access to the memory behind it.
 fn region_at_or_after(task: Name, address: u64) -> Result<Option<Region>, i32> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     let regions = match space::target(task)? {
         Target::Local => starnix::process::regions().map_err(|_| KERN_FAILURE)?,
         Target::Remote { pid, image } => match server::client::regions(pid, image) {

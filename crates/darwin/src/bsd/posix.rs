@@ -349,7 +349,7 @@ pub unsafe extern "C" fn csops(
     useraddr: *mut c_void,
     usersize: usize,
 ) -> c_int {
-    if pid != 0 && pid != starnix::process::me() {
+    if pid != 0 && pid != crate::process::host_self() {
         crate::errno::set(libc::ESRCH);
         return -1;
     }

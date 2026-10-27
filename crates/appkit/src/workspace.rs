@@ -144,6 +144,7 @@ unsafe extern "C" fn frontmost_application(_receiver: Id, _sel: Sel) -> Id {
 /// `-[NSWorkspace runningApplications]`: this process, and every other
 /// application running in the prefix.
 unsafe extern "C" fn workspace_running_applications(_receiver: Id, _sel: Sel) -> Id {
+    let _host = darwin::syscall::ScopedHostSyscallContext::new();
     let mut objects = vec![current()];
     for application in server::client::applications(None).unwrap_or_default() {
         let object = object_for(&application);
@@ -476,6 +477,7 @@ pub(crate) fn spawn_application(
 /// What a program that keeps itself to one instance asks: finding another, it
 /// activates that one and quits.
 unsafe extern "C" fn running_applications(_class: Id, _sel: Sel, identifier: Id) -> Id {
+    let _host = darwin::syscall::ScopedHostSyscallContext::new();
     if identifier.is_null() {
         return autoreleased_array(&[]);
     }

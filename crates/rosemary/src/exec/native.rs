@@ -197,6 +197,13 @@ impl Native {
             false => darwin::sysctl::GuestArch::X86_64,
         });
         darwin::sysctl::set_runs_host_instructions(true);
+        // The guest's instructions run on this CPU, so its raw syscalls would
+        // reach the host kernel under Darwin's numbering.
+        match darwin::syscall::setup_syscall_handler() {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+            Err(e) => eprintln!("rosemary: the guest's raw syscalls are not interposed: {e}"),
+        }
 
         let mut loader = Loader::new(HOST_SPEC);
         loader.insert_libraries(crate::dyld::inserted_libraries(&bytes, HOST_SPEC));

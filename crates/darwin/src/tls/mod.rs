@@ -194,7 +194,12 @@ macro_rules! call_as_darwin {
 /// thread exit, a callback a host library makes on its own - must still find
 /// this thread's array, as [`tsd_base`] already arranges for a thread that
 /// never entered.
-pub struct DarwinThread(());
+///
+/// The guest's syscalls, unlike the register, are interposed only for the
+/// scope's life - see [`crate::syscall`].
+pub struct DarwinThread {
+    _syscalls: crate::syscall::ScopedGuestSyscallContext,
+}
 
 pub const fn can_enter_darwin() -> bool {
     cfg!(target_os = "macos")
@@ -213,28 +218,42 @@ impl DarwinThread {
         if !entered() {
             set_thread_pointer(tsd_base());
         }
-        DarwinThread(())
+        DarwinThread {
+            _syscalls: crate::syscall::ScopedGuestSyscallContext::new(),
+        }
     }
 }
 
+// FIXME: This abstraction probably won't be used anywhere. Do we just remove it?
 pub struct HostThread {
     saved: Option<u64>,
+    _syscalls: crate::syscall::ScopedHostSyscallContext,
 }
 
 impl HostThread {
     pub fn enter() -> HostThread {
+        let syscalls = crate::syscall::ScopedHostSyscallContext::new();
         if !swaps() {
-            return HostThread { saved: None };
+            return HostThread {
+                saved: None,
+                _syscalls: syscalls,
+            };
         }
         let saved = host_thread_pointer();
         let base = tsd_base() as usize as *const u64;
         // SAFETY: `base` is this thread's own array, which has `WORDS` words.
         let host = unsafe { *base.add(HOST_THREAD_POINTER) };
         if host == 0 {
-            return HostThread { saved: None };
+            return HostThread {
+                saved: None,
+                _syscalls: syscalls,
+            };
         }
         set_thread_pointer(host);
-        HostThread { saved: Some(saved) }
+        HostThread {
+            saved: Some(saved),
+            _syscalls: syscalls,
+        }
     }
 }
 

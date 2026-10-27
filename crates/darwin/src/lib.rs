@@ -100,6 +100,7 @@ pub mod stdlib;
 pub mod strict;
 pub mod string;
 pub mod strtofp;
+pub mod syscall;
 pub mod sysctl;
 pub mod sysdir;
 pub mod sysinfo;

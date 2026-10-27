@@ -21,6 +21,7 @@ use std::sync::Mutex;
 /// a test binary, or a host with no server configured - where distributed
 /// notifications stay inside the process.
 fn directory() -> Option<PathBuf> {
+    let _host = crate::syscall::ScopedHostSyscallContext::new();
     Some(server::client::directory()?.join("distnote"))
 }
 
