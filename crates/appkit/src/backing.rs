@@ -3067,7 +3067,12 @@ fn native_scene_proven_empty(placed: &Placed) -> bool {
                 width: width_tile,
                 height: height_tile,
             };
-            if native_scene_pixels_cropped(placed.view, width, height, crop).is_some() {
+            // A row-banded capture is opaque, so never empty. Trying it first
+            // also keeps a view published tiled from gaining a flat copy.
+            if native_scene_tiled_pixels_cropped_with_damage(placed.view, width, height, crop)
+                .is_some()
+                || native_scene_pixels_cropped(placed.view, width, height, crop).is_some()
+            {
                 return false;
             }
             let key = (
@@ -4871,6 +4876,52 @@ mod tests {
         assert!(native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).is_none());
         native_scene_pixels_cropped(view, W, H, crop).unwrap();
         assert_eq!(opaque_alpha_scan_count_for_tests(), scans);
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn proving_a_tiled_view_nonempty_caches_no_flat_copy() {
+        const W: u32 = 512;
+        const H: u32 = 520;
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(W, H);
+        store.pixels = [10, 20, 30, 255].repeat((W * H) as usize);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let rect = Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(W),
+            height: i64::from(H),
+        };
+        let placed = Placed {
+            view,
+            rect,
+            clip: rect,
+            alpha: 1.0,
+        };
+        assert!(!native_scene_proven_empty(&placed));
+        let owner = view as usize;
+        assert!(
+            NATIVE_TILED_CAPTURES
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.0 == owner)
+        );
+        assert!(
+            !NATIVE_CAPTURES
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|key| key.0 == owner)
+        );
         forget(view);
         objc::arc::release(view);
     }
