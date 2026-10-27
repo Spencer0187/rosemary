@@ -8,10 +8,14 @@ use std::{
 
 use starnix::process::Region;
 
-use crate::{errno, syscall::{
-    generic::generic_syscall_entry,
-    scope::{SELECTOR, ScopedHostSyscallContext},
-}};
+use crate::{
+    errno,
+    syscall::{
+        generic::generic_syscall_entry,
+        scope::{SELECTOR, ScopedHostSyscallContext},
+        split_syscall_number,
+    },
+};
 
 const PR_SET_SYSCALL_USER_DISPATCH: c_int = 59;
 const PR_SYS_DISPATCH_OFF: c_ulong = 0;
@@ -201,8 +205,9 @@ extern "C" fn handle_sigsys(signum: c_int, info: *mut libc::siginfo_t, context: 
         regs[libc::REG_RAX as usize] = to_kernel(number, args) as i64;
         return;
     }
+    let (darwin_class, darwin_number) = split_syscall_number(number);
     // Darwin reports failure with the carry flag and a positive `errno`.
-    let (value, flags) = match generic_syscall_entry(number, args) {
+    let (value, flags) = match generic_syscall_entry(darwin_class, darwin_number, args) {
         Ok(value) => (value as i64, regs[libc::REG_EFL as usize] & !EFLAGS_CF),
         Err(errno) => (errno as i64, regs[libc::REG_EFL as usize] | EFLAGS_CF),
     };

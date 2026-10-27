@@ -48,12 +48,12 @@ pub fn host_pid(guest: i32) -> i32 {
 }
 
 /// `pid_t getpid(void)`.
-extern "C" fn getpid() -> libc::pid_t {
+pub extern "C" fn getpid() -> libc::pid_t {
     pid()
 }
 
 /// `pid_t getppid(void)`.
-extern "C" fn getppid() -> libc::pid_t {
+pub extern "C" fn getppid() -> libc::pid_t {
     // SAFETY: `getppid` has no preconditions.
     guest_pid(unsafe { libc::getppid() })
 }
@@ -64,7 +64,7 @@ extern "C" fn getppid() -> libc::pid_t {
 /// the machine going down, and its end is launchd's exit, after which the
 /// server ends whatever is left. Nobody else may: a guest that wants the
 /// prefix down asks launchd, which is how it is done on a Mac too.
-extern "C" fn reboot(_howto: libc::c_int) -> libc::c_int {
+pub extern "C" fn reboot(_howto: libc::c_int) -> libc::c_int {
     if pid() != server::registry::LAUNCHD {
         crate::errno::set(libc::EPERM);
         return -1;

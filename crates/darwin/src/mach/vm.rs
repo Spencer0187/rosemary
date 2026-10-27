@@ -464,7 +464,7 @@ pub unsafe extern "C" fn vm_deallocate(task: Name, address: u64, size: u64) -> i
 /// `kern_return_t vm_protect(vm_map_t target_task, vm_address_t address,
 /// vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection)`, and
 /// `mach_vm_protect`, the same call on a 64-bit task.
-pub extern "C" fn vm_protect(
+pub unsafe extern "C" fn vm_protect(
     task: Name,
     address: u64,
     size: u64,
@@ -678,7 +678,7 @@ mod tests {
             KERN_SUCCESS
         );
         assert_eq!(
-            vm_protect(TASK_SELF, address, 2 * 4096, 0, prot),
+            unsafe { vm_protect(TASK_SELF, address, 2 * 4096, 0, prot) },
             KERN_SUCCESS
         );
         address
@@ -825,7 +825,10 @@ mod tests {
     #[test]
     fn bad_reads_fail_with_darwins_codes() {
         let base = map(VM_PROT_READ | VM_PROT_WRITE);
-        assert_eq!(vm_protect(TASK_SELF, base + 4096, 4096, 0, 0), KERN_SUCCESS);
+        assert_eq!(
+            unsafe { vm_protect(TASK_SELF, base + 4096, 4096, 0, 0) },
+            KERN_SUCCESS
+        );
         let (mut data, mut count) = (0_u64, 0_u32);
         assert_eq!(
             unsafe { vm_read(TASK_SELF, base + 4000, 200, &mut data, &mut count) },
@@ -863,7 +866,7 @@ mod tests {
             &data
         );
         assert_eq!(
-            vm_protect(TASK_SELF, base, 4096, 0, VM_PROT_READ),
+            unsafe { vm_protect(TASK_SELF, base, 4096, 0, VM_PROT_READ) },
             KERN_SUCCESS
         );
         assert_eq!(

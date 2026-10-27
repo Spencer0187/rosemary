@@ -284,19 +284,38 @@ pub fn guest_errno() -> i32 {
 /// A host library that returns successfully is still entitled to leave `errno` wherever it likes, and a guest
 /// that checks it after a call this runtime made on its behalf sees the runtime's failure rather than its
 /// own.
-pub struct Held(i32);
+///
+/// Off Darwin the guest's own slot is held too, so that a [`set_guest`] or a
+/// [`guest_errno`] read inside the hold does not outlive it.
+pub struct Held {
+    host: i32,
+    #[cfg(not(target_os = "macos"))]
+    guest: (libc::c_int, libc::c_int),
+}
 
 impl Held {
     #[inline(always)]
     pub fn now() -> Held {
-        Held(get())
+        Held {
+            host: get(),
+            #[cfg(not(target_os = "macos"))]
+            guest: (
+                guest_slot::VALUE.with(|value| value.get()),
+                guest_slot::PUSHED.with(|pushed| pushed.get()),
+            ),
+        }
     }
 }
 
 impl Drop for Held {
     #[inline(always)]
     fn drop(&mut self) {
-        set(self.0);
+        set(self.host);
+        #[cfg(not(target_os = "macos"))]
+        {
+            guest_slot::VALUE.with(|value| value.set(self.guest.0));
+            guest_slot::PUSHED.with(|pushed| pushed.set(self.guest.1));
+        }
     }
 }
 
@@ -429,6 +448,21 @@ mod tests {
             set(libc::ENOENT);
         }
         assert_eq!(get(), libc::EPIPE);
+        set(0);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn holding_errno_puts_back_a_guest_write() {
+        set(libc::EPIPE);
+        // SAFETY: this thread's live slot; the guest writes `errno = 0`.
+        unsafe { *guest_location() = 0 };
+        {
+            let _held = Held::now();
+            set_guest(93);
+            assert_eq!(guest_errno(), 93);
+        }
+        assert_eq!(guest_errno(), 0, "the guest's own errno = 0 survives");
         set(0);
     }
 
