@@ -5674,10 +5674,10 @@ mod tests {
     /// transaction should make one O(N) capture, not N O(N) captures.
     #[test]
     fn batch_metal_scene_capture_cost() {
-        if !sdl3::isolated::run_here() {
+        if std::env::var_os("ROSEMARY_BENCH_APPKIT_SCENE").is_none() {
             return;
         }
-        if std::env::var_os("ROSEMARY_BENCH_APPKIT_SCENE").is_none() {
+        if !sdl3::isolated::run_here() {
             return;
         }
         crate::bootstrap();

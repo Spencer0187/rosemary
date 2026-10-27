@@ -990,9 +990,6 @@ pub(crate) fn pixel_clip_from_surface(
 #[cfg(test)]
 #[test]
 fn physical_pixel_rects_share_independent_edge_rounding_at_one_and_two_x() {
-    if !sdl3::isolated::run_here() {
-        return;
-    }
     let bounds = NSRect {
         origin: NSPoint { x: 0.5, y: 0.5 },
         size: NSSize {
