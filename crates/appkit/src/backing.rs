@@ -710,11 +710,11 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
     Some((tiles, revision, None))
 }
 
-const NATIVE_HASH_CHUNK_BYTES: usize = 64 * 1024;
-
-fn opaque_capture_hashes(pixels: &[u8]) -> Vec<u64> {
+// Flat captures hash the same row bands as NativePixelTiles, so identical
+// pixels keep one revision when a view moves between the two paths.
+fn opaque_capture_hashes(pixels: &[u8], stride: usize) -> Vec<u64> {
     pixels
-        .chunks(NATIVE_HASH_CHUNK_BYTES)
+        .chunks(stride * NATIVE_TILE_ROWS)
         .map(hash_bytes)
         .collect()
 }
@@ -789,8 +789,9 @@ fn update_plain_opaque_capture(
     {
         return None;
     }
+    let band_bytes = crop_width.checked_mul(4)?.checked_mul(NATIVE_TILE_ROWS)?;
     if prior.pixels.len() != length
-        || prior.opaque_hashes.as_ref()?.len() != length.div_ceil(NATIVE_HASH_CHUNK_BYTES)
+        || prior.opaque_hashes.as_ref()?.len() != length.div_ceil(band_bytes)
     {
         return None;
     }
@@ -817,7 +818,7 @@ fn update_plain_opaque_capture(
     }
     let old_revision = prior.revision;
     let pixels = std::sync::Arc::make_mut(&mut prior.pixels);
-    let mut touched = vec![false; length.div_ceil(NATIVE_HASH_CHUNK_BYTES)];
+    let mut touched = vec![false; length.div_ceil(band_bytes)];
     for row in 0..h {
         let src_at = (y + row)
             .checked_mul(width)?
@@ -830,17 +831,13 @@ fn update_plain_opaque_capture(
         pixels
             .get_mut(dst_at..dst_at + row_bytes)?
             .copy_from_slice(source.pixels.get(src_at..src_at + row_bytes)?);
-        for part in
-            dst_at / NATIVE_HASH_CHUNK_BYTES..=(dst_at + row_bytes - 1) / NATIVE_HASH_CHUNK_BYTES
-        {
-            touched[part] = true;
-        }
+        touched[(dy + row) / NATIVE_TILE_ROWS] = true;
     }
     let hashes = prior.opaque_hashes.as_mut()?;
     for (index, changed) in touched.into_iter().enumerate() {
         if changed {
-            let offset = index * NATIVE_HASH_CHUNK_BYTES;
-            let end = pixels.len().min(offset + NATIVE_HASH_CHUNK_BYTES);
+            let offset = index * band_bytes;
+            let end = pixels.len().min(offset + band_bytes);
             hashes[index] = hash_bytes(&pixels[offset..end]);
         }
     }
@@ -2733,7 +2730,10 @@ fn native_scene_pixels_impl(
         .iter()
         .all(|pixel| pixel[3] == 0);
     let opaque_hashes = if !empty && exact_opaque.is_some() {
-        Some(opaque_capture_hashes(&output.pixels))
+        Some(opaque_capture_hashes(
+            &output.pixels,
+            crop.width as usize * 4,
+        ))
     } else {
         None
     };
@@ -4695,6 +4695,56 @@ mod tests {
         assert_eq!(new_right.2.unwrap().from_revision, old_right.1);
         assert_ne!(new_right.1, old_right.1);
         assert_eq!(native_render_count_for_tests(), before + 1);
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
+    fn flat_and_tiled_captures_of_the_same_pixels_share_a_revision() {
+        // 600-pixel rows make a band differ from any power-of-two chunk.
+        const W: u32 = 600;
+        const H: u32 = 520;
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(W, H);
+        store.pixels = [10, 20, 30, 255].repeat((W * H) as usize);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(W),
+            height: i64::from(H),
+        };
+        let tiled = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        let flat = native_scene_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        assert_eq!(flat.1, tiled.1);
+        {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            let at = (300 * W as usize + 7) * 4;
+            src.pixels[at..at + 4].copy_from_slice(&[1, 2, 3, 255]);
+            src.touch_region(Rect {
+                x: 7,
+                y: 300,
+                width: 1,
+                height: 1,
+            });
+        }
+        // Both incremental patches must rehash the band the edit landed in.
+        let patches = NATIVE_INCREMENTAL_PATCHES.with(Cell::get);
+        let tiled = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        let flat = native_scene_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        assert_eq!(NATIVE_INCREMENTAL_PATCHES.with(Cell::get), patches + 1);
+        assert_eq!(
+            flat.2.unwrap().from_revision,
+            tiled.2.unwrap().from_revision
+        );
+        assert_eq!(flat.1, tiled.1);
         forget(view);
         objc::arc::release(view);
     }
