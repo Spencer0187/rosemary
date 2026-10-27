@@ -316,6 +316,7 @@ struct NativeCapture {
     opaque_hashes: Option<Vec<u64>>,
     revision: u64,
     damage: Option<NativeCpuDamage>,
+    last_used: u64,
 }
 type CaptureKey = (usize, i64, i64, u32, u32, u32, u32, bool, u64);
 /// Immutable CPU-owned row bands; cloning a new generation clones only
@@ -493,9 +494,17 @@ struct NativeTiledCache {
     descendant_revision: u64,
     overlay_revision: u64,
     tiles: std::sync::Arc<NativePixelTiles>,
+    last_used: u64,
 }
 static NATIVE_TILED_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeTiledCache>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// A single sequence across both representations makes a flat hit newer
+// than a tiled miss (and vice versa), even when their cache locks differ.
+static NATIVE_CAPTURE_CLOCK: AtomicU64 = AtomicU64::new(1);
+fn next_native_capture_use() -> u64 {
+    NATIVE_CAPTURE_CLOCK.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Clone, Copy)]
 enum NativeCacheKind {
@@ -530,45 +539,36 @@ fn trim_native_capture_maps(
     if used <= limit {
         return;
     }
-    // Prefer the just-published representation; older entries from the
-    // opposite cache are evicted first.
-    let flat_keys: Vec<_> = flat.keys().copied().collect();
-    let tiled_keys: Vec<_> = tiled.keys().copied().collect();
-    let mut evict_flat = |used: &mut usize| {
-        for key in &flat_keys {
-            if *used <= limit {
-                break;
-            }
-            if matches!(recent, (NativeCacheKind::Flat, keep) if keep == *key) {
-                continue;
-            }
-            if let Some(entry) = flat.remove(key) {
-                *used = used.saturating_sub(entry.pixels.len());
-            }
+    // Keep genuinely hot entries, regardless of representation. A publication
+    // can evict a colder cache record without releasing an Arc held by an
+    // asynchronous GPU reader. Sort only when a limit is exceeded.
+    let mut candidates = Vec::with_capacity(flat.len() + tiled.len());
+    candidates.extend(flat.iter().filter_map(|(key, capture)| {
+        (!matches!(recent, (NativeCacheKind::Flat, keep) if keep == *key)).then_some((
+            capture.last_used,
+            NativeCacheKind::Flat,
+            *key,
+        ))
+    }));
+    candidates.extend(tiled.iter().filter_map(|(key, capture)| {
+        (!matches!(recent, (NativeCacheKind::Tiled, keep) if keep == *key)).then_some((
+            capture.last_used,
+            NativeCacheKind::Tiled,
+            *key,
+        ))
+    }));
+    candidates.sort_unstable_by_key(|(last_used, _, _)| *last_used);
+    for (_, kind, key) in candidates {
+        if used <= limit {
+            break;
         }
-    };
-    let mut evict_tiled = |used: &mut usize| {
-        for key in &tiled_keys {
-            if *used <= limit {
-                break;
-            }
-            if matches!(recent, (NativeCacheKind::Tiled, keep) if keep == *key) {
-                continue;
-            }
-            if let Some(entry) = tiled.remove(key) {
-                *used = used.saturating_sub(entry.tiles.retained_bytes());
-            }
-        }
-    };
-    match recent.0 {
-        NativeCacheKind::Flat => {
-            evict_tiled(&mut used);
-            evict_flat(&mut used);
-        }
-        NativeCacheKind::Tiled => {
-            evict_flat(&mut used);
-            evict_tiled(&mut used);
-        }
+        let freed = match kind {
+            NativeCacheKind::Flat => flat.remove(&key).map(|capture| capture.pixels.len()),
+            NativeCacheKind::Tiled => tiled
+                .remove(&key)
+                .map(|capture| capture.tiles.retained_bytes()),
+        };
+        used = used.saturating_sub(freed.unwrap_or(0));
     }
 }
 
@@ -647,6 +647,7 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
             && old.descendant_revision == descendant_revision
             && old.overlay_revision == overlay_revision
         {
+            old.last_used = next_native_capture_use();
             if old.view_generation == source.generation() {
                 return Some((std::sync::Arc::clone(&old.tiles), old.tiles.revision, None));
             }
@@ -710,6 +711,7 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
             descendant_revision,
             overlay_revision,
             tiles: std::sync::Arc::clone(&tiles),
+            last_used: next_native_capture_use(),
         },
     );
     drop(cache);
@@ -815,6 +817,7 @@ fn update_plain_opaque_capture(
     }) {
         prior.view_generation = Some(source.generation());
         prior.damage = None;
+        prior.last_used = next_native_capture_use();
         return Some((std::sync::Arc::clone(&prior.pixels), prior.revision));
     }
     let old_revision = prior.revision;
@@ -851,6 +854,7 @@ fn update_plain_opaque_capture(
     }
     prior.revision = opaque_capture_revision(hashes, length);
     prior.view_generation = Some(source.generation());
+    prior.last_used = next_native_capture_use();
     prior.damage = (old_revision != prior.revision).then_some(NativeCpuDamage {
         from_revision: old_revision,
         rect: Rect {
@@ -2527,7 +2531,7 @@ fn native_scene_pixels_impl(
         && let Some(hit) = NATIVE_CAPTURES
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+            .get_mut(&key)
             .filter(|hit| {
                 hit.layer == layer as usize
                     && hit.store_instance == store_instance
@@ -2542,6 +2546,7 @@ fn native_scene_pixels_impl(
                     && hit.excluded_view_layers == excluded_view_layers
             })
     {
+        hit.last_used = next_native_capture_use();
         return (!hit.pixels.is_empty())
             .then(|| (std::sync::Arc::clone(&hit.pixels), hit.revision));
     }
@@ -2572,6 +2577,7 @@ fn native_scene_pixels_impl(
         {
             prior.view_generation = view_generation;
             prior.damage = None;
+            prior.last_used = next_native_capture_use();
             return (!prior.pixels.is_empty())
                 .then(|| (std::sync::Arc::clone(&prior.pixels), prior.revision));
         }
@@ -2774,6 +2780,7 @@ fn native_scene_pixels_impl(
                 opaque_hashes,
                 revision,
                 damage,
+                last_used: next_native_capture_use(),
             },
         );
         drop(captures);
@@ -4723,6 +4730,7 @@ mod tests {
             opaque_hashes: None,
             revision: 1,
             damage: None,
+            last_used: next_native_capture_use(),
         };
         let tiled_capture = |color: [u8; 4]| {
             let tiles =
@@ -4735,6 +4743,7 @@ mod tests {
                 descendant_revision: 0,
                 overlay_revision: 0,
                 tiles: std::sync::Arc::new(tiles),
+                last_used: next_native_capture_use(),
             }
         };
         let mut flat = HashMap::new();
@@ -4799,6 +4808,154 @@ mod tests {
                 .sum::<usize>();
         assert!(total <= LIMIT);
         assert_eq!(NATIVE_CAPTURE_CACHE_LIMIT, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn alternating_large_native_captures_keep_hot_flat_and_tiled_entries() {
+        const W: u32 = 512;
+        const H: u32 = 1024;
+        const CAPACITY: usize = 3 * 2 * 1024 * 1024;
+        let key = |view| (view, 0, 0, W, H, W, H, false, 0);
+        let make_flat = |color: u8| NativeCapture {
+            layer: 1,
+            store_instance: Some(1),
+            width: W,
+            height: H,
+            crop_x: 0,
+            crop_y: 0,
+            view_generation: Some(1),
+            overlay_generation: 0,
+            ca_content_revision: 0,
+            ca_descendant_revision: 0,
+            excluded_view_layers: 0,
+            plain_store: true,
+            pixels: std::sync::Arc::new([color, 10, 20, 255].repeat((W * H) as usize)),
+            opaque_hashes: None,
+            revision: 1,
+            damage: None,
+            last_used: next_native_capture_use(),
+        };
+        let make_tiled = |color: u8| NativeTiledCache {
+            layer: 1,
+            store_instance: 1,
+            view_generation: 1,
+            ca_revision: 0,
+            descendant_revision: 0,
+            overlay_revision: 0,
+            tiles: std::sync::Arc::new(
+                NativePixelTiles::from_opaque_bgra(
+                    W,
+                    H,
+                    &[color, 10, 20, 255].repeat((W * H) as usize),
+                )
+                .unwrap(),
+            ),
+            last_used: next_native_capture_use(),
+        };
+        let mut flat = HashMap::new();
+        let mut tiled = HashMap::new();
+        let hot_flat = key(0x111);
+        let hot_tiled = key(0x222);
+        let mut held = Vec::new();
+        flat.insert(hot_flat, make_flat(30));
+        tiled.insert(hot_tiled, make_tiled(40));
+        let flat_reader = std::sync::Arc::clone(&flat[&hot_flat].pixels);
+        let tiled_reader = std::sync::Arc::clone(&tiled[&hot_tiled].tiles);
+        let mut old_cold = None;
+        let start = std::time::Instant::now();
+        for n in 0..48usize {
+            // Revisit both hot captures before a new cold publication, even
+            // if they belong to different cache representations.
+            flat.get_mut(&hot_flat).unwrap().last_used = next_native_capture_use();
+            tiled.get_mut(&hot_tiled).unwrap().last_used = next_native_capture_use();
+            let cold = key(0x400 + n);
+            if n % 2 == 0 {
+                flat.insert(cold, make_flat(n as u8));
+                held.push(std::sync::Arc::clone(&flat[&cold].pixels));
+            } else {
+                tiled.insert(cold, make_tiled(n as u8));
+            }
+            trim_native_capture_maps(
+                &mut flat,
+                &mut tiled,
+                (
+                    if n % 2 == 0 {
+                        NativeCacheKind::Flat
+                    } else {
+                        NativeCacheKind::Tiled
+                    },
+                    cold,
+                ),
+                CAPACITY,
+            );
+            assert!(
+                flat.contains_key(&hot_flat),
+                "hot flat source evicted in round {n}"
+            );
+            assert!(
+                tiled.contains_key(&hot_tiled),
+                "hot tiled source evicted in round {n}"
+            );
+            assert!(
+                old_cold.is_none_or(|key| !flat.contains_key(&key) && !tiled.contains_key(&key)),
+                "old cold capture not evicted in round {n}"
+            );
+            assert!(
+                flat.values().map(|v| v.pixels.len()).sum::<usize>()
+                    + tiled
+                        .values()
+                        .map(|v| v.tiles.retained_bytes())
+                        .sum::<usize>()
+                    <= CAPACITY
+            );
+            old_cold = Some(cold);
+        }
+        eprintln!(
+            "48 alternating 2MiB cache publications with hot flat+tiled reuse: {:?}",
+            start.elapsed()
+        );
+        assert_eq!(&flat_reader[..4], &[30, 10, 20, 255]);
+        let mut previous = [0; 4];
+        tiled_reader
+            .copy_rect_to(10, 10, 1, 1, &mut previous)
+            .unwrap();
+        assert_eq!(previous, [40, 10, 20, 255]);
+        assert_eq!(held.len(), 24);
+        assert_eq!(
+            &held[0][..4],
+            &[0, 10, 20, 255],
+            "evicting a cold entry invalidated an Arc retained by a reader"
+        );
+    }
+
+    #[test]
+    fn flat_and_tiled_cache_hits_update_shared_recency_clock() {
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        const W: u32 = 512;
+        const H: u32 = 512;
+        set_native_view_pixels_for_tests(view, W, H, [7, 17, 37, 255].repeat((W * H) as usize));
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: W as i64,
+            height: H as i64,
+        };
+        let key = (view as usize, 0, 0, W, H, W, H, false, 0);
+        let first = native_scene_pixels_cropped(view, W, H, crop).unwrap();
+        let tiled = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        assert_eq!(tiled.0.retained_bytes(), (W * H * 4) as usize);
+        let before = NATIVE_TILED_CAPTURES.lock().unwrap()[&key].last_used;
+        let flat_again = native_scene_pixels_cropped(view, W, H, crop).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first.0, &flat_again.0));
+        assert!(NATIVE_CAPTURES.lock().unwrap()[&key].last_used > before);
+        let after = NATIVE_CAPTURES.lock().unwrap()[&key].last_used;
+        let tiled_again = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&tiled.0, &tiled_again.0));
+        assert!(NATIVE_TILED_CAPTURES.lock().unwrap()[&key].last_used > after);
+        drop((first, tiled, flat_again, tiled_again));
+        forget(view);
+        objc::arc::release(view);
     }
 
     #[test]
