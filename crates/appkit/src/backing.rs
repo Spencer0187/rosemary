@@ -485,6 +485,9 @@ struct NativeTiledCache {
     descendant_revision: u64,
     overlay_revision: u64,
     tiles: std::sync::Arc<NativePixelTiles>,
+    // Kept across republishes of the same tiles: the GPU may not have staged
+    // the publication that first carried it.
+    damage: Option<NativeCpuDamage>,
     last_used: u64,
 }
 static NATIVE_TILED_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeTiledCache>>> =
@@ -640,7 +643,11 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
         {
             old.last_used = next_native_capture_use();
             if old.view_generation == source.generation() {
-                return Some((std::sync::Arc::clone(&old.tiles), old.tiles.revision, None));
+                return Some((
+                    std::sync::Arc::clone(&old.tiles),
+                    old.tiles.revision,
+                    old.damage,
+                ));
             }
             if let Some(all) = source.damage_regions_since(old.view_generation) {
                 let regions = all
@@ -650,7 +657,11 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
                     .collect::<Vec<_>>();
                 if regions.is_empty() {
                     old.view_generation = source.generation();
-                    return Some((std::sync::Arc::clone(&old.tiles), old.tiles.revision, None));
+                    return Some((
+                        std::sync::Arc::clone(&old.tiles),
+                        old.tiles.revision,
+                        old.damage,
+                    ));
                 }
                 // All previously accepted unchanged pixels were verified
                 // opaque; newly authored regions alone need an alpha check.
@@ -669,18 +680,20 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
                     // Preserve exact dirty rectangles for CPU patch work,
                     // keep the old single-box GPU ABI conservative for now.
                     let union = regions.iter().copied().reduce(|a, b| a.union(&b))?;
-                    let damage = (prior != revision).then_some(NativeCpuDamage {
-                        from_revision: prior,
-                        rect: Rect {
-                            x: union.x - crop.x,
-                            y: union.y - crop.y,
-                            width: union.width,
-                            height: union.height,
-                        },
-                    });
+                    if prior != revision {
+                        old.damage = Some(NativeCpuDamage {
+                            from_revision: prior,
+                            rect: Rect {
+                                x: union.x - crop.x,
+                                y: union.y - crop.y,
+                                width: union.width,
+                                height: union.height,
+                            },
+                        });
+                    }
                     old.view_generation = source.generation();
                     old.tiles = std::sync::Arc::new(next);
-                    return Some((std::sync::Arc::clone(&old.tiles), revision, damage));
+                    return Some((std::sync::Arc::clone(&old.tiles), revision, old.damage));
                 }
             }
         }
@@ -702,6 +715,7 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
             descendant_revision,
             overlay_revision,
             tiles: std::sync::Arc::clone(&tiles),
+            damage: None,
             last_used: next_native_capture_use(),
         },
     );
@@ -812,7 +826,6 @@ fn update_plain_opaque_capture(
         source.pixels[src_at..src_at + row_bytes] == prior.pixels[dst_at..dst_at + row_bytes]
     }) {
         prior.view_generation = Some(source.generation());
-        prior.damage = None;
         prior.last_used = next_native_capture_use();
         return Some((std::sync::Arc::clone(&prior.pixels), prior.revision));
     }
@@ -2565,7 +2578,6 @@ fn native_scene_pixels_impl(
                 .is_some_and(|region| region.intersection(&crop).is_empty())
         {
             prior.view_generation = view_generation;
-            prior.damage = None;
             prior.last_used = next_native_capture_use();
             return (!prior.pixels.is_empty())
                 .then(|| (std::sync::Arc::clone(&prior.pixels), prior.revision));
@@ -4750,6 +4762,52 @@ mod tests {
     }
 
     #[test]
+    fn a_tiled_republish_keeps_damage_the_gpu_may_not_have_staged() {
+        const W: u32 = 512;
+        const H: u32 = 520;
+        crate::bootstrap();
+        let view = objc::object::create_instance(objc::class::lookup(c"NSView").unwrap(), 0);
+        let mut store = Store::new(W, H);
+        store.pixels = [10, 20, 30, 255].repeat((W * H) as usize);
+        store.touch();
+        VIEW_STORES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(view as usize, store);
+        let crop = Rect {
+            x: 0,
+            y: 0,
+            width: i64::from(W),
+            height: i64::from(H),
+        };
+        let touch = |pixel: [u8; 4]| {
+            let mut stores = VIEW_STORES.lock().unwrap();
+            let src = stores.as_mut().unwrap().get_mut(&(view as usize)).unwrap();
+            let at = (200 * W as usize + 9) * 4;
+            src.pixels[at..at + 4].copy_from_slice(&pixel);
+            src.touch_region(Rect {
+                x: 9,
+                y: 200,
+                width: 1,
+                height: 1,
+            });
+        };
+        let cold = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        touch([1, 2, 3, 255]);
+        let patched = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        let damage = patched.2.expect("a real edit carries damage");
+        assert_eq!(damage.from_revision, cold.1);
+        let again = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        assert_eq!((again.1, again.2), (patched.1, Some(damage)));
+        touch([1, 2, 3, 255]);
+        let identical = native_scene_tiled_pixels_cropped_with_damage(view, W, H, crop).unwrap();
+        assert_eq!((identical.1, identical.2), (patched.1, Some(damage)));
+        forget(view);
+        objc::arc::release(view);
+    }
+
+    #[test]
     fn flat_and_tiled_capture_caches_share_one_budget_without_releasing_readers() {
         const W: u32 = 512;
         const H: u32 = 1024;
@@ -4785,6 +4843,7 @@ mod tests {
                 descendant_revision: 0,
                 overlay_revision: 0,
                 tiles: std::sync::Arc::new(tiles),
+                damage: None,
                 last_used: next_native_capture_use(),
             }
         };
@@ -4892,6 +4951,7 @@ mod tests {
                 )
                 .unwrap(),
             ),
+            damage: None,
             last_used: next_native_capture_use(),
         };
         let mut flat = HashMap::new();
@@ -5446,7 +5506,7 @@ mod tests {
         }
         let same = native_scene_pixels_cropped_with_damage(view, 130, 140, crop).unwrap();
         assert_eq!(same.1, updated.1);
-        assert_eq!(same.2, None);
+        assert_eq!(same.2, updated.2, "unchanged texels dropped staged damage");
         drop(first);
         drop(original);
         drop(updated);
