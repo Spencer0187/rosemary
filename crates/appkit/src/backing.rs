@@ -487,6 +487,81 @@ struct NativeTiledCache {
 static NATIVE_TILED_CAPTURES: std::sync::LazyLock<Mutex<HashMap<CaptureKey, NativeTiledCache>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
+#[derive(Clone, Copy)]
+enum NativeCacheKind {
+    Flat,
+    Tiled,
+}
+
+// Enforce one 256 MiB AppKit cache budget across both representations. A
+// published Arc outlives eviction, but only entries retained by these maps
+// count toward the cache limit. Both publishers hold VIEW_STORES through
+// insertion and pruning, preventing concurrent admissions between those steps.
+fn trim_native_capture_caches(recent: (NativeCacheKind, CaptureKey)) {
+    let mut flat = NATIVE_CAPTURES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut tiled = NATIVE_TILED_CAPTURES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    trim_native_capture_maps(&mut flat, &mut tiled, recent, NATIVE_CAPTURE_CACHE_LIMIT);
+}
+
+fn trim_native_capture_maps(
+    flat: &mut HashMap<CaptureKey, NativeCapture>,
+    tiled: &mut HashMap<CaptureKey, NativeTiledCache>,
+    recent: (NativeCacheKind, CaptureKey),
+    limit: usize,
+) {
+    let flat_bytes: usize = flat.values().map(|capture| capture.pixels.len()).sum();
+    let tiled_bytes: usize = tiled
+        .values()
+        .map(|capture| capture.tiles.retained_bytes())
+        .sum();
+    let mut used = flat_bytes.saturating_add(tiled_bytes);
+    if used <= limit {
+        return;
+    }
+    // Prefer the just-published representation; older entries from the
+    // opposite cache are evicted first.
+    let flat_keys: Vec<_> = flat.keys().copied().collect();
+    let tiled_keys: Vec<_> = tiled.keys().copied().collect();
+    let mut evict_flat = |used: &mut usize| {
+        for key in &flat_keys {
+            if *used <= limit {
+                break;
+            }
+            if matches!(recent, (NativeCacheKind::Flat, keep) if keep == *key) {
+                continue;
+            }
+            if let Some(entry) = flat.remove(key) {
+                *used = used.saturating_sub(entry.pixels.len());
+            }
+        }
+    };
+    let mut evict_tiled = |used: &mut usize| {
+        for key in &tiled_keys {
+            if *used <= limit {
+                break;
+            }
+            if matches!(recent, (NativeCacheKind::Tiled, keep) if keep == *key) {
+                continue;
+            }
+            if let Some(entry) = tiled.remove(key) {
+                *used = used.saturating_sub(entry.tiles.retained_bytes());
+            }
+        }
+    };
+    match recent.0 {
+        NativeCacheKind::Flat => {
+            evict_tiled(&mut used);
+            evict_flat(&mut used);
+        }
+        NativeCacheKind::Tiled => {
+            evict_flat(&mut used);
+            evict_tiled(&mut used);
+        }
+    }
+}
+
 /// Publication path for large plain opaque NSView backing stores. The scene
 /// owns a row-banded value snapshot, never a borrowed mutable Store pointer.
 /// Any uncertain damage or alpha proof falls back to the existing full capture.
@@ -627,24 +702,8 @@ pub(crate) fn native_scene_tiled_pixels_cropped_with_damage(
             tiles: std::sync::Arc::clone(&tiles),
         },
     );
-    // Cap retained AppKit-side tile-cache storage, excluding GPU-owned old
-    // generations whose lifetime belongs to the receiving worker.
-    let mut used: usize = cache.values().map(|c| c.tiles.retained_bytes()).sum();
-    if used > NATIVE_CAPTURE_CACHE_LIMIT {
-        let keys: Vec<_> = cache
-            .keys()
-            .copied()
-            .filter(|other| *other != key)
-            .collect();
-        for entry in keys {
-            if used <= NATIVE_CAPTURE_CACHE_LIMIT {
-                break;
-            }
-            if let Some(removed) = cache.remove(&entry) {
-                used = used.saturating_sub(removed.tiles.retained_bytes());
-            }
-        }
-    }
+    drop(cache);
+    trim_native_capture_caches((NativeCacheKind::Tiled, key));
     Some((tiles, revision, None))
 }
 
@@ -2705,20 +2764,8 @@ fn native_scene_pixels_impl(
                 damage,
             },
         );
-        // Bound cached pixel payload across all views to 256 MiB, retaining
-        // the current capture. In-progress GPU users own their own Arc.
-        let mut used: usize = captures.values().map(|entry| entry.pixels.len()).sum();
-        if used > NATIVE_CAPTURE_CACHE_LIMIT {
-            let keys: Vec<_> = captures.keys().copied().filter(|id| *id != key).collect();
-            for id in keys {
-                if used <= NATIVE_CAPTURE_CACHE_LIMIT {
-                    break;
-                }
-                if let Some(entry) = captures.remove(&id) {
-                    used = used.saturating_sub(entry.pixels.len());
-                }
-            }
-        }
+        drop(captures);
+        trim_native_capture_caches((NativeCacheKind::Flat, key));
     }
     (!empty).then_some((pixels, revision))
 }
@@ -4639,6 +4686,107 @@ mod tests {
         assert_eq!(native_render_count_for_tests(), before + 1);
         forget(view);
         objc::arc::release(view);
+    }
+
+    #[test]
+    fn flat_and_tiled_capture_caches_share_one_budget_without_releasing_readers() {
+        const W: u32 = 512;
+        const H: u32 = 1024;
+        const LIMIT: usize = 3 * 1024 * 1024;
+        let key = |view| (view, 0, 0, W, H, W, H, false, 0);
+        let flat_capture = |color: [u8; 4]| NativeCapture {
+            layer: 1,
+            store_instance: Some(1),
+            width: W,
+            height: H,
+            crop_x: 0,
+            crop_y: 0,
+            view_generation: Some(1),
+            overlay_generation: 0,
+            ca_content_revision: 0,
+            ca_descendant_revision: 0,
+            excluded_view_layers: 0,
+            plain_store: true,
+            pixels: std::sync::Arc::new(color.repeat((W * H) as usize)),
+            opaque_hashes: None,
+            revision: 1,
+            damage: None,
+        };
+        let tiled_capture = |color: [u8; 4]| {
+            let tiles =
+                NativePixelTiles::from_opaque_bgra(W, H, &color.repeat((W * H) as usize)).unwrap();
+            NativeTiledCache {
+                layer: 1,
+                store_instance: 1,
+                view_generation: 1,
+                ca_revision: 0,
+                descendant_revision: 0,
+                overlay_revision: 0,
+                tiles: std::sync::Arc::new(tiles),
+            }
+        };
+        let mut flat = HashMap::new();
+        let mut tiled = HashMap::new();
+        let flat_key = key(1);
+        let mixed_key = key(2);
+        flat.insert(flat_key, flat_capture([11, 22, 33, 255]));
+        let held_flat = std::sync::Arc::clone(&flat[&flat_key].pixels);
+        tiled.insert(mixed_key, tiled_capture([44, 55, 66, 255]));
+        let held_tiled = std::sync::Arc::clone(&tiled[&mixed_key].tiles);
+        assert_eq!(flat[&flat_key].pixels.len(), 2 * 1024 * 1024);
+        assert_eq!(tiled[&mixed_key].tiles.retained_bytes(), 2 * 1024 * 1024);
+        trim_native_capture_maps(
+            &mut flat,
+            &mut tiled,
+            (NativeCacheKind::Tiled, mixed_key),
+            LIMIT + 2 * 1024 * 1024,
+        );
+        assert!(flat.contains_key(&flat_key) && tiled.contains_key(&mixed_key));
+        // Publishing a tiled snapshot must evict the older flat cache entry,
+        // not the caller's separately owned flat Arc.
+        trim_native_capture_maps(
+            &mut flat,
+            &mut tiled,
+            (NativeCacheKind::Tiled, mixed_key),
+            LIMIT,
+        );
+        assert!(flat.is_empty());
+        assert!(tiled.contains_key(&mixed_key));
+        assert_eq!(&held_flat[..4], &[11, 22, 33, 255]);
+        // The same view moves to the flat path (e.g. a DMA overlay). The
+        // previous tiled source remains readable by a GPU worker.
+        flat.insert(mixed_key, flat_capture([77, 88, 99, 255]));
+        let held_second_flat = std::sync::Arc::clone(&flat[&mixed_key].pixels);
+        trim_native_capture_maps(
+            &mut flat,
+            &mut tiled,
+            (NativeCacheKind::Flat, mixed_key),
+            LIMIT,
+        );
+        assert!(tiled.is_empty());
+        assert!(flat.contains_key(&mixed_key));
+        let mut prior = [0; 4];
+        held_tiled.copy_rect_to(12, 31, 1, 1, &mut prior).unwrap();
+        assert_eq!(prior, [44, 55, 66, 255]);
+        // Re-enter the eligible tiled path. Eviction must never modify the
+        // flat snapshot still retained by another reader.
+        tiled.insert(mixed_key, tiled_capture([111, 122, 133, 255]));
+        trim_native_capture_maps(
+            &mut flat,
+            &mut tiled,
+            (NativeCacheKind::Tiled, mixed_key),
+            LIMIT,
+        );
+        assert!(flat.is_empty());
+        assert!(tiled.contains_key(&mixed_key));
+        assert_eq!(&held_second_flat[..4], &[77, 88, 99, 255]);
+        let total: usize = flat.values().map(|v| v.pixels.len()).sum::<usize>()
+            + tiled
+                .values()
+                .map(|v| v.tiles.retained_bytes())
+                .sum::<usize>();
+        assert!(total <= LIMIT);
+        assert_eq!(NATIVE_CAPTURE_CACHE_LIMIT, 256 * 1024 * 1024);
     }
 
     #[test]
