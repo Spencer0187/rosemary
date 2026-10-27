@@ -2408,12 +2408,16 @@ fn tiled_native_staging_bytes(state: &Swapchain, layer: &ScenePlacement) -> u64 
         .as_ref()
         .and_then(|native| native.tiles.as_ref());
     let whole = tiles.map_or(0, |tiles| tiles.len() as u64);
-    let upload = tiled_native_predecessor(state, layer).map_or(whole, |(_, rect)| {
+    let patch = tiled_native_predecessor(state, layer).map(|(_, rect)| rect);
+    whole.saturating_add(tiled_native_upload_bytes(whole, patch))
+}
+
+fn tiled_native_upload_bytes(whole: u64, patch: Option<appkit::backing::Rect>) -> u64 {
+    patch.map_or(whole, |rect| {
         (rect.width as u64)
             .saturating_mul(rect.height as u64)
             .saturating_mul(4)
-    });
-    whole.saturating_add(upload)
+    })
 }
 
 // Both representations preserve the only Metal source when it lives in the
@@ -2452,12 +2456,9 @@ fn stage_tiled_native_source(
     let whole_bytes = tiles.len() as u64;
     let old = tiled_native_predecessor(state, layer);
     let patch = old.as_ref().map(|(_, rect)| *rect);
-    let upload = patch.map_or(whole_bytes, |r| {
-        (r.width as u64)
-            .saturating_mul(r.height as u64)
-            .saturating_mul(4)
-    });
-    let incoming = tiled_native_staging_bytes(state, layer);
+    // Budget the same upload this attempt performs, from one predecessor scan.
+    let upload = tiled_native_upload_bytes(whole_bytes, patch);
+    let incoming = whole_bytes.saturating_add(upload);
     state.retire_copied();
     if !scene::fits_scene_budget(state.budgeted_scene_bytes(), incoming) {
         state.shed_scene_spares();
