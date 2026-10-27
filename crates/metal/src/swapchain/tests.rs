@@ -6287,6 +6287,287 @@ fn tiled_native_scene_budget_exhaustion_uses_terminal_refusal() {
     sdl3::video::destroy_window(window);
 }
 
+/// A tiled upload must reclaim an unrelated flat CPU/DMA base cache before
+/// deferring at the physical window allocation ledger. The base is optional;
+/// no accepted native GPU source or reader may be evicted with it.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_physical_pressure_sheds_optional_flat_cpu_base() {
+    if isolate_vulkan_graphical_test("tiled_native_physical_pressure_sheds_optional_flat_cpu_base")
+    {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 64,
+        height: 64,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET | gpu::USAGE_SHADER_READ,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    // A flat native view owns an accepted snapshot and an optional cached
+    // CPU base. Only the base is eligible for eviction.
+    let accepted = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+    let accepted_image = accepted.image.image;
+    let flat_id = 0x1011;
+    state.seed_accepted_native_for_budget_test(flat_id, DirectFrame::from_frame(&whole), accepted);
+    state.native_cpu_bases.push(NativeCpuBaseCache {
+        id: flat_id,
+        source: std::sync::Weak::new(),
+        cpu_revision: Some(1),
+        image: BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap(),
+    });
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            40,
+            32,
+            &[0u8, 0, 255, 255].repeat(40 * 32),
+        )
+        .unwrap(),
+    );
+    let mut tiled = test_opaque_metal_placement(
+        0x1012,
+        DirectFrame::from_frame(&appkit::view::Frame {
+            width: 40,
+            height: 32,
+            ..whole
+        }),
+    );
+    tiled.opaque = false;
+    tiled.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(tiles.clone()),
+        cpu_capture: None,
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    let incoming = tiled_native_staging_bytes(&state, &tiled);
+    assert_eq!(incoming, 2 * 40 * 32 * 4);
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let ledger = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap();
+    let held = ledger.held.load(Ordering::Acquire);
+    let free = incoming / 2;
+    let temporary_pressure =
+        GpuCharge::reserve(window as usize, WINDOW_GPU_PAYLOAD_BUDGET - held - free).unwrap();
+    assert!(!window_gpu_capacity_available(window as usize, incoming));
+    assert_eq!(state.native_cpu_bases.len(), 1);
+    assert_eq!(stage_native_scene_source(&mut state, &tiled), Ok(true));
+    assert!(
+        state.native_cpu_bases.is_empty(),
+        "optional flat base was not released"
+    );
+    assert_eq!(state.scene_layers.len(), 2);
+    assert_eq!(state.scene_layers[0].snapshot.image.image, accepted_image);
+    assert_eq!(state.scene_layers[1].native_revision, Some(tiles.revision));
+    assert_eq!(
+        read_scene_pixel(
+            gpu,
+            state.scene_layers[1].snapshot.image.image,
+            40,
+            32,
+            13,
+            11
+        ),
+        [0, 0, 255, 255]
+    );
+    drop(temporary_pressure);
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// External GPU reservations may clear on unrelated fence retirement.
+/// They must defer tiled staging, not permanently refuse the same revision.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_external_physical_pressure_defers_then_recovers() {
+    if isolate_vulkan_graphical_test("tiled_native_external_physical_pressure_defers_then_recovers")
+    {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            40,
+            32,
+            &[0, 0, 255, 255].repeat(40 * 32),
+        )
+        .unwrap(),
+    );
+    let mut source = test_opaque_metal_placement(
+        0x1013,
+        DirectFrame::from_frame(&appkit::view::Frame {
+            width: 40,
+            height: 32,
+            ..whole
+        }),
+    );
+    source.opaque = false;
+    source.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(tiles.clone()),
+        cpu_capture: None,
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    let incoming = tiled_native_staging_bytes(&state, &source);
+    let account = GpuCharge::reserve(window as usize, 1).unwrap();
+    let held = WINDOW_GPU_BUDGETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .and_then(std::sync::Weak::upgrade)
+        .unwrap()
+        .held
+        .load(Ordering::Acquire);
+    let pressure = GpuCharge::reserve(
+        window as usize,
+        WINDOW_GPU_PAYLOAD_BUDGET - held - incoming / 2,
+    )
+    .unwrap();
+    assert_eq!(stage_native_scene_source(&mut state, &source), Ok(false));
+    assert!(state.scene_layers.is_empty());
+    drop(pressure);
+    assert_eq!(stage_native_scene_source(&mut state, &source), Ok(true));
+    assert_eq!(state.scene_layers[0].native_revision, Some(tiles.revision));
+    drop(state);
+    drop(account);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
+/// No escrow candidate and a pinned old+new physical floor exceed the 768MiB
+/// ledger. Waiting cannot make progress; the staged tiled revision must be
+/// terminally refused rather than periodically requeued.
+#[test]
+#[cfg(not(target_os = "macos"))]
+fn tiled_native_atomic_floor_without_escrow_is_terminal() {
+    if isolate_vulkan_graphical_test("tiled_native_atomic_floor_without_escrow_is_terminal") {
+        return;
+    }
+    let Some((window, gpu, mut state, metal, whole)) = v10_fifo_fixture() else {
+        return;
+    };
+    let desc = ImageDescription {
+        image_type: vk::ImageType::TYPE_2D,
+        view_type: vk::ImageViewType::TYPE_2D,
+        format: vk::Format::B8G8R8A8_UNORM,
+        width: 2048,
+        height: 2048,
+        depth: 1,
+        levels: 1,
+        layers: 1,
+        samples: 1,
+        usage: gpu::USAGE_RENDER_TARGET,
+        cube: false,
+        components: vk::ComponentMapping::default(),
+    };
+    let mut old = Vec::new();
+    for n in 0..28usize {
+        let lease = BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        old.push(Arc::clone(&lease));
+        state.seed_accepted_native_for_budget_test(
+            0x3000 + n,
+            DirectFrame::from_frame(&whole),
+            lease,
+        );
+    }
+    state.transaction_pinned = old.clone();
+    // These images have not been acknowledged to AppKit. They are required
+    // for rollback but are not eligible for completed-revision CPU escrow.
+    for layer in &mut state.scene_layers {
+        layer.native_published_revision = None;
+    }
+    for n in 0..19 {
+        let replacement =
+            BackingImageLease::create_for_window(gpu, window as usize, &desc).unwrap();
+        state.scene_layers[n].snapshot = replacement;
+        state.scene_layers[n].native_revision = Some(2);
+    }
+    state.transaction_retiring_bytes = 19 * 16 * 1024 * 1024;
+    let tiles = Arc::new(
+        appkit::backing::NativePixelTiles::from_opaque_bgra(
+            2048,
+            2048,
+            &[0, 0, 255, 255].repeat(2048 * 2048),
+        )
+        .unwrap(),
+    );
+    let mut proposed = test_opaque_metal_placement(
+        0x4000,
+        DirectFrame::from_frame(&appkit::view::Frame {
+            width: 2048,
+            height: 2048,
+            ..whole
+        }),
+    );
+    proposed.opaque = false;
+    proposed.native = Some(scene::NativeCpuSceneSource {
+        tiles: Some(tiles.clone()),
+        cpu_capture: None,
+        bytes: Arc::new(Vec::new()),
+        revision: tiles.revision,
+        dmabuf: None,
+        dma_sample: None,
+    });
+    let required = tiled_native_staging_bytes(&state, &proposed);
+    assert_eq!(required, 32 * 1024 * 1024);
+    assert_eq!(state.atomic_transition_gpu_floor(), 47 * 16 * 1024 * 1024);
+    assert!(scene::fits_scene_budget(
+        state.budgeted_scene_bytes(),
+        required
+    ));
+    assert!(!window_gpu_capacity_available(window as usize, required));
+    assert_eq!(
+        stage_native_scene_source(&mut state, &proposed),
+        Err("native AppKit atomic GPU transition peak exhausted".to_string())
+    );
+    let mut rollback = state
+        .scene_layers
+        .iter()
+        .cloned()
+        .map(scene::SceneRollbackLayer::from_gpu)
+        .collect::<Vec<_>>();
+    // Seeded leases have no producer-published revision; escrow is forbidden.
+    assert_eq!(
+        stage_native_transaction_source(&mut state, &proposed, &mut rollback, &[proposed.clone()]),
+        Err("native AppKit atomic GPU transition peak exhausted".to_string())
+    );
+    assert!(rollback.iter().all(|entry| entry.escrow_bytes() == 0));
+    assert!(
+        state
+            .scene_layers
+            .iter()
+            .all(|layer| layer.id != proposed.id)
+    );
+    state.transaction_pinned.clear();
+    state.transaction_retiring_bytes = 0;
+    drop(rollback);
+    drop(old);
+    drop(state);
+    gpu.destroy_image(metal);
+    sdl3::video::destroy_window(window);
+}
+
 #[test]
 #[cfg(not(target_os = "macos"))]
 fn tiled_native_staging_escrows_retired_gpu_image_when_upload_buffer_is_pressured() {

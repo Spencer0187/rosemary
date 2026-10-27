@@ -2471,6 +2471,19 @@ fn stage_tiled_native_source(
         }
     }
     if !window_gpu_capacity_available(layer.frame.window as usize, incoming) {
+        // A flat CPU/DMA base is an optional performance cache, even when
+        // the next source is tiled. Its lease can prevent an independent
+        // image plus upload buffer from fitting the physical window ledger.
+        state.shed_scene_spares();
+    }
+    if !window_gpu_capacity_available(layer.frame.window as usize, incoming) {
+        // Pinned/committed generations form an atomic floor which waiting
+        // for unrelated submission fences cannot lower. The transaction
+        // wrapper may first escrow a superseded source to reduce this floor.
+        if state.atomic_transition_gpu_floor() > WINDOW_GPU_PAYLOAD_BUDGET.saturating_sub(incoming)
+        {
+            return Err("native AppKit atomic GPU transition peak exhausted".into());
+        }
         return Ok(None);
     }
     let gpu = state.gpu;
