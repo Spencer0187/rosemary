@@ -45,6 +45,10 @@ fn handle_mach_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         }
         numbers::mach::thread_self_trap => Ok(mach::task::mach_thread_self().into()),
         numbers::mach::host_self_trap => Ok(mach::task::mach_host_self().into()),
+        // FIXME (ACCCURAY): task_for_pid is the privileged variant of task_name_for_pid, they are not equal
+        numbers::mach::task_name_for_pid | numbers::mach::task_for_pid => {
+            Ok(unsafe { mach::tasks::task_for_pid(args[0] as _, args[1] as _, args[2] as _) } as _)
+        }
         _ => Err(errno::from_host(ENOSYS)),
     }
 }
