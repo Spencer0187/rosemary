@@ -89,7 +89,6 @@ unsafe extern "C" fn authorization_status_for_media_type(
     media_type: Id,
 ) -> isize {
     let status = authorization_status(media_type);
-    eprintln!("DEBUG avfoundation: authorizationStatus -> {status}");
     status
 }
 
@@ -113,10 +112,6 @@ unsafe extern "C" fn request_access_for_media_type(
     media_type: Id,
     handler: Id,
 ) {
-    eprintln!(
-        "DEBUG avfoundation: requestAccess granted={}",
-        authorized(media_type)
-    );
     if handler.is_null() {
         return;
     }
@@ -148,7 +143,6 @@ unsafe extern "C" fn answer(context: *mut std::ffi::c_void) {
             .add(BLOCK_INVOKE_OFFSET)
             .cast::<Option<unsafe extern "C" fn(Id, i8)>>()
     };
-    eprintln!("DEBUG avfoundation: answering {}", pending.granted);
     if let Some(invoke) = invoke {
         // SAFETY: the guest passed this block as a `void (^)(BOOL)`.
         unsafe { invoke(pending.handler, i8::from(pending.granted)) };
