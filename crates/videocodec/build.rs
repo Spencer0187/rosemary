@@ -1,6 +1,7 @@
 use sha2::{Digest, Sha256};
 use std::env;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -101,9 +102,60 @@ fn source_dir(out: &Path) -> (PathBuf, String) {
     (source, fingerprint)
 }
 
+// Stage a patched, immutable-source-derived copy. Never patch user-supplied
+// or cached pinned source in place; the verified input remains reproducible.
+fn staged_ffmpeg_source(source: &Path, out: &Path, patch: &Path) -> PathBuf {
+    fn copy_tree(from: &Path, to: &Path) {
+        fs::create_dir_all(to).expect("cannot stage FFmpeg source directory");
+        for entry in fs::read_dir(from).expect("cannot enumerate pinned FFmpeg") {
+            let entry = entry.expect("invalid FFmpeg directory entry");
+            let path = entry.path();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            let target = to.join(entry.file_name());
+            let ty = entry.file_type().expect("cannot stat pinned FFmpeg");
+            if ty.is_dir() {
+                copy_tree(&path, &target);
+            } else if ty.is_file() {
+                fs::copy(path, target).expect("cannot copy pinned FFmpeg source");
+            } else {
+                panic!("unexpected file in verified FFmpeg source");
+            }
+        }
+    }
+    let staged = out.join("ffmpeg-patched-source");
+    if staged.exists() {
+        fs::remove_dir_all(&staged).expect("cannot replace stale FFmpeg stage");
+    }
+    copy_tree(source, &staged);
+    for file in [
+        "libavutil/mem.c",
+        "libavcodec/h264dec.c",
+        "libavcodec/h264_slice.c",
+        "libavcodec/h2645_parse.c",
+        "libavcodec/h264_ps.c",
+    ] {
+        let path = staged.join(file);
+        let mut permissions = fs::metadata(&path)
+            .expect("FFmpeg stage metadata")
+            .permissions();
+        permissions.set_mode(permissions.mode() | 0o200);
+        fs::set_permissions(path, permissions).expect("FFmpeg stage permissions");
+    }
+    command(
+        Command::new("patch")
+            .current_dir(&staged)
+            .args(["--batch", "--fuzz=0", "-p1", "-i"])
+            .arg(patch),
+    );
+    staged
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=src/ffmpeg_shim.c");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=patches/ffmpeg-h264-memory-guards.patch");
     println!("cargo:rerun-if-env-changed=ROSEMARY_FFMPEG_SOURCE");
     let host = env::var("HOST").expect("HOST");
     let target = env::var("TARGET").expect("TARGET");
@@ -133,6 +185,7 @@ fn main() {
         .filter(|output| output.status.success());
     let mut recipe = Sha256::new();
     recipe.update(include_bytes!("build.rs"));
+    recipe.update(include_bytes!("patches/ffmpeg-h264-memory-guards.patch"));
     recipe.update(compiler_path.as_bytes());
     recipe.update(&compiler_version.stdout);
     recipe.update(&compiler_version.stderr);
@@ -213,12 +266,16 @@ fn main() {
     if stale {
         let _ = fs::remove_dir_all(&install);
         let _ = fs::remove_dir_all(out.join("ffmpeg-build"));
+        let _ = fs::remove_dir_all(out.join("ffmpeg-patched-source"));
         let _ = fs::remove_file(&stamp);
     }
     if stale || !archive.exists() || !install.join("lib/libswscale.a").exists() {
+        let patch =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("patches/ffmpeg-h264-memory-guards.patch");
+        let patched = staged_ffmpeg_source(&source, &out, &patch);
         let build = out.join("ffmpeg-build");
         fs::create_dir_all(&build).expect("cannot create FFmpeg build directory");
-        let mut configure = Command::new(source.join("configure"));
+        let mut configure = Command::new(patched.join("configure"));
         configure
             .current_dir(&build)
             .arg(format!("--prefix={}", install.display()))

@@ -135,6 +135,10 @@ unsafe extern "C" {
     #[cfg(test)]
     fn rosemary_h264_test_fail_native_allocation(handle: *mut c_void, stage: i32);
     #[cfg(test)]
+    fn rosemary_h264_test_fail_ffmpeg_allocation(handle: *mut c_void, stage: i32);
+    #[cfg(test)]
+    fn rosemary_h264_table_allocation_attempts(handle: *mut c_void) -> usize;
+    #[cfg(test)]
     fn rosemary_h264_test_fail_converter_allocation(handle: *mut c_void, stage: i32);
     fn rosemary_h264_token_released(handle: *mut c_void, id: u64) -> i32;
     fn rosemary_h264_forget_token(handle: *mut c_void, id: u64);
@@ -1998,6 +2002,11 @@ mod tests {
             0
         );
         assert!(decoder.fatal.is_none());
+        // SPS rejection precedes ff_h264_alloc_tables, not merely get_buffer2.
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
+            0
+        );
         let mut recovered = decoder.submit_annex_b(small, None, None).unwrap();
         recovered.extend(decoder.finish().unwrap());
         assert_eq!(
@@ -2086,7 +2095,14 @@ mod tests {
             },
         );
         assert_eq!(decoder.receive_one().unwrap().unwrap().id, 101);
+        let tables_before_oversized =
+            unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) };
         assert!(decoder.receive_one().unwrap().is_none());
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
+            tables_before_oversized,
+            "oversized SPS initialized macroblock tables"
+        );
         let drops = std::iter::from_fn(|| decoder.take_dropped()).collect::<Vec<_>>();
         assert_eq!(drops.len(), 1);
         assert_eq!(drops[0].id, 202);
@@ -2107,6 +2123,104 @@ mod tests {
             vec![303]
         );
         assert!(decoder.take_dropped().is_none());
+    }
+
+    #[test]
+    fn internal_ffmpeg_table_and_nal_parser_allocation_failures_are_fatal() {
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        for stage in [1, 2] {
+            let mut decoder = decoder_for_fixture(stream);
+            // SAFETY: the one-shot fault is armed for this decoder's native
+            // ff_h264_alloc_tables or H.264 NAL RBSP allocation, not get_buffer2.
+            unsafe { rosemary_h264_test_fail_ffmpeg_allocation(decoder.handle.as_ptr(), stage) };
+            assert_eq!(
+                decoder.submit_annex_b(stream, None, None).unwrap_err(),
+                Error::Codec(-12),
+                "FFmpeg internal stage {stage}"
+            );
+            assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+            assert!(decoder.pending.contains_key(&0));
+            assert!(decoder.take_dropped().is_none());
+            assert_eq!(
+                decoder.submit_annex_b(stream, None, None).unwrap_err(),
+                Error::Codec(-12)
+            );
+        }
+    }
+
+    #[test]
+    fn internal_ffmpeg_table_and_nal_parser_failures_poison_trait_session() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut packet = Vec::new();
+        for nal in nals_from_fixture(stream) {
+            packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            packet.extend_from_slice(nal);
+        }
+        for stage in [1, 2] {
+            let mut decoder = decoder_for_fixture(stream);
+            // SAFETY: decoder-owned hook, native allocation fault only.
+            unsafe { rosemary_h264_test_fail_ffmpeg_allocation(decoder.handle.as_ptr(), stage) };
+            let error = decoder
+                .submit(AccessUnit {
+                    id: 789,
+                    bytes: &packet,
+                    pts_ns: None,
+                    dts_ns: None,
+                    duration_ns: None,
+                })
+                .unwrap_err();
+            assert!(
+                matches!(error, media::Error::Decode(ref message) if message.contains("Codec(-12)")),
+                "FFmpeg internal stage {stage}: {error:?}"
+            );
+            assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+            assert!(decoder.pending.contains_key(&789));
+            assert!(decoder.take_dropped().is_none());
+            assert!(matches!(decoder.is_drained(), Err(media::Error::Decode(_))));
+        }
+    }
+
+    #[test]
+    fn deferred_ffmpeg_table_allocation_failure_is_fatal() {
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let high_chroma = include_bytes!("../tests/fixtures/high444_10bit_4096x4096.h264");
+        let stage = 1;
+        let later = high_chroma.as_slice();
+        let mut decoder = decoder_for_fixture(small);
+        assert_eq!(decoder.send(Some(small), None, None, 101), 0);
+        decoder.pending.insert(
+            101,
+            SourceTiming {
+                pts: None,
+                dts: None,
+                duration: None,
+                decode_error: None,
+            },
+        );
+        assert_eq!(decoder.send(Some(later), None, None, 202), 0);
+        decoder.pending.insert(
+            202,
+            SourceTiming {
+                pts: None,
+                dts: None,
+                duration: None,
+                decode_error: None,
+            },
+        );
+        assert_eq!(decoder.receive_one().unwrap().unwrap().id, 101);
+        // SAFETY: the decoder is exclusively held, and the next FFmpeg
+        // H.264 packet was accepted but has not yet been decoded.
+        unsafe { rosemary_h264_test_fail_ffmpeg_allocation(decoder.handle.as_ptr(), stage) };
+        assert_eq!(
+            decoder.receive_one().unwrap_err(),
+            Error::Codec(-12),
+            "stage {stage}"
+        );
+        assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+        assert!(decoder.pending.contains_key(&202));
+        assert!(decoder.take_dropped().is_none());
+        assert_eq!(decoder.finish().unwrap_err(), Error::Codec(-12));
     }
 
     #[test]

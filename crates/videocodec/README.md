@@ -5,15 +5,20 @@ or require a system-installed FFmpeg library at runtime. The crate builds the
 necessary FFmpeg libraries from the exact source revision identified in
 `build.rs`, and links them statically.
 
-Build prerequisites are a C compiler, GNU make, Git, and an internet connection
+Build prerequisites are a C compiler, GNU make, Git, `patch`, and an internet connection
 for the first source retrieval in a normal Cargo build. Offline/Nix builders
 can prefetch that exact source revision and set `ROSEMARY_FFMPEG_SOURCE` to its
 read-only directory before invoking Cargo. A supplied directory must either be
 an unmodified Git checkout at the pinned commit or exactly match the SHA-256
 file manifest of the official pinned codeload archive. The archive fingerprint
 is verified before cached static FFmpeg libraries are considered reusable.
-A source path, fingerprint, target, or build-recipe change causes a full
-out-of-tree FFmpeg rebuild rather than linking stale native archives.
+A source path, fingerprint, target, build-recipe or bundled FFmpeg patch
+change causes a full out-of-tree rebuild rather than linking stale native
+archives. After verifying the original pinned upstream source, the builder
+copies it into Cargo's build output and applies the exact-version source patch
+`patches/ffmpeg-h264-memory-guards.patch`. The original source is never
+modified. Redistributors must also provide this patch alongside the
+corresponding FFmpeg source and license information.
 
 The current bundled-FFmpeg builder supports **native builds only**: it rejects
 `HOST != TARGET` explicitly rather than compiling FFmpeg for the host and the
@@ -94,16 +99,18 @@ successful retry. The legacy
 automatic-ID counter never emits the reserved exhaustion value, but the
 `mediabackend` trait accepts the entire opaque `u64` identity domain.
 
-The guarded `get_buffer2` rejects pictures exceeding 4096² pixels before
-FFmpeg allocates decoded frame storage, alongside its 64 MiB source-frame
+The source patch rejects SPS dimensions exceeding 4096² pixels before
+FFmpeg initializes dimension-dependent H.264 macroblock tables. The guarded
+`get_buffer2` independently rejects such pictures before decoded-frame storage, alongside its 64 MiB source-frame
 request limit and 256 MiB budget for live native reference buffers. FFmpeg's
 `max_pixels` is not used as the 4096² guard because it rejects frames before
 the callback receives their opaque source IDs. FFmpeg's independent generic
 image-size and overflow validity checks remain enabled; inputs so extreme
 that FFmpeg rejects them before invoking `get_buffer2` fail as native decoder
 errors rather than receiving an invented picture identity. For attributable
-oversize H.264 pictures, the guarded callback reports `SourceFrameTooLarge`,
-including when the allocation happens during deferred receive. The source-format and bit depth determine these charges (not the
+oversize H.264 pictures, either the early SPS check or guarded frame-allocation
+callback reports `SourceFrameTooLarge` using the actual packet identity,
+including when decoding happens during deferred receive. The source-format and bit depth determine these charges (not the
 converted I420 bytes); single-frame decoding threads avoid multiplying the
 reference budget by frame-thread count. Converted buffers and Rust's bounded
 output FIFO are separate allocations. These safeguards limit decoded-picture

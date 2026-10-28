@@ -32,6 +32,10 @@ typedef struct RosemaryDecoder {
     int source_budget_refused;
     int native_allocation_error;
     int test_native_allocation_failure;
+    int test_ffmpeg_allocation_stage;
+    int decoding_packet_identity_valid;
+    uint64_t decoding_packet_id;
+    size_t table_allocations_started;
     int source_budget_identity_valid;
     uint64_t source_budget_id;
     int last_send_error;
@@ -44,6 +48,55 @@ typedef struct RosemaryDecoder {
     AVFrame *converted;
     struct SwsContext *converter;
 } RosemaryDecoder;
+
+// The bundled FFmpeg allocator may run outside this decoder (or on other
+// threads); only the active synchronous decode call may alter session state.
+static _Thread_local RosemaryDecoder *rosemary_active_decoder;
+static _Thread_local int rosemary_armed_allocation_failure;
+
+void rosemary_h264_ffmpeg_allocation_failed(void) {
+    if (rosemary_active_decoder)
+        rosemary_active_decoder->native_allocation_error = AVERROR(ENOMEM);
+}
+
+int rosemary_h264_ffmpeg_inject_alloc_failure(void) {
+    RosemaryDecoder *decoder = rosemary_active_decoder;
+    if (!decoder || !rosemary_armed_allocation_failure) return 0;
+    rosemary_armed_allocation_failure = 0;
+    decoder->test_ffmpeg_allocation_stage = 0;
+    return 1;
+}
+
+// 1=H.264 macroblock tables, 2=NAL RBSP parser buffer.
+void rosemary_h264_ffmpeg_allocation_probe(int stage) {
+    if (rosemary_active_decoder) {
+        if (stage == 1) rosemary_active_decoder->table_allocations_started++;
+        if (rosemary_active_decoder->test_ffmpeg_allocation_stage == stage)
+            rosemary_armed_allocation_failure = 1;
+    }
+}
+
+void rosemary_h264_ffmpeg_decoding_packet(AVCodecContext *context, const AVPacket *packet) {
+    RosemaryDecoder *decoder = context->opaque;
+    if (!decoder || rosemary_active_decoder != decoder) return;
+    decoder->decoding_packet_identity_valid = 0;
+    if (packet->opaque_ref && packet->opaque_ref->size == sizeof(uint64_t)) {
+        memcpy(&decoder->decoding_packet_id, packet->opaque_ref->data, sizeof(uint64_t));
+        decoder->decoding_packet_identity_valid = 1;
+    }
+}
+
+int rosemary_h264_ffmpeg_reject_sps(AVCodecContext *context, int mb_width, int mb_height) {
+    RosemaryDecoder *decoder = context->opaque;
+    if (!decoder || mb_width <= 0 || mb_height <= 0 ||
+        (int64_t)mb_width * mb_height <= ROSEMARY_MAX_NATIVE_PIXELS / 256)
+        return 0;
+    decoder->source_budget_refused = 1;
+    decoder->source_budget_identity_valid = decoder->decoding_packet_identity_valid;
+    if (decoder->source_budget_identity_valid)
+        decoder->source_budget_id = decoder->decoding_packet_id;
+    return 1;
+}
 
 typedef struct {
     RosemaryDecoder *decoder;
@@ -156,6 +209,14 @@ int rosemary_h264_last_send_error(RosemaryDecoder *decoder) {
 // 1: default allocator; 2: tracked wrapper allocation; 3: AVBufferRef wrapper.
 void rosemary_h264_test_fail_native_allocation(RosemaryDecoder *decoder, int stage) {
     if (decoder) decoder->test_native_allocation_failure = stage;
+}
+
+void rosemary_h264_test_fail_ffmpeg_allocation(RosemaryDecoder *decoder, int stage) {
+    if (decoder) decoder->test_ffmpeg_allocation_stage = stage;
+}
+
+size_t rosemary_h264_table_allocation_attempts(RosemaryDecoder *decoder) {
+    return decoder ? decoder->table_allocations_started : 0;
 }
 
 // Enabled only by a test-only Rust FFI declaration; the fault occurs after
@@ -290,7 +351,14 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     decoder->source_budget_refused = 0;
     decoder->source_budget_identity_valid = 0;
     decoder->native_allocation_error = 0;
+    decoder->decoding_packet_identity_valid = 0;
+    RosemaryDecoder *previous_decoder = rosemary_active_decoder;
+    int previous_armed = rosemary_armed_allocation_failure;
+    rosemary_active_decoder = decoder;
+    rosemary_armed_allocation_failure = 0;
     result = avcodec_send_packet(decoder->context, decoder->packet);
+    rosemary_active_decoder = previous_decoder;
+    rosemary_armed_allocation_failure = previous_armed;
     if (decoder->test_send_enomem_after_accept && result == 0) {
         decoder->test_send_enomem_after_accept = 0;
         result = AVERROR(ENOMEM);
@@ -301,20 +369,22 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     // EAGAIN is guaranteed not to consume input. Other errors can occur
     // after libavcodec takes the opaque reference into buffer_pkt; keep the
     // observer so the sample can be completed exactly once.
-    if (result != AVERROR(EAGAIN)) {
+    if (result != AVERROR(EAGAIN) || decoder->native_allocation_error) {
         token->next = decoder->tokens;
         decoder->tokens = token;
     } else {
         av_buffer_unref(&token->ref);
         free(token);
     }
-    if (result == AVERROR(EAGAIN)) return 1;
+    // A masked allocation failure must outrank even an apparent EAGAIN.
+    // Conservatively retain ownership because decoder state is now fatal.
     if (decoder->native_allocation_error) return 5;
+    if (result == AVERROR(EAGAIN)) return 1;
     // H.264 maps a failed get_buffer2(ENOMEM) to INVALIDDATA in decode.c.
     // This is a known guarded allocation refusal only when the callback
     // itself recorded it; unrelated errors remain fatal.
     if (decoder->source_budget_refused &&
-        (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA))
+        (result == 0 || result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA))
         return 4; // Consumed packet, decoder source-frame budget exceeded.
     if (result == AVERROR_INVALIDDATA)
         return 3; // Recoverable corruption, ownership remains tracked.
@@ -356,11 +426,19 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     decoder->source_budget_refused = 0;
     decoder->source_budget_identity_valid = 0;
     decoder->native_allocation_error = 0;
+    decoder->decoding_packet_identity_valid = 0;
+    RosemaryDecoder *previous_decoder = rosemary_active_decoder;
+    int previous_armed = rosemary_armed_allocation_failure;
+    rosemary_active_decoder = decoder;
+    rosemary_armed_allocation_failure = 0;
     int result = avcodec_receive_frame(decoder->context, decoder->frame);
+    rosemary_active_decoder = previous_decoder;
+    rosemary_armed_allocation_failure = previous_armed;
     if (decoder->native_allocation_error)
         return decoder->native_allocation_error;
     if (decoder->source_budget_refused &&
-        (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA)) {
+        (result == 0 || result == AVERROR(EAGAIN) ||
+         result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA)) {
         memset(out, 0, sizeof(*out));
         if (decoder->source_budget_identity_valid) {
             out->identity_valid = 1;
