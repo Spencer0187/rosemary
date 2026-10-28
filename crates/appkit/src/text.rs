@@ -1015,6 +1015,12 @@ pub(crate) fn commit(receiver: Id, text: &str) {
 
 /// Deliver an in-progress host IME composition to the focused input client.
 pub(crate) fn compose(receiver: Id, text: &str, start: i32, length: i32) {
+    // SDL reports an empty composition at the end of every input method round,
+    // composing or not, but AppKit's input context only clears marked text
+    // that the client has.
+    if text.is_empty() && !client_has_marked_text(receiver) {
+        return;
+    }
     let value = objc::arc::autorelease(foundation::string::from_str(text));
     let character_range = NSRange {
         location: usize::try_from(start).unwrap_or(0),
@@ -1059,6 +1065,20 @@ pub(crate) fn compose(receiver: Id, text: &str, start: i32, length: i32) {
                 std::mem::transmute(method.implementation());
             f(receiver, legacy, value, selected);
         }
+    }
+}
+
+fn client_has_marked_text(receiver: Id) -> bool {
+    let sel = objc::sel::get("hasMarkedText");
+    // SAFETY: a live first responder.
+    let Some(method) = (unsafe { objc::object::class_of(receiver) }).and_then(|c| c.method(sel))
+    else {
+        return false;
+    };
+    // SAFETY: `-hasMarkedText` is `BOOL (id, SEL)`.
+    unsafe {
+        let f: unsafe extern "C" fn(Id, Sel) -> u8 = std::mem::transmute(method.implementation());
+        f(receiver, sel) != 0
     }
 }
 
@@ -1846,6 +1866,44 @@ mod tests {
         commit(view, "coffee");
         assert_eq!(read(view).text, "coffee");
         assert_eq!(read(view).marked, None);
+    }
+
+    #[test]
+    fn an_empty_composition_only_clears_marked_text_the_client_has() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static MARKED: AtomicBool = AtomicBool::new(false);
+        static CLEARS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn has_marked(_: Id, _: Sel) -> u8 {
+            MARKED.load(Ordering::Relaxed) as u8
+        }
+        unsafe extern "C" fn set_marked(_: Id, _: Sel, value: Id, _: NSRange) {
+            // SAFETY: an `NSString`.
+            if unsafe { foundation::string::bytes(value) }.is_empty() {
+                CLEARS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        crate::bootstrap();
+        let view = objc::class::lookup(c"NSView").expect("NSView");
+        let class =
+            objc::class::allocate_pair(Some(view), c"MarkedTextRecorder", 0).expect("a subclass");
+        class.add_method(
+            objc::sel::get("hasMarkedText"),
+            has_marked as objc::class::Imp,
+            c"c16@0:8",
+        );
+        class.add_method(
+            objc::sel::get("setMarkedText:selectedRange:"),
+            set_marked as objc::class::Imp,
+            c"v40@0:8@16{_NSRange=QQ}24",
+        );
+        objc::class::register_pair(class);
+        let client = objc::object::create_instance(class, 0);
+
+        compose(client, "", 0, 0);
+        assert_eq!(CLEARS.load(Ordering::Relaxed), 0);
+        MARKED.store(true, Ordering::Relaxed);
+        compose(client, "", 0, 0);
+        assert_eq!(CLEARS.load(Ordering::Relaxed), 1);
     }
 
     #[test]
