@@ -51,18 +51,26 @@ normal streaming and missing-IDR recovery, without relying on PTS/order.
 Terminal EOS reports any remaining unreturned IDs.
 
 The trait implementation has an output limit of 32 owned frames and a 64 MiB
-frame-byte budget. Once full, `submit` returns recoverable `Backpressure`
-without consuming the caller's access unit; after `pull`, retry that same ID.
+FIFO byte budget. A single separately bounded 64 MiB overflow-frame slot
+preserves output when an SPS resolution change produces a picture larger than
+the space available in the FIFO. No more input is accepted while that slot is
+occupied; the older queued frames must be pulled before the overflow picture.
+A picture individually exceeding the 64 MiB slot is reported as a frame-local
+drop with an error. Full queues return recoverable `Backpressure` without
+consuming the caller's access unit; after `pull`, retry the same ID.
 The dropped-completion queue is separately bounded to 1024 entries; poll
 `take_dropped` alongside `pull`. Delayed EOS output is pulled incrementally.
-`pull` is synchronous and ignores its timeout. A fatal decoder/frame-layout
-error remains latched for the session.
+`pull` is synchronous and ignores its timeout. An identified frame-local
+layout/conversion error is reported as `DroppedSample.error`, while decoder
+errors that invalidate the session or lose identity are latched as fatal.
 
-Accepted `AccessUnit.id` values must be strictly increasing within a session;
-this avoids an unbounded historical identity set. Rejected input and
-`Backpressure` do not advance the accepted identity. The legacy
-`Decoder::submit_annex_b` and `submit_avcc` methods remain available with
-automatically assigned IDs and plane-based `Frame` output.
+The `AccessUnit.id` is an opaque sample identity: it need not be numerically
+ordered, but the caller must provide distinct IDs for the life of a session.
+The decoder checks collisions among in-flight outputs, pending inputs, and
+unconsumed dropped notifications without retaining an unbounded set of all
+historical IDs. Malformed inputs are validated before checking backpressure.
+The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
+with automatically assigned IDs and plane-based `Frame` output.
 
 FFmpeg reserves `i64::MIN` for absent timestamps, so callers supplying that
 exact number receive `InvalidTimestamp` rather than silent corruption.

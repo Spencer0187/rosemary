@@ -161,6 +161,13 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if (result == AVERROR_EOF) return 2;
     if (result < 0) return result;
     AVFrame *f = decoder->frame;
+    // A conversion/layout error concerns this identified picture rather than
+    // the decode session. Populate identity before any fallible conversion.
+    memset(out, 0, sizeof(*out));
+    if (f->opaque_ref && f->opaque_ref->size == sizeof(out->id)) {
+        memcpy(&out->id, f->opaque_ref->data, sizeof(out->id));
+        out->identity_valid = 1;
+    }
     if (f->width <= 0 || f->height <= 0 || f->width > 32768 || f->height > 32768)
         return AVERROR_INVALIDDATA;
     AVFrame *source = f;
@@ -204,15 +211,10 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         f = decoder->converted;
     }
     int fmt = f->format == AV_PIX_FMT_NV12 ? 1 : 0;
-    memset(out, 0, sizeof(*out));
     out->width = f->width;
     out->height = f->height;
     out->format = fmt;
     out->pts = source->best_effort_timestamp;
-    if (source->opaque_ref && source->opaque_ref->size == sizeof(out->id)) {
-        memcpy(&out->id, source->opaque_ref->data, sizeof(out->id));
-        out->identity_valid = 1;
-    }
     out->color_range = color_range;
     out->colorspace = source->colorspace;
     out->primaries = source->color_primaries;
