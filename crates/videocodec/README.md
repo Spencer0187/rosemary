@@ -63,8 +63,10 @@ The dropped-completion queue is separately bounded to 1024 entries; poll
 and successful `is_drained()` requires every accepted sample ID to be resolved
 and every completion notification consumed. `pull` is synchronous and ignores
 its timeout. An identified frame-local
-layout/conversion error is reported as `DroppedSample.error`, while decoder
-errors that invalidate the session or lose identity are latched as fatal.
+layout/unsupported-conversion error is reported as `DroppedSample.error`.
+Unexpected native conversion failures, including swscale context creation and
+converted-frame allocation `ENOMEM` after FFmpeg identified a picture, latch
+fatal decoder failure without discarding the accepted sample identity.
 
 The `AccessUnit.id` is an opaque sample identity: it need not be numerically
 ordered, but the caller must provide distinct IDs for the life of a session.
@@ -74,8 +76,14 @@ historical IDs. AVCC framing, NAL headers and expanded packet size are
 validated before checking backpressure, but Annex B output allocation and
 copy occur only after the packet can enter the decoder, including in the
 legacy AVCC API.
-The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
-with automatically assigned IDs and plane-based `Frame` output. When the
+The legacy `Decoder::submit_annex_b`, `submit_avcc`, and `finish` methods
+remain available with automatically assigned IDs and plane-based `Frame`
+output. A session must use either the legacy API or the
+`mediabackend::VideoDecoder` trait API; attempts to switch interfaces after
+selection return `MixedDecoderApis` (`InvalidInput` through the trait).
+`take_dropped` is a shared notification accessor. The trait's drain predicate
+also checks retained legacy frames defensively, so a mixed interface cannot
+report EOS with inaccessible frames. When the
 completion queue stalls, these methods and `finish()` return recoverable
 `videocodec::Error::Backpressure`; consume notifications using the inherent
 `Decoder::take_dropped()` and retry the same unaccepted input.
@@ -148,10 +156,11 @@ matrix; unsupported matrices are rejected as frame-local conversion errors.
 Decoded planar RGB (GBRP) H.264 uses an explicit BT.601 conversion, and
 its I420 output reports BT.601 rather than the original RGB matrix.
 
-Arch packaging supplies checksum-verified, pinned FFmpeg source explicitly
-via `ROSEMARY_FFMPEG_SOURCE`. The build script independently verifies the
-source commit/tree and never needs to clone during the package build;
-Git, Make and a C compiler are declared as build dependencies.
+Arch release packaging for this standalone decoder is deferred until a
+Rosemary release actually includes `videocodec`. The existing PKGBUILD still
+builds Rosemary v0.2.1 and is left unchanged by this decoder contribution.
+For offline builds of this crate, `ROSEMARY_FFMPEG_SOURCE` accepts a pinned,
+independently verified FFmpeg source tree.
 
 FFmpeg reserves `i64::MIN` for absent timestamps, so callers supplying that
 exact number receive `InvalidTimestamp` rather than silent corruption.

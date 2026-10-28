@@ -30,6 +30,7 @@ typedef struct RosemaryDecoder {
     uint64_t source_budget_id;
     int last_send_error;
     int test_send_enomem_after_accept;
+    int test_fail_converter_allocation;
     RosemaryOpaqueToken *tokens;
     AVCodecContext *context;
     AVPacket *packet;
@@ -125,6 +126,12 @@ int rosemary_h264_last_send_error(RosemaryDecoder *decoder) {
 // libavcodec has actually consumed the next packet.
 void rosemary_h264_test_send_enomem_after_accept(RosemaryDecoder *decoder) {
     if (decoder) decoder->test_send_enomem_after_accept = 1;
+}
+
+// Test-only one-shot failure after frame opaque identity has been populated.
+// 1: sws converter creation; 2: converted AVFrame allocation.
+void rosemary_h264_test_fail_converter_allocation(RosemaryDecoder *decoder, int stage) {
+    if (decoder) decoder->test_fail_converter_allocation = stage;
 }
 
 int rosemary_h264_last_budget_id(RosemaryDecoder *decoder, uint64_t *id) {
@@ -299,7 +306,8 @@ void rosemary_h264_forget_token(RosemaryDecoder *decoder, uint64_t id) {
     }
 }
 
-// 0=frame available, 1=more input needed, 2=drained, negative=decode error.
+// 0=frame, 1=need input, 2=EOF, 4=budget reject, 6=known picture reject;
+// negative errors (including ENOMEM) leave the decoder session fatal.
 int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if (!decoder || !out) return AVERROR(EINVAL);
     av_frame_unref(decoder->frame);
@@ -329,10 +337,10 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if ((f->flags & AV_FRAME_FLAG_CORRUPT) || f->decode_error_flags) {
         out->flags = f->flags;
         out->decode_error_flags = f->decode_error_flags;
-        return AVERROR_INVALIDDATA;
+        return 6;
     }
     if (f->width <= 0 || f->height <= 0 || f->width > 32768 || f->height > 32768)
-        return AVERROR_INVALIDDATA;
+        return 6;
     AVFrame *source = f;
     int output_colorspace = source->colorspace;
     int color_range = f->color_range;
@@ -345,7 +353,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         f->format != AV_PIX_FMT_NV12) {
         // A whole-picture sws_scale mixes chroma across different fields.
         if (source->flags & AV_FRAME_FLAG_INTERLACED)
-            return AVERROR_INVALIDDATA;
+            return 6;
         int sws_matrix;
         switch (source->colorspace) {
         case AVCOL_SPC_RGB:
@@ -362,7 +370,11 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         case AVCOL_SPC_SMPTE240M: sws_matrix = SWS_CS_SMPTE240M; break;
         case AVCOL_SPC_BT2020_NCL: sws_matrix = SWS_CS_BT2020; break;
         // In particular, swscale cannot implement BT.2020 constant-luminance.
-        default: return AVERROR_INVALIDDATA;
+        default: return 6;
+        }
+        if (decoder->test_fail_converter_allocation == 1) {
+            decoder->test_fail_converter_allocation = 0;
+            return AVERROR(ENOMEM);
         }
         decoder->converter = sws_getCachedContext(
             decoder->converter, f->width, f->height, f->format,
@@ -384,6 +396,10 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         decoder->converted->width = f->width;
         decoder->converted->height = f->height;
         decoder->converted->format = AV_PIX_FMT_YUV420P;
+        if (decoder->test_fail_converter_allocation == 2) {
+            decoder->test_fail_converter_allocation = 0;
+            return AVERROR(ENOMEM);
+        }
         result = av_frame_get_buffer(decoder->converted, 32);
         if (result < 0) return result;
         result = sws_scale(decoder->converter,

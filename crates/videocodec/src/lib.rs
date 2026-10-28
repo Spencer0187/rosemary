@@ -72,6 +72,7 @@ pub enum Error {
     DuplicateIdentity,
     MissingIdentity,
     InvalidTimestamp,
+    MixedDecoderApis,
 }
 
 impl fmt::Display for Error {
@@ -125,6 +126,8 @@ unsafe extern "C" {
     fn rosemary_h264_last_budget_id(handle: *mut c_void, id: *mut u64) -> i32;
     #[cfg(test)]
     fn rosemary_h264_test_send_enomem_after_accept(handle: *mut c_void);
+    #[cfg(test)]
+    fn rosemary_h264_test_fail_converter_allocation(handle: *mut c_void, stage: i32);
     fn rosemary_h264_token_released(handle: *mut c_void, id: u64) -> i32;
     fn rosemary_h264_forget_token(handle: *mut c_void, id: u64);
     #[cfg(test)]
@@ -245,6 +248,12 @@ fn prepend_headers(headers: &[u8], sample: &[u8]) -> Result<Vec<u8>, Error> {
 
 /// Stateful H.264 decoder. One owner at a time; guest frameworks decide which
 /// thread submits samples and how/when decoded frames are delivered.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecoderApi {
+    Legacy,
+    Media,
+}
+
 #[derive(Clone, Copy)]
 struct SourceTiming {
     pts: Option<i64>,
@@ -261,6 +270,7 @@ pub struct Decoder {
     finished: bool,
     next_id: u64,
     legacy_ready: Vec<Frame>,
+    api: Option<DecoderApi>,
     pending: HashMap<u64, SourceTiming>,
     dropped: VecDeque<media::DroppedSample>,
     available: VecDeque<CodecFrame>,
@@ -308,6 +318,7 @@ impl Decoder {
             finished: false,
             next_id: 0,
             legacy_ready: Vec::new(),
+            api: None,
             pending: HashMap::new(),
             dropped: VecDeque::new(),
             available: VecDeque::new(),
@@ -328,6 +339,7 @@ impl Decoder {
         dts: Option<i64>,
     ) -> Result<Vec<Frame>, Error> {
         self.check_fatal()?;
+        self.select_api(DecoderApi::Legacy)?;
         if self.finished {
             return Err(Error::Drained);
         }
@@ -353,6 +365,8 @@ impl Decoder {
         pts: Option<i64>,
         dts: Option<i64>,
     ) -> Result<Vec<Frame>, Error> {
+        self.check_fatal()?;
+        self.select_api(DecoderApi::Legacy)?;
         if self.next_id == u64::MAX {
             return Err(Error::DuplicateIdentity);
         }
@@ -434,6 +448,7 @@ impl Decoder {
     /// Finish delayed/reordered frames. A drained decoder must be recreated.
     pub fn finish(&mut self) -> Result<Vec<Frame>, Error> {
         self.check_fatal()?;
+        self.select_api(DecoderApi::Legacy)?;
         if self.dropped.len() >= MAX_QUEUED_DROPS {
             return Err(Error::Backpressure);
         }
@@ -551,6 +566,16 @@ impl Decoder {
         self.fatal.map_or(Ok(()), Err)
     }
 
+    fn select_api(&mut self, api: DecoderApi) -> Result<(), Error> {
+        match self.api {
+            Some(active) if active != api => Err(Error::MixedDecoderApis),
+            _ => {
+                self.api = Some(api);
+                Ok(())
+            }
+        }
+    }
+
     fn latch(&mut self, error: Error) -> Error {
         *self.fatal.get_or_insert(error)
     }
@@ -589,7 +614,7 @@ impl Decoder {
     fn process_view(
         &mut self,
         view: &FrameView,
-        native_error: Option<i32>,
+        native_error: Option<Error>,
     ) -> Result<Option<Frame>, Error> {
         if view.identity_valid == 0 {
             return Err(self.latch(Error::MissingIdentity));
@@ -600,7 +625,7 @@ impl Decoder {
         let converted = if frame_is_corrupt(view) {
             Err(Error::CorruptFrame)
         } else {
-            native_error.map_or_else(|| copy_frame(view), |err| Err(Error::Codec(err)))
+            native_error.map_or_else(|| copy_frame(view), Err)
         };
         let timing = self
             .pending
@@ -658,9 +683,10 @@ impl Decoder {
                     self.reap_dropped()?;
                     return Ok(None);
                 }
-                negative if view.identity_valid != 0 => {
-                    self.process_view(&view, Some(negative))?;
+                6 if view.identity_valid != 0 => {
+                    self.process_view(&view, Some(Error::InvalidImageLayout))?;
                 }
+                6 => return Err(self.latch(Error::MissingIdentity)),
                 negative => return Err(self.latch(Error::Codec(negative))),
             }
         }
@@ -1039,7 +1065,8 @@ fn media_error(error: Error) -> media::Error {
         | Error::InvalidParameterSet
         | Error::InvalidPacket
         | Error::DuplicateIdentity
-        | Error::InvalidTimestamp => media::Error::InvalidInput(error.to_string()),
+        | Error::InvalidTimestamp
+        | Error::MixedDecoderApis => media::Error::InvalidInput(error.to_string()),
         Error::Backpressure => media::Error::Backpressure,
         Error::BackendUnavailable => media::Error::BackendUnavailable(error.to_string()),
         _ => media::Error::Decode(error.to_string()),
@@ -1055,6 +1082,7 @@ impl media::VideoDecoder for Decoder {
 
     fn submit(&mut self, packet: AccessUnit<'_>) -> Result<(), media::Error> {
         self.check_fatal().map_err(media_error)?;
+        self.select_api(DecoderApi::Media).map_err(media_error)?;
         if self.finished {
             return Err(media::Error::EndOfStream);
         }
@@ -1113,6 +1141,8 @@ impl media::VideoDecoder for Decoder {
     }
 
     fn pull(&mut self, _timeout: Duration) -> Result<Option<Self::Frame>, media::Error> {
+        self.check_fatal().map_err(media_error)?;
+        self.select_api(DecoderApi::Media).map_err(media_error)?;
         self.pull_queued().map_err(media_error)
     }
 
@@ -1122,6 +1152,7 @@ impl media::VideoDecoder for Decoder {
 
     fn end_stream(&mut self) -> Result<(), media::Error> {
         self.check_fatal().map_err(media_error)?;
+        self.select_api(DecoderApi::Media).map_err(media_error)?;
         if self.finished {
             return Ok(());
         }
@@ -1140,7 +1171,12 @@ impl media::VideoDecoder for Decoder {
 
     fn is_drained(&mut self) -> Result<bool, media::Error> {
         self.check_fatal().map_err(media_error)?;
-        if !self.finished || !self.available.is_empty() || self.overflow.is_some() {
+        self.select_api(DecoderApi::Media).map_err(media_error)?;
+        if !self.finished
+            || !self.available.is_empty()
+            || self.overflow.is_some()
+            || !self.legacy_ready.is_empty()
+        {
             return Ok(false);
         }
         if !self.eof
@@ -1155,6 +1191,7 @@ impl media::VideoDecoder for Decoder {
         Ok(self.eof
             && self.available.is_empty()
             && self.overflow.is_none()
+            && self.legacy_ready.is_empty()
             && self.pending.is_empty()
             && self.dropped.is_empty())
     }
@@ -1279,6 +1316,66 @@ mod tests {
             1536
         );
         assert_ne!(frames[0].planes[0].data[0], 0);
+    }
+
+    #[test]
+    fn conversion_allocation_failure_is_fatal_after_frame_identity() {
+        let stream = include_bytes!("../tests/fixtures/blue_high444_32x32.h264");
+        for stage in [1, 2] {
+            let mut decoder = decoder_for_fixture(stream);
+            // SAFETY: local native decoder; the hook fires only after the
+            // picture has an opaque sample identity in the conversion path.
+            unsafe { rosemary_h264_test_fail_converter_allocation(decoder.handle.as_ptr(), stage) };
+            let outcome = decoder
+                .submit_annex_b(stream, None, None)
+                .and_then(|_| decoder.finish().map(|_| ()));
+            assert_eq!(outcome.unwrap_err(), Error::Codec(-12), "stage {stage}");
+            assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+            assert!(
+                decoder.pending.contains_key(&0),
+                "consumed picture identity lost"
+            );
+            assert!(
+                decoder.take_dropped().is_none(),
+                "fatal ENOMEM became a sample drop"
+            );
+            assert_eq!(
+                decoder.submit_annex_b(stream, None, None).unwrap_err(),
+                Error::Codec(-12)
+            );
+            assert_eq!(decoder.finish().unwrap_err(), Error::Codec(-12));
+        }
+    }
+
+    #[test]
+    fn media_conversion_allocation_failure_is_fatal() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/blue_high444_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let mut packet = Vec::new();
+        for nal in nals_from_fixture(stream) {
+            packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            packet.extend_from_slice(nal);
+        }
+        // SAFETY: native decoder is exclusively owned by the test.
+        unsafe { rosemary_h264_test_fail_converter_allocation(decoder.handle.as_ptr(), 2) };
+        let sample = AccessUnit {
+            id: 733,
+            bytes: &packet,
+            pts_ns: None,
+            dts_ns: None,
+            duration_ns: None,
+        };
+        let result = decoder.submit(sample).and_then(|_| {
+            decoder.end_stream()?;
+            decoder.pull(Duration::ZERO).map(|_| ())
+        });
+        assert!(
+            matches!(result, Err(media::Error::Decode(ref message)) if message.contains("Codec(-12)"))
+        );
+        assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+        assert!(decoder.pending.contains_key(&733));
+        assert!(decoder.take_dropped().is_none());
     }
 
     #[test]
@@ -1739,7 +1836,7 @@ mod tests {
         };
         assert!(
             decoder
-                .process_view(&bad_native, Some(-12))
+                .process_view(&bad_native, Some(Error::InvalidImageLayout))
                 .unwrap()
                 .is_none()
         );
@@ -2478,6 +2575,85 @@ mod tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..59).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn legacy_finish_backpressure_cannot_silently_drain_through_media_api() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let mut unit = Vec::new();
+        let mut frames = Vec::new();
+        for nal in nals_from_fixture(stream) {
+            if nal[0] & 31 == 9 && !unit.is_empty() {
+                frames.extend(decoder.submit_annex_b(&unit, None, None).unwrap());
+                unit.clear();
+            }
+            unit.extend_from_slice(&[0, 0, 0, 1]);
+            unit.extend_from_slice(nal);
+        }
+        if !unit.is_empty() {
+            frames.extend(decoder.submit_annex_b(&unit, None, None).unwrap());
+        }
+        let saved = frames.pop().expect("fixture must emit output before EOS");
+        decoder.legacy_ready.push(saved);
+        for id in 10000..10000 + MAX_QUEUED_DROPS as u64 {
+            decoder
+                .dropped
+                .push_back(media::DroppedSample { id, error: None });
+        }
+        assert_eq!(decoder.finish().unwrap_err(), Error::Backpressure);
+        for _ in 0..MAX_QUEUED_DROPS {
+            assert!(decoder.take_dropped().is_some());
+        }
+        assert!(
+            matches!(decoder.is_drained(), Err(media::Error::InvalidInput(ref reason)) if reason.contains("MixedDecoderApis"))
+        );
+        assert!(matches!(
+            decoder.pull(Duration::ZERO),
+            Err(media::Error::InvalidInput(_))
+        ));
+        assert!(matches!(
+            decoder.end_stream(),
+            Err(media::Error::InvalidInput(_))
+        ));
+        assert!(!decoder.legacy_ready.is_empty());
+        frames.extend(decoder.finish().unwrap());
+        assert!(decoder.legacy_ready.is_empty());
+        frames.sort_by_key(|frame| frame.id);
+        assert_eq!(
+            frames.iter().map(|f| f.id).collect::<Vec<_>>(),
+            (0..8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn trait_decoder_rejects_switching_to_legacy_submission() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let mut packet = Vec::new();
+        for nal in nals_from_fixture(stream) {
+            packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            packet.extend_from_slice(nal);
+        }
+        decoder
+            .submit(AccessUnit {
+                id: 88,
+                bytes: &packet,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        assert_eq!(
+            decoder.submit_annex_b(stream, None, None).unwrap_err(),
+            Error::MixedDecoderApis
+        );
+        assert_eq!(decoder.finish().unwrap_err(), Error::MixedDecoderApis);
+        decoder.end_stream().unwrap();
+        assert_eq!(decoder.pull(Duration::ZERO).unwrap().unwrap().id, 88);
+        assert!(decoder.is_drained().unwrap());
     }
 
     #[test]
