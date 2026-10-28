@@ -73,6 +73,16 @@ Unexpected native conversion failures, including swscale context creation and
 converted-frame allocation `ENOMEM` after FFmpeg identified a picture, latch
 fatal decoder failure without discarding the accepted sample identity.
 
+Every submitted access unit also has a 1024-NAL upper bound, independent of
+the 64 MiB compressed packet limit. FFmpeg allocates per-NAL parser descriptors
+and skipped-byte position arrays that are not charged to native decoded-frame
+buffers. Both AVCC and Annex B input are checked before FFmpeg sees the packet;
+initially prepended SPS/PPS headers count toward the limit. AVCC validation
+also counts embedded Annex B start codes inside unescaped NAL payloads, because
+they become additional parser boundaries after conversion. An over-limit packet
+returns `InvalidPacket` without consuming the sample identity or allocating
+FFmpeg parser metadata.
+
 The `AccessUnit.id` is an opaque sample identity: it need not be numerically
 ordered, but the caller must provide distinct IDs for the life of a session.
 The decoder checks collisions among in-flight outputs, pending inputs, and
@@ -110,7 +120,11 @@ that FFmpeg rejects them before invoking `get_buffer2` fail as native decoder
 errors rather than receiving an invented picture identity. For attributable
 oversize H.264 pictures, either the early SPS check or guarded frame-allocation
 callback reports `SourceFrameTooLarge` using the actual packet identity,
-including when decoding happens during deferred receive. The source-format and bit depth determine these charges (not the
+including when decoding happens during deferred receive. A rejected SPS does
+not by itself imply that the packet's picture was rejected: FFmpeg can recover
+using later valid parameter sets or a previously decoded SPS. Native successful
+frame output takes precedence over a stale metadata-rejection flag, and
+accepted picture identity is completed exactly once. The source-format and bit depth determine these charges (not the
 converted I420 bytes); single-frame decoding threads avoid multiplying the
 reference budget by frame-thread count. Converted buffers and Rust's bounded
 output FIFO are separate allocations. These safeguards limit decoded-picture

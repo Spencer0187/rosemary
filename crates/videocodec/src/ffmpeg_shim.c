@@ -198,6 +198,18 @@ static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame,
             decoder->native_peak_bytes = decoder->native_live_bytes;
         total += bytes;
     }
+    // The early SPS check rejects metadata, not a decoded picture. If FFmpeg
+    // falls back to valid SPS state and allocates a real picture for that same
+    // sample, forget the stale metadata rejection even if output is delayed.
+    if (decoder->source_budget_refused && decoder->source_budget_identity_valid &&
+        frame->opaque_ref && frame->opaque_ref->size == sizeof(uint64_t)) {
+        uint64_t decoded_id;
+        memcpy(&decoded_id, frame->opaque_ref->data, sizeof(decoded_id));
+        if (decoded_id == decoder->source_budget_id) {
+            decoder->source_budget_refused = 0;
+            decoder->source_budget_identity_valid = 0;
+        }
+    }
     return 0;
 }
 
@@ -383,8 +395,10 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     // H.264 maps a failed get_buffer2(ENOMEM) to INVALIDDATA in decode.c.
     // This is a known guarded allocation refusal only when the callback
     // itself recorded it; unrelated errors remain fatal.
+    // An SPS rejected earlier in this packet may be replaced by a valid SPS
+    // before FFmpeg decodes a picture. Do not override native success.
     if (decoder->source_budget_refused &&
-        (result == 0 || result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA))
+        (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA))
         return 4; // Consumed packet, decoder source-frame budget exceeded.
     if (result == AVERROR_INVALIDDATA)
         return 3; // Recoverable corruption, ownership remains tracked.
@@ -436,9 +450,11 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     rosemary_armed_allocation_failure = previous_armed;
     if (decoder->native_allocation_error)
         return decoder->native_allocation_error;
+    // A rejected SPS may precede a successful picture in the same packet;
+    // success belongs to that picture, not the rejected metadata.
     if (decoder->source_budget_refused &&
-        (result == 0 || result == AVERROR(EAGAIN) ||
-         result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA)) {
+        (result == AVERROR(EAGAIN) || result == AVERROR(ENOMEM) ||
+         result == AVERROR_INVALIDDATA)) {
         memset(out, 0, sizeof(*out));
         if (decoder->source_budget_identity_valid) {
             out->identity_valid = 1;

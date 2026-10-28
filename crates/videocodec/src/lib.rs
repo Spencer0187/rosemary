@@ -21,6 +21,9 @@ use std::ptr::NonNull;
 use std::time::Duration;
 
 const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
+// FFmpeg allocates one H2645NAL descriptor and skipped-byte position storage
+// per NAL. Compressed-byte limits alone do not bound that metadata.
+const MAX_NAL_UNITS_PER_ACCESS_UNIT: usize = 1024;
 const AV_FRAME_FLAG_CORRUPT: i32 = 1 << 0;
 // Positive native frame-rejection status, distinct from fatal FFmpeg errors.
 const NATIVE_PICTURE_REJECTED: i32 = 6;
@@ -179,15 +182,42 @@ impl NalLength {
     }
 }
 
-// Validate framing and expanded size before allocating any converted output.
-// This also permits a caller to check malformed input ahead of backpressure.
-fn avcc_annex_b_len(sample: &[u8], length: NalLength) -> Result<usize, Error> {
+// H.264 Annex B uses either 00 00 01 or 00 00 00 01 start codes.
+// Count only the 3-byte suffix so 4-byte prefixes are counted exactly once.
+fn annex_b_nal_count(sample: &[u8]) -> usize {
+    sample
+        .windows(3)
+        .filter(|bytes| *bytes == [0, 0, 1])
+        .count()
+}
+
+fn check_annex_b_nals(sample: &[u8], prepended_headers: &[u8]) -> Result<(), Error> {
+    let count = annex_b_nal_count(sample);
+    let header_count = annex_b_nal_count(prepended_headers);
+    if count > MAX_NAL_UNITS_PER_ACCESS_UNIT.saturating_sub(header_count) {
+        return Err(Error::InvalidPacket);
+    }
+    Ok(())
+}
+
+// Validate framing, expanded size and parser metadata bounds before copying
+// any input or evaluating output backpressure.
+fn avcc_annex_b_len_with_headers(
+    sample: &[u8],
+    length: NalLength,
+    prepended_headers: &[u8],
+) -> Result<usize, Error> {
     if sample.is_empty() || sample.len() > MAX_PACKET_BYTES {
         return Err(Error::InvalidPacket);
     }
     let mut total = 0;
     let mut remaining = sample;
+    let mut count = annex_b_nal_count(prepended_headers);
     while !remaining.is_empty() {
+        count += 1;
+        if count > MAX_NAL_UNITS_PER_ACCESS_UNIT {
+            return Err(Error::InvalidPacket);
+        }
         let width = length.width();
         let Some(prefix) = remaining.get(..width) else {
             return Err(Error::InvalidPacket);
@@ -202,10 +232,21 @@ fn avcc_annex_b_len(sample: &[u8], length: NalLength) -> Result<usize, Error> {
         if nal[0] & 0x1f == 0 || nal[0] & 0x80 != 0 {
             return Err(Error::InvalidPacket);
         }
+        // A malicious length-prefixed NAL can contain unescaped 00 00 01.
+        // Once converted to Annex B, FFmpeg treats these as extra NALs too.
+        let embedded = annex_b_nal_count(nal);
+        count = count.checked_add(embedded).ok_or(Error::InvalidPacket)?;
+        if count > MAX_NAL_UNITS_PER_ACCESS_UNIT {
+            return Err(Error::InvalidPacket);
+        }
         total = checked_packet_size(total, checked_packet_size(4, nal.len())?)?;
         remaining = &remaining[nal_size..];
     }
     Ok(total)
+}
+
+fn avcc_annex_b_len(sample: &[u8], length: NalLength) -> Result<usize, Error> {
+    avcc_annex_b_len_with_headers(sample, length, &[])
 }
 
 /// Converts a validated length-prefixed access unit to Annex B.
@@ -359,7 +400,15 @@ impl Decoder {
             return Err(Error::DuplicateIdentity);
         }
         self.validate_input(self.next_id, pts, dts)?;
-        let expanded = avcc_annex_b_len(sample, self.length)?;
+        let expanded = avcc_annex_b_len_with_headers(
+            sample,
+            self.length,
+            if self.needs_headers {
+                &self.headers
+            } else {
+                &[]
+            },
+        )?;
         if self.needs_headers {
             checked_packet_size(self.headers.len(), expanded)?;
         }
@@ -408,6 +457,14 @@ impl Decoder {
         if sample.is_empty() || sample.len() > MAX_PACKET_BYTES {
             return Err(Error::InvalidPacket);
         }
+        check_annex_b_nals(
+            sample,
+            if self.needs_headers {
+                &self.headers
+            } else {
+                &[]
+            },
+        )?;
         if self.dropped.len() >= MAX_QUEUED_DROPS {
             return Err(Error::Backpressure);
         }
@@ -1101,7 +1158,16 @@ impl media::VideoDecoder for Decoder {
         // Input validation precedes backpressure and never consumes the packet.
         self.validate_input(packet.id, packet.pts_ns, packet.dts_ns)
             .map_err(media_error)?;
-        let expanded_bytes = avcc_annex_b_len(packet.bytes, self.length).map_err(media_error)?;
+        let expanded_bytes = avcc_annex_b_len_with_headers(
+            packet.bytes,
+            self.length,
+            if self.needs_headers {
+                &self.headers
+            } else {
+                &[]
+            },
+        )
+        .map_err(media_error)?;
         if self.needs_headers {
             checked_packet_size(self.headers.len(), expanded_bytes).map_err(media_error)?;
         }
@@ -1281,6 +1347,221 @@ mod tests {
             .collect();
         assert_eq!(parameter_sets.len(), 2);
         Decoder::new(&parameter_sets, NalLength::Four).unwrap()
+    }
+
+    #[test]
+    fn many_small_nals_are_rejected_before_native_parse_on_both_apis() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        // 1025 tiny NALs require barely five KiB of compressed input, yet
+        // FFmpeg allocates a descriptor and skipped-byte metadata for each.
+        let mut annex_b = Vec::new();
+        let mut avcc = Vec::new();
+        for _ in 0..MAX_NAL_UNITS_PER_ACCESS_UNIT + 1 {
+            annex_b.extend_from_slice(&[0, 0, 0, 1, 0x09]);
+            avcc.extend_from_slice(&[0, 0, 0, 1, 0x09]);
+        }
+        assert_eq!(annex_b.len(), (MAX_NAL_UNITS_PER_ACCESS_UNIT + 1) * 5);
+        assert_eq!(
+            annex_b_nal_count(&annex_b),
+            MAX_NAL_UNITS_PER_ACCESS_UNIT + 1
+        );
+        assert_eq!(
+            avcc_annex_b_len(&avcc, NalLength::Four),
+            Err(Error::InvalidPacket)
+        );
+        assert_eq!(
+            avcc_to_annex_b(&avcc, NalLength::Four),
+            Err(Error::InvalidPacket)
+        );
+        assert_eq!(check_annex_b_nals(&annex_b, &[]), Err(Error::InvalidPacket));
+
+        let mut legacy = decoder_for_fixture(stream);
+        assert_eq!(
+            legacy.submit_annex_b(&annex_b, None, None).unwrap_err(),
+            Error::InvalidPacket
+        );
+        assert_eq!(
+            legacy.submit_avcc(&avcc, None, None).unwrap_err(),
+            Error::InvalidPacket
+        );
+        assert_eq!(legacy.next_id, 0);
+        assert!(legacy.pending.is_empty());
+        assert!(legacy.dropped.is_empty());
+        assert!(legacy.fatal.is_none());
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(legacy.handle.as_ptr()) },
+            0
+        );
+
+        let mut media_decoder = decoder_for_fixture(stream);
+        media_decoder.queued_bytes = MAX_QUEUED_BYTES;
+        let result = media_decoder.submit(AccessUnit {
+            id: 991,
+            bytes: &avcc,
+            pts_ns: None,
+            dts_ns: None,
+            duration_ns: None,
+        });
+        assert!(matches!(result, Err(media::Error::InvalidInput(_))));
+        assert!(!media_decoder.id_in_flight(991));
+        assert!(media_decoder.dropped.is_empty());
+        assert!(media_decoder.fatal.is_none());
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(media_decoder.handle.as_ptr()) },
+            0
+        );
+    }
+
+    #[test]
+    fn nal_cap_includes_automatically_prepended_headers() {
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let headers = annex_b_nal_count(&decoder.headers);
+        assert_eq!(headers, 2);
+        // A 1024-NAL payload fits the raw limit, but adding initial SPS/PPS
+        // would exceed FFmpeg's per-packet parser metadata ceiling.
+        let nals = MAX_NAL_UNITS_PER_ACCESS_UNIT - headers + 1;
+        let annex_b = [0, 0, 0, 1, 0x09].repeat(nals);
+        let avcc = [0, 0, 0, 1, 0x09].repeat(nals);
+        assert!(check_annex_b_nals(&annex_b, &[]).is_ok());
+        assert_eq!(avcc_annex_b_len(&avcc, NalLength::Four), Ok(avcc.len()));
+        assert_eq!(
+            decoder.submit_annex_b(&annex_b, None, None).unwrap_err(),
+            Error::InvalidPacket
+        );
+        assert_eq!(
+            decoder.submit_avcc(&avcc, None, None).unwrap_err(),
+            Error::InvalidPacket
+        );
+        assert_eq!(decoder.next_id, 0);
+        assert!(decoder.pending.is_empty());
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
+            0
+        );
+
+        use mediabackend::VideoDecoder;
+        let mut media_decoder = decoder_for_fixture(stream);
+        assert!(matches!(
+            media_decoder.submit(AccessUnit {
+                id: 904,
+                bytes: &avcc,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            }),
+            Err(media::Error::InvalidInput(_))
+        ));
+        assert!(!media_decoder.id_in_flight(904));
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(media_decoder.handle.as_ptr()) },
+            0
+        );
+    }
+
+    #[test]
+    fn avcc_embedded_start_codes_are_charged_as_parser_nals() {
+        // One length-prefixed NAL can expand into over a thousand start-code
+        // separated NALs if malicious contents are copied into Annex B.
+        let mut nal = Vec::with_capacity(1 + (MAX_NAL_UNITS_PER_ACCESS_UNIT * 4));
+        nal.push(0x65);
+        for _ in 0..MAX_NAL_UNITS_PER_ACCESS_UNIT {
+            nal.extend_from_slice(&[0, 0, 1, 0x09]);
+        }
+        let mut avcc = Vec::from((nal.len() as u32).to_be_bytes());
+        avcc.extend_from_slice(&nal);
+        assert_eq!(
+            avcc_annex_b_len(&avcc, NalLength::Four),
+            Err(Error::InvalidPacket)
+        );
+        assert_eq!(
+            avcc_to_annex_b(&avcc, NalLength::Four),
+            Err(Error::InvalidPacket)
+        );
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        assert_eq!(
+            decoder.submit_avcc(&avcc, None, None).unwrap_err(),
+            Error::InvalidPacket
+        );
+        assert!(decoder.pending.is_empty());
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
+            0
+        );
+    }
+
+    #[test]
+    fn million_tiny_nals_fail_before_ffmpeg_allocation() {
+        // An access unit far below 64 MiB previously expanded into millions
+        // of H2645NAL descriptors plus skipped-byte metadata arrays.
+        let sample = [0, 0, 0, 1, 0x09].repeat(1_000_000);
+        assert_eq!(sample.len(), 5_000_000);
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        assert_eq!(
+            decoder.submit_annex_b(&sample, None, None).unwrap_err(),
+            Error::InvalidPacket
+        );
+        assert!(decoder.pending.is_empty());
+        assert!(decoder.fatal.is_none());
+        assert_eq!(
+            unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
+            0
+        );
+    }
+
+    #[test]
+    fn start_code_nal_limit_counts_both_prefix_lengths() {
+        let mut sample = [0, 0, 0, 1, 0x09].repeat(MAX_NAL_UNITS_PER_ACCESS_UNIT / 2);
+        sample.extend([0, 0, 1, 0x09].repeat(MAX_NAL_UNITS_PER_ACCESS_UNIT / 2));
+        assert_eq!(annex_b_nal_count(&sample), MAX_NAL_UNITS_PER_ACCESS_UNIT);
+        assert!(check_annex_b_nals(&sample, &[]).is_ok());
+        sample.extend_from_slice(&[0, 0, 1, 0x09]);
+        assert_eq!(check_annex_b_nals(&sample, &[]), Err(Error::InvalidPacket));
+    }
+
+    #[test]
+    fn superseded_oversized_sps_does_not_steal_valid_frame_completion() {
+        let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let bad_sps = nals_from_fixture(huge)
+            .into_iter()
+            .find(|nal| nal.first().is_some_and(|header| header & 0x1f == 7))
+            .unwrap();
+        let mut annex_b = Vec::from([0, 0, 0, 1]);
+        annex_b.extend_from_slice(bad_sps);
+        annex_b.extend_from_slice(small);
+
+        let mut legacy = decoder_for_fixture(small);
+        let mut frames = legacy.submit_annex_b(&annex_b, None, None).unwrap();
+        frames.extend(legacy.finish().unwrap());
+        assert_eq!(frames.iter().map(|frame| frame.id).collect::<Vec<_>>(), [0]);
+        assert!(legacy.take_dropped().is_none());
+        assert!(legacy.pending.is_empty());
+
+        use mediabackend::VideoDecoder;
+        let mut media_decoder = decoder_for_fixture(small);
+        let mut packet = Vec::new();
+        for nal in nals_from_fixture(&annex_b) {
+            packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            packet.extend_from_slice(nal);
+        }
+        media_decoder
+            .submit(AccessUnit {
+                id: 902,
+                bytes: &packet,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        media_decoder.end_stream().unwrap();
+        assert_eq!(media_decoder.pull(Duration::ZERO).unwrap().unwrap().id, 902);
+        assert!(media_decoder.pull(Duration::ZERO).unwrap().is_none());
+        assert!(media_decoder.take_dropped().is_none());
+        assert!(media_decoder.is_drained().unwrap());
     }
 
     #[test]
@@ -2067,7 +2348,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_sps_deferred_receive_attributes_drop_and_recovers() {
+    fn deferred_oversized_sps_does_not_override_decoded_picture() {
         let small = include_bytes!("../tests/fixtures/red_32x32.h264");
         let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
         let mut decoder = decoder_for_fixture(small);
@@ -2097,19 +2378,15 @@ mod tests {
         assert_eq!(decoder.receive_one().unwrap().unwrap().id, 101);
         let tables_before_oversized =
             unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) };
-        assert!(decoder.receive_one().unwrap().is_none());
+        // The invalid oversized SPS does not replace the prior valid SPS;
+        // FFmpeg still decodes this picture with its previous parameters.
+        assert_eq!(decoder.receive_one().unwrap().unwrap().id, 202);
         assert_eq!(
             unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
             tables_before_oversized,
             "oversized SPS initialized macroblock tables"
         );
-        let drops = std::iter::from_fn(|| decoder.take_dropped()).collect::<Vec<_>>();
-        assert_eq!(drops.len(), 1);
-        assert_eq!(drops[0].id, 202);
-        assert!(
-            matches!(drops[0].error, Some(media::Error::Decode(ref message))
-            if message.contains("SourceFrameTooLarge"))
-        );
+        assert!(decoder.take_dropped().is_none());
         assert!(decoder.pending.is_empty());
         assert!(decoder.fatal.is_none());
         let peak = unsafe { rosemary_h264_native_peak_bytes(decoder.handle.as_ptr()) };
