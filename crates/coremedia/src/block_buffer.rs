@@ -34,8 +34,9 @@ struct Allocation {
     capacity: usize,
 }
 
-// The allocation pointer is read, allocated and freed only while its shared
-// Mutex is held, so distinct buffer views can own it across threads.
+// The backing pointer and all framework-mediated byte accesses are protected
+// by the shared Mutex<Allocation>. Distinct views have independent Storage
+// locks, which are NOT sufficient to synchronize overlapping byte accesses.
 unsafe impl Send for Allocation {}
 
 impl Allocation {
@@ -89,12 +90,44 @@ impl Storage {
         Ok(unsafe { shared.memory.add(self.start + offset) })
     }
 
-    fn pointer_assuring_allocation(&mut self, offset: usize) -> Result<*mut u8, i32> {
-        let status = self.allocate();
-        if status != 0 {
-            return Err(status);
+    /// Copy bytes while holding the allocation lock for the entire operation.
+    /// All views acquire locks in the same order: Storage -> Allocation.
+    ///
+    /// # Safety
+    /// `destination` must address `length` writable bytes and must not be
+    /// concurrently accessed except through this allocation's serialized APIs.
+    unsafe fn copy_bytes(&self, offset: usize, length: usize, destination: *mut u8) -> i32 {
+        let shared = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.memory.is_null() {
+            return UNALLOCATED_BLOCK;
         }
-        self.pointer(offset)
+        // SAFETY: bounds were checked by the caller and the shared allocation
+        // cannot be freed or modified by another view while this lock is held.
+        // ptr::copy has memmove semantics, including overlapping guest slices.
+        unsafe {
+            core::ptr::copy(shared.memory.add(self.start + offset), destination, length);
+        }
+        0
+    }
+
+    /// Replacement is allowed to allocate deferred memory, and serializes the
+    /// complete copy with reads/writes through any other view of the allocation.
+    ///
+    /// # Safety
+    /// `source` must address `length` readable bytes and must not be
+    /// concurrently modified outside this allocation's serialized APIs.
+    unsafe fn replace_bytes(&self, offset: usize, length: usize, source: *const u8) -> i32 {
+        let mut shared = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
+        let status = shared.allocate();
+        if status != 0 {
+            return status;
+        }
+        // SAFETY: the destination extent was checked by the caller; source is
+        // caller-validated memory. ptr::copy is overlap-safe under this lock.
+        unsafe {
+            core::ptr::copy(source, shared.memory.add(self.start + offset), length);
+        }
+        0
     }
 }
 
@@ -446,13 +479,9 @@ pub unsafe extern "C" fn CMBlockBufferCopyDataBytes(
     if destination.is_null() {
         return BAD_POINTER;
     }
-    let pointer = match guard.pointer(offset) {
-        Ok(pointer) => pointer,
-        Err(status) => return status,
-    };
-    // SAFETY: checked the ranges; copy also permits overlapping guest slices.
-    unsafe { core::ptr::copy(pointer, destination.cast(), length) };
-    0
+    // SAFETY: caller supplies destination storage; bounds were checked above.
+    // The shared allocation lock stays held across the *entire* read.
+    unsafe { guard.copy_bytes(offset, length, destination.cast()) }
 }
 
 /// # Safety
@@ -466,7 +495,7 @@ pub unsafe extern "C" fn CMBlockBufferReplaceDataBytes(
     let Some(contents) = (unsafe { storage(handle) }) else {
         return BAD_POINTER;
     };
-    let mut guard = contents.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = contents.lock().unwrap_or_else(|e| e.into_inner());
     if offset > guard.length {
         return BAD_OFFSET;
     }
@@ -476,13 +505,9 @@ pub unsafe extern "C" fn CMBlockBufferReplaceDataBytes(
     if source.is_null() {
         return BAD_POINTER;
     }
-    let pointer = match guard.pointer_assuring_allocation(offset) {
-        Ok(pointer) => pointer,
-        Err(status) => return status,
-    };
-    // SAFETY: checked destination bounds; caller supplies source range.
-    unsafe { core::ptr::copy(source.cast::<u8>(), pointer, length) };
-    0
+    // SAFETY: caller supplies source storage; bounds were checked above.
+    // Allocation and the *entire* replacement happen under the shared lock.
+    unsafe { guard.replace_bytes(offset, length, source.cast()) }
 }
 
 #[cfg(test)]
@@ -866,6 +891,200 @@ mod tests {
             corefoundation::api::CFRelease(copy);
             assert_eq!(CMBlockBufferGetDataLength(copy), 3);
             corefoundation::api::CFRelease(copy);
+            corefoundation::api::CFRelease(source);
+        }
+    }
+
+    #[test]
+    fn concurrent_alias_reads_and_replacements_are_serialized() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        const LEN: usize = 128 * 1024;
+        const ITERATIONS: usize = 800;
+        let mut source = core::ptr::null();
+        let mut alias = core::ptr::null();
+        let mut second_alias = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    LEN,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    LEN,
+                    ASSURE_NOW,
+                    &mut source,
+                ),
+                0
+            );
+            for target in [&mut alias, &mut second_alias] {
+                assert_eq!(
+                    CMBlockBufferCreateContiguous(
+                        core::ptr::null(),
+                        source,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                        LEN,
+                        0,
+                        target,
+                    ),
+                    0
+                );
+            }
+        }
+        // The reader may acquire the first lock before either writer runs.
+        // Initialize the allocation so its first snapshot is well-defined.
+        let initial = vec![0x11u8; LEN];
+        assert_eq!(
+            unsafe { CMBlockBufferReplaceDataBytes(initial.as_ptr().cast(), source, 0, LEN) },
+            0
+        );
+        // Hold all CF refs through the scoped workers. Pass the pointer bits,
+        // not Rust references to the foreign CF objects, to worker threads.
+        let (source, alias, second_alias) =
+            (source as usize, alias as usize, second_alias as usize);
+        let barrier = Arc::new(Barrier::new(3));
+        thread::scope(|scope| {
+            let writer_barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                let a = vec![0x55u8; LEN];
+                let b = vec![0xaau8; LEN];
+                writer_barrier.wait();
+                for i in 0..ITERATIONS {
+                    let bytes = if i % 2 == 0 { &a } else { &b };
+                    assert_eq!(
+                        unsafe {
+                            CMBlockBufferReplaceDataBytes(
+                                bytes.as_ptr().cast(),
+                                source as *const c_void,
+                                0,
+                                LEN,
+                            )
+                        },
+                        0
+                    );
+                }
+            });
+            let second_writer_barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                let a = vec![0x33u8; LEN];
+                let b = vec![0xccu8; LEN];
+                second_writer_barrier.wait();
+                for i in 0..ITERATIONS {
+                    let bytes = if i % 2 == 0 { &a } else { &b };
+                    assert_eq!(
+                        unsafe {
+                            CMBlockBufferReplaceDataBytes(
+                                bytes.as_ptr().cast(),
+                                alias as *const c_void,
+                                0,
+                                LEN,
+                            )
+                        },
+                        0
+                    );
+                }
+            });
+            let mut copied = vec![0u8; LEN];
+            barrier.wait();
+            for _ in 0..ITERATIONS {
+                assert_eq!(
+                    unsafe {
+                        CMBlockBufferCopyDataBytes(
+                            second_alias as *const c_void,
+                            0,
+                            LEN,
+                            copied.as_mut_ptr().cast(),
+                        )
+                    },
+                    0
+                );
+                // Each snapshot must be one complete replacement; the shared
+                // allocation mutex forbids torn snapshots across views.
+                assert!(
+                    copied.iter().all(|&b| b == copied[0]),
+                    "torn cross-view read"
+                );
+            }
+        });
+        unsafe {
+            corefoundation::api::CFRelease(second_alias as *const c_void);
+            corefoundation::api::CFRelease(alias as *const c_void);
+            corefoundation::api::CFRelease(source as *const c_void);
+        }
+    }
+
+    #[test]
+    fn overlapping_copy_between_aliases_uses_memmove_semantics() {
+        let mut source = core::ptr::null();
+        let mut view = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    8,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    8,
+                    ASSURE_NOW,
+                    &mut source,
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"abcdefgh".as_ptr().cast(), source, 0, 8),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferCreateContiguous(
+                    core::ptr::null(),
+                    source,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    8,
+                    0,
+                    &mut view,
+                ),
+                0
+            );
+            let mut ptr = core::ptr::null_mut();
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    view,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut ptr
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(source, 0, 6, ptr.add(2).cast()),
+                0
+            );
+            let mut observed = [0u8; 8];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(view, 0, 8, observed.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&observed, b"ababcdef");
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(ptr.add(2).cast(), view, 0, 6),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(source, 0, 8, observed.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&observed, b"abcdefef");
+            corefoundation::api::CFRelease(view);
             corefoundation::api::CFRelease(source);
         }
     }
