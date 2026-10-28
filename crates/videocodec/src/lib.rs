@@ -156,13 +156,13 @@ impl NalLength {
     }
 }
 
-/// Converts a single AVCC access unit to Annex B, validating every length field.
-/// An empty or incomplete sample must never enter the native codec.
-pub fn avcc_to_annex_b(sample: &[u8], length: NalLength) -> Result<Vec<u8>, Error> {
+// Validate framing and expanded size before allocating any converted output.
+// This also permits a caller to check malformed input ahead of backpressure.
+fn avcc_annex_b_len(sample: &[u8], length: NalLength) -> Result<usize, Error> {
     if sample.is_empty() || sample.len() > MAX_PACKET_BYTES {
         return Err(Error::InvalidPacket);
     }
-    let mut out = Vec::new();
+    let mut total = 0;
     let mut remaining = sample;
     while !remaining.is_empty() {
         let width = length.width();
@@ -179,9 +179,25 @@ pub fn avcc_to_annex_b(sample: &[u8], length: NalLength) -> Result<Vec<u8>, Erro
         if nal[0] & 0x1f == 0 || nal[0] & 0x80 != 0 {
             return Err(Error::InvalidPacket);
         }
-        checked_packet_size(out.len(), checked_packet_size(4, nal.len())?)?;
+        total = checked_packet_size(total, checked_packet_size(4, nal.len())?)?;
+        remaining = &remaining[nal_size..];
+    }
+    Ok(total)
+}
+
+/// Converts a validated length-prefixed access unit to Annex B.
+pub fn avcc_to_annex_b(sample: &[u8], length: NalLength) -> Result<Vec<u8>, Error> {
+    let length_bytes = avcc_annex_b_len(sample, length)?;
+    let mut out = Vec::with_capacity(length_bytes);
+    let mut remaining = sample;
+    while !remaining.is_empty() {
+        let width = length.width();
+        let nal_size = remaining[..width]
+            .iter()
+            .fold(0usize, |value, &byte| (value << 8) | usize::from(byte));
+        remaining = &remaining[width..];
         out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(nal);
+        out.extend_from_slice(&remaining[..nal_size]);
         remaining = &remaining[nal_size..];
     }
     Ok(out)
@@ -951,9 +967,9 @@ impl media::VideoDecoder for Decoder {
         // Input validation precedes backpressure and never consumes the packet.
         self.validate_input(packet.id, packet.pts_ns, packet.dts_ns)
             .map_err(media_error)?;
-        let bytes = avcc_to_annex_b(packet.bytes, self.length).map_err(media_error)?;
+        let expanded_bytes = avcc_annex_b_len(packet.bytes, self.length).map_err(media_error)?;
         if self.needs_headers {
-            checked_packet_size(self.headers.len(), bytes.len()).map_err(media_error)?;
+            checked_packet_size(self.headers.len(), expanded_bytes).map_err(media_error)?;
         }
         if !self.queue_has_room() {
             return Err(media::Error::Backpressure);
@@ -962,6 +978,7 @@ impl media::VideoDecoder for Decoder {
         if !self.queue_has_room() {
             return Err(media::Error::Backpressure);
         }
+        let bytes = avcc_to_annex_b(packet.bytes, self.length).map_err(media_error)?;
         let prefixed;
         let raw = if self.needs_headers {
             prefixed = prepend_headers(&self.headers, &bytes).map_err(media_error)?;
@@ -1159,6 +1176,33 @@ mod tests {
             1536
         );
         assert_ne!(frames[0].planes[0].data[0], 0);
+    }
+
+    #[test]
+    fn rgb_gbrp_h264_conversion_reports_ycbcr_matrix_and_red_pixels() {
+        // Encoded with libx264rgb from pure red RGB24, as AVCOL_SPC_RGB GBRP.
+        let stream = include_bytes!("../tests/fixtures/rgb_gbrp_red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let mut frames = decoder.submit_annex_b(stream, Some(11), None).unwrap();
+        frames.extend(decoder.finish().unwrap());
+        assert_eq!(frames.len(), 1);
+        let frame = &frames[0];
+        assert_eq!(frame.format, PixelFormat::I420);
+        assert_eq!(frame.layout.matrix, ColorMatrix::Bt601);
+        assert_eq!(frame.layout.full_range, Some(true));
+        assert_eq!((frame.width, frame.height), (32, 32));
+        // Full-range BT.601 red is approximately Y=76, U=85, V=255.
+        // Check all three planes so that matrix metadata cannot mask a
+        // broken RGB-to-YUV swscale conversion.
+        assert!(frame.planes[0].data.iter().all(|&y| (72..=85).contains(&y)));
+        assert!(frame.planes[1].data.iter().all(|&u| (79..=93).contains(&u)));
+        assert!(
+            frame.planes[2]
+                .data
+                .iter()
+                .all(|&v| (245..=255).contains(&v))
+        );
+        assert!(decoder.take_dropped().is_none());
     }
 
     #[test]
@@ -1644,6 +1688,67 @@ mod tests {
         assert!(!decoder.id_in_flight(9));
         decoder.queued_bytes = 0;
         assert!(decoder.fatal.is_none());
+    }
+
+    #[test]
+    fn avcc_structure_and_expansion_are_validated_before_queue_admission() {
+        use mediabackend::VideoDecoder;
+        let nals = [0x67, 0x42, 0x80, 0x68, 0x01, 0x65, 0x90];
+        let sample = [
+            0, 0, 0, 3, nals[0], nals[1], nals[2], 0, 0, 0, 2, nals[3], nals[4], 0, 0, 0, 2,
+            nals[5], nals[6],
+        ];
+        let length = avcc_annex_b_len(&sample, NalLength::Four).unwrap();
+        assert_eq!(length, sample.len());
+        assert_eq!(
+            avcc_to_annex_b(&sample, NalLength::Four).unwrap().len(),
+            length
+        );
+        for malformed in [
+            &sample[..sample.len() - 1],
+            &[0, 0, 0, 2, 0x80, 0x01][..],
+            &[0, 0, 0, 0][..],
+        ] {
+            assert_eq!(
+                avcc_annex_b_len(malformed, NalLength::Four),
+                Err(Error::InvalidPacket)
+            );
+            assert_eq!(
+                avcc_to_annex_b(malformed, NalLength::Four),
+                Err(Error::InvalidPacket)
+            );
+        }
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        decoder.queued_bytes = MAX_QUEUED_BYTES;
+        // A multi-megabyte valid compressed sample must be rejected at the
+        // admission boundary without expanding it into a second allocation.
+        let mut big = vec![0u8; 4 + 4 * 1024 * 1024];
+        big[..4].copy_from_slice(&(4 * 1024 * 1024u32).to_be_bytes());
+        big[4] = 0x65;
+        assert_eq!(avcc_annex_b_len(&big, NalLength::Four), Ok(big.len()));
+        assert!(matches!(
+            decoder.submit(AccessUnit {
+                id: 55,
+                bytes: &big,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            }),
+            Err(media::Error::Backpressure)
+        ));
+        assert!(!decoder.id_in_flight(55));
+        assert!(matches!(
+            decoder.submit(AccessUnit {
+                id: 55,
+                bytes: &big[..big.len() - 1],
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            }),
+            Err(media::Error::InvalidInput(_))
+        ));
+        assert!(!decoder.id_in_flight(55));
     }
 
     #[test]

@@ -136,10 +136,20 @@ fn main() {
     recipe.update(compiler_path.as_bytes());
     recipe.update(&compiler_version.stdout);
     recipe.update(&compiler_version.stderr);
-    for arg in shim_compiler.args() {
-        recipe.update(arg.to_string_lossy().as_bytes());
-        recipe.update([0]);
-    }
+    let compiler_cflags = shim_compiler
+        .args()
+        .iter()
+        .map(|arg| {
+            let arg = arg.to_str().expect("non-UTF8 native compiler argument");
+            assert!(
+                !arg.chars().any(char::is_whitespace),
+                "FFmpeg cannot safely pass compiler arguments containing whitespace: {arg:?}"
+            );
+            arg
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    recipe.update(compiler_cflags.as_bytes());
     if let Some(nasm) = &nasm_version {
         recipe.update(&nasm.stdout);
         recipe.update(&nasm.stderr);
@@ -213,6 +223,10 @@ fn main() {
             .current_dir(&build)
             .arg(format!("--prefix={}", install.display()))
             .arg(format!("--cc={compiler_path}"))
+            .arg(format!("--extra-cflags={compiler_cflags}"))
+            // FFmpeg links configure probes through the C driver. Keep ABI,
+            // target and sysroot arguments in those invocations as well.
+            .arg(format!("--extra-ldflags={compiler_cflags}"))
             .args([
                 "--disable-programs",
                 "--disable-doc",

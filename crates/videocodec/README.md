@@ -70,7 +70,9 @@ The `AccessUnit.id` is an opaque sample identity: it need not be numerically
 ordered, but the caller must provide distinct IDs for the life of a session.
 The decoder checks collisions among in-flight outputs, pending inputs, and
 unconsumed dropped notifications without retaining an unbounded set of all
-historical IDs. Malformed inputs are validated before checking backpressure.
+historical IDs. AVCC framing, NAL headers and expanded packet size are
+validated before checking backpressure, but the Annex B output allocation
+and copy occur only after the output queue admits the packet.
 The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
 with automatically assigned IDs and plane-based `Frame` output. When the
 completion queue stalls, these methods and `finish()` return recoverable
@@ -108,7 +110,11 @@ BT.2020 constant-luminance signals map to the distinct shared
 Native I420/NV12 output retains its signaled metadata. Converting an
 unsupported bit depth/chroma format using BT.2020 constant-luminance
 coefficients fails for that specific picture, rather than silently
-applying BT.601 conversion coefficients.
+applying BT.601 conversion coefficients. For other uncommon input formats,
+swscale's selected YCbCr coefficients are also checked against the signaled
+matrix; unsupported matrices are rejected as frame-local conversion errors.
+Decoded planar RGB (GBRP) H.264 uses an explicit BT.601 conversion, and
+its I420 output reports BT.601 rather than the original RGB matrix.
 
 Arch packaging supplies checksum-verified, pinned FFmpeg source explicitly
 via `ROSEMARY_FFMPEG_SOURCE`. The build script independently verifies the
@@ -120,5 +126,6 @@ exact number receive `InvalidTimestamp` rather than silent corruption.
 
 The FFmpeg build-recipe fingerprint includes the resolved C compiler and
 version, compiler arguments, detected assembler version, source provenance,
-target, and native-build environment variables. Toolchain changes therefore
+target, and native-build environment variables. The resolved compiler flags
+are also passed to FFmpeg's C and linker invocations, not only fingerprinted. Toolchain changes therefore
 invalidate cached native FFmpeg archives before the shim is rebuilt.

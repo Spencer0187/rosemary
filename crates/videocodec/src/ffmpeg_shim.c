@@ -264,6 +264,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if (f->width <= 0 || f->height <= 0 || f->width > 32768 || f->height > 32768)
         return AVERROR_INVALIDDATA;
     AVFrame *source = f;
+    int output_colorspace = source->colorspace;
     int color_range = f->color_range;
     if (color_range == AVCOL_RANGE_UNSPECIFIED && f->format == AV_PIX_FMT_YUVJ420P)
         color_range = AVCOL_RANGE_JPEG;
@@ -272,10 +273,24 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     // Ordinary 8-bit 4:2:0 frames keep their native memory layout.
     if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P &&
         f->format != AV_PIX_FMT_NV12) {
-        // swscale has non-constant-luminance BT.2020 coefficients only.
-        // Do not silently decode BT.2020 CL using the BT.601 matrix.
-        if (source->colorspace == AVCOL_SPC_BT2020_CL)
-            return AVERROR_INVALIDDATA;
+        int sws_matrix;
+        switch (source->colorspace) {
+        case AVCOL_SPC_RGB:
+        case AVCOL_SPC_UNSPECIFIED:
+            // swscale emits BT.601 YCbCr even for planar RGB input. The
+            // output matrix describes converted pixels, not source pixels.
+            sws_matrix = SWS_CS_ITU601;
+            output_colorspace = AVCOL_SPC_SMPTE170M;
+            break;
+        case AVCOL_SPC_BT709: sws_matrix = SWS_CS_ITU709; break;
+        case AVCOL_SPC_FCC: sws_matrix = SWS_CS_FCC; break;
+        case AVCOL_SPC_BT470BG:
+        case AVCOL_SPC_SMPTE170M: sws_matrix = SWS_CS_ITU601; break;
+        case AVCOL_SPC_SMPTE240M: sws_matrix = SWS_CS_SMPTE240M; break;
+        case AVCOL_SPC_BT2020_NCL: sws_matrix = SWS_CS_BT2020; break;
+        // In particular, swscale cannot implement BT.2020 constant-luminance.
+        default: return AVERROR_INVALIDDATA;
+        }
         decoder->converter = sws_getCachedContext(
             decoder->converter, f->width, f->height, f->format,
             f->width, f->height, AV_PIX_FMT_YUV420P,
@@ -288,9 +303,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         // The output range is explicitly the source range. If unknown, use
         // swscale's documented limited-range default but do not claim it was signaled.
         int full = color_range == AVCOL_RANGE_JPEG;
-        const int *coefficients = sws_getCoefficients(
-            source->colorspace == AVCOL_SPC_BT709 ? SWS_CS_ITU709 :
-            source->colorspace == AVCOL_SPC_BT2020_NCL ? SWS_CS_BT2020 : SWS_CS_ITU601);
+        const int *coefficients = sws_getCoefficients(sws_matrix);
         if (sws_setColorspaceDetails(decoder->converter, coefficients, full,
                 coefficients, full, brightness, contrast, saturation) < 0)
             return AVERROR_INVALIDDATA;
@@ -313,7 +326,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     out->format = fmt;
     out->pts = source->best_effort_timestamp;
     out->color_range = color_range;
-    out->colorspace = source->colorspace;
+    out->colorspace = output_colorspace;
     out->primaries = source->color_primaries;
     out->transfer = source->color_trc;
     out->chroma_location = f == source ? source->chroma_location : AVCHROMA_LOC_UNSPECIFIED;
