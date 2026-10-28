@@ -1,0 +1,56 @@
+name: video decoder
+
+on:
+  pull_request:
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/videocodec/**'
+      - 'crates/mediabackend/**'
+      - '.github/workflows/videocodec.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/videocodec/**'
+      - 'crates/mediabackend/**'
+      - '.github/workflows/videocodec.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Confirm the unshipped decoder is opt-in
+        run: |
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/workspace.json"
+          python3 - "$RUNNER_TEMP/workspace.json" <<'PY'
+          import json, sys
+          with open(sys.argv[1], encoding='utf-8') as f:
+              metadata = json.load(f)
+          packages = {p['name']: p['id'] for p in metadata['packages']}
+          assert packages['videocodec'] in metadata['workspace_members']
+          assert packages['videocodec'] not in metadata['workspace_default_members']
+          assert packages['rosemary'] in metadata['workspace_default_members']
+          PY
+      - name: Prefetch immutable FFmpeg source
+        run: |
+          mkdir -p "$RUNNER_TEMP/ffmpeg-source"
+          curl --fail --location --retry 3 \
+            'https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/946fcce07b6dcd0331c8cc609192aeff5e1924f8' \
+            | tar -xz --strip-components=1 -C "$RUNNER_TEMP/ffmpeg-source"
+      - name: Test decoder and source integrity
+        env:
+          ROSEMARY_FFMPEG_SOURCE: ${{ runner.temp }}/ffmpeg-source
+        run: cargo test --locked --release -p videocodec --all-targets
+      - name: Strict Clippy
+        env:
+          ROSEMARY_FFMPEG_SOURCE: ${{ runner.temp }}/ffmpeg-source
+        run: cargo clippy --locked -p videocodec -p mediabackend --all-targets -- -D warnings

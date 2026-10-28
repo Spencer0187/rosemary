@@ -1,6 +1,47 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+# Retain the existing default workspace coverage without implicitly building the
+# unshipped, source-fetching software decoder. It is still a workspace member:
+# use `-p videocodec` or `--workspace` to build and test it explicitly.
+default-members = [
+    "crates/appkit",
+    "crates/applicationservices",
+    "crates/audiotoolbox",
+    "crates/avfoundation",
+    "crates/chrome",
+    "crates/contacts",
+    "crates/coreaudio",
+    "crates/corefoundation",
+    "crates/coremedia",
+    "crates/coreservices",
+    "crates/coretext",
+    "crates/corevideo",
+    "crates/darwin",
+    "crates/exports",
+    "crates/forcefeedback",
+    "crates/foundation",
+    "crates/gamecontroller",
+    "crates/iokit",
+    "crates/iosurface",
+    "crates/launcher",
+    "crates/machish",
+    "crates/mediabackend",
+    "crates/metal",
+    "crates/metal_translate",
+    "crates/network",
+    "crates/objc",
+    "crates/opencl",
+    "crates/posix-regex",
+    "crates/prefix",
+    "crates/rosemary",
+    "crates/sdl3",
+    "crates/security",
+    "crates/server",
+    "crates/starnix",
+    "crates/videotoolbox",
+    "crates/webkit",
+]
 exclude = ["third_party"]
 
 [workspace.package]

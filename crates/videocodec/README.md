@@ -8,10 +8,14 @@ necessary FFmpeg libraries from the exact source revision identified in
 Build prerequisites are a C compiler, GNU make, Git, `patch`, and an internet connection
 for the first source retrieval in a normal Cargo build. Offline/Nix builders
 can prefetch that exact source revision and set `ROSEMARY_FFMPEG_SOURCE` to its
-read-only directory before invoking Cargo. A supplied directory must either be
-an unmodified Git checkout at the pinned commit or exactly match the SHA-256
-file manifest of the official pinned codeload archive. The archive fingerprint
-is verified before cached static FFmpeg libraries are considered reusable.
+read-only directory before invoking Cargo. A supplied directory must match the SHA-256
+file manifest of the official pinned codeload archive **regardless of Git
+history**. Git checkouts also require the exact pinned HEAD and clean tracked
+files. Ignored generated files (such as `config.h` and codec lists) are included
+in the content manifest: an extra or modified file is rejected before staging,
+including if `git status` reports clean. The staged copy is checked against
+that same manifest before the pinned source patch is applied. The content
+fingerprint is checked before cached static FFmpeg libraries can be reused.
 A source path, fingerprint, target, build-recipe or bundled FFmpeg patch
 change causes a full out-of-tree rebuild rather than linking stale native
 archives. After verifying the original pinned upstream source, the builder
@@ -23,7 +27,13 @@ corresponding FFmpeg source and license information.
 ## Release integration gate
 
 This crate is currently **standalone and unshipped**. The `rosemary` runtime
-binary does not depend on `videocodec`; the existing Nix package selects
+binary does not depend on `videocodec`. The root workspace explicitly lists
+its other 36 crates as `default-members`, so a plain root `cargo build` or
+`cargo test` does not fetch or build FFmpeg. Decoder tests are still selected
+explicitly with `cargo test -p videocodec` (including `--test source_integrity`)
+or as part of `cargo test --workspace`. A dedicated decoder CI job fetches
+the immutable FFmpeg source before Cargo builds, checks default-member
+selection, and runs all decoder tests and strict Clippy. The existing Nix package selects
 `--package rosemary --bin rosemary`, while the Arch recipe builds a prior
 release. Adding this crate to the workspace does not enable guest VideoToolbox
 or include a decoder in either release artifact.

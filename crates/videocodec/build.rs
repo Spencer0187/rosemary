@@ -8,9 +8,9 @@ use std::process::Command;
 // Versioned upstream source, not a moving release branch.
 const FFMPEG_REF: &str = "n9.0.2";
 const FFMPEG_COMMIT: &str = "946fcce07b6dcd0331c8cc609192aeff5e1924f8";
-// All 10,424 non-.git files of FFmpeg's commit-pinned codeload archive, in
-// lexical relative-path order; hash each `path + NUL + SHA256(file)`, then hash
-// the concatenation. A source tree without Git history must match exactly.
+// All 10,424 non-.git files in both the pinned Git checkout and codeload
+// archive. Hash each `path + NUL + SHA256(file)` in lexical order, then hash
+// the concatenation. Nothing outside this manifest may enter the build.
 const FFMPEG_TREE_SHA256: &str = "ac162b65212c0ef5f5a45aa11874036ca2bcd63a964a7815c234c8010b352a19";
 
 fn command(cmd: &mut Command) {
@@ -51,6 +51,41 @@ fn tree_hash(root: &Path) -> String {
     format!("{:x}", digest.finalize())
 }
 
+// A clean Git status is insufficient: generated FFmpeg headers, codec lists,
+// and other files ignored by Git can still be selected by configure/make.
+// Verify every staged file, including ignored files, regardless of origin.
+fn verify_source(source: &Path, expected_commit: &str, expected_tree_hash: &str) -> String {
+    assert!(source.join("configure").is_file(), "invalid FFmpeg source");
+    if source.join(".git").exists() {
+        let revision = Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("cannot read FFmpeg revision");
+        assert!(revision.status.success());
+        let head = String::from_utf8_lossy(&revision.stdout);
+        assert_eq!(
+            head.trim(),
+            expected_commit,
+            "incorrect FFmpeg source revision"
+        );
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(source)
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .output()
+            .expect("cannot verify FFmpeg working tree");
+        assert!(
+            status.status.success() && status.stdout.is_empty(),
+            "modified FFmpeg source"
+        );
+    }
+    let digest = tree_hash(source);
+    assert_eq!(digest, expected_tree_hash, "unverified FFmpeg source tree");
+    format!("tree:{digest}")
+}
+
 fn source_dir(out: &Path) -> (PathBuf, String) {
     let source = if let Some(prefetched) = env::var_os("ROSEMARY_FFMPEG_SOURCE") {
         PathBuf::from(prefetched)
@@ -67,37 +102,7 @@ fn source_dir(out: &Path) -> (PathBuf, String) {
         }
         src
     };
-    assert!(source.join("configure").is_file(), "invalid FFmpeg source");
-    let fingerprint = if source.join(".git").exists() {
-        let revision = Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .expect("cannot read FFmpeg revision");
-        assert!(revision.status.success());
-        let head = String::from_utf8_lossy(&revision.stdout);
-        assert_eq!(
-            head.trim(),
-            FFMPEG_COMMIT,
-            "incorrect FFmpeg source revision"
-        );
-        let status = Command::new("git")
-            .arg("-C")
-            .arg(&source)
-            .args(["status", "--porcelain", "--untracked-files=all"])
-            .output()
-            .expect("cannot verify FFmpeg working tree");
-        assert!(
-            status.status.success() && status.stdout.is_empty(),
-            "modified FFmpeg source"
-        );
-        format!("git:{FFMPEG_COMMIT}")
-    } else {
-        let digest = tree_hash(&source);
-        assert_eq!(digest, FFMPEG_TREE_SHA256, "unverified FFmpeg source tree");
-        format!("tree:{digest}")
-    };
+    let fingerprint = verify_source(&source, FFMPEG_COMMIT, FFMPEG_TREE_SHA256);
     println!("cargo:rerun-if-changed={}", source.display());
     (source, fingerprint)
 }
@@ -129,6 +134,13 @@ fn staged_ffmpeg_source(source: &Path, out: &Path, patch: &Path) -> PathBuf {
         fs::remove_dir_all(&staged).expect("cannot replace stale FFmpeg stage");
     }
     copy_tree(source, &staged);
+    // Detect changes between the original verification and staging before
+    // applying the intentional, checked-in patch to the copied source.
+    assert_eq!(
+        tree_hash(&staged),
+        FFMPEG_TREE_SHA256,
+        "staged FFmpeg source does not match the verified input"
+    );
     for file in [
         "libavutil/mem.c",
         "libavcodec/h264dec.c",
@@ -334,4 +346,105 @@ fn main() {
         println!("cargo:rustc-link-lib=pthread");
     }
     // FFmpeg source is kept only under Cargo's target output, never in the repo.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct Fixture(PathBuf);
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn pinned_shape_fixture() -> (Fixture, String, String) {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "rosemary-ffmpeg-source-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let fixture = Fixture(root.clone());
+        fs::create_dir_all(root.join("libavcodec")).unwrap();
+        fs::write(root.join("configure"), b"#!/bin/sh\n").unwrap();
+        fs::write(
+            root.join("libavcodec/h264dec.c"),
+            b"pinned decoder source\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".gitignore"),
+            b"/config.h\n/libavcodec/codec_list.c\n",
+        )
+        .unwrap();
+        command(Command::new("git").current_dir(&root).args(["init", "-q"]));
+        command(Command::new("git").current_dir(&root).args(["add", "."]));
+        command(Command::new("git").current_dir(&root).args([
+            "-c",
+            "user.name=Source Test",
+            "-c",
+            "user.email=source-test@example.invalid",
+            "commit",
+            "-qm",
+            "pinned fixture",
+        ]));
+        let rev = Command::new("git")
+            .current_dir(&root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(rev.status.success());
+        let commit = String::from_utf8(rev.stdout).unwrap().trim().to_owned();
+        let hash = tree_hash(&root);
+        (fixture, commit, hash)
+    }
+
+    #[test]
+    fn git_checkout_and_archive_use_the_same_content_manifest() {
+        let (fixture, commit, hash) = pinned_shape_fixture();
+        assert_eq!(
+            verify_source(&fixture.0, &commit, &hash),
+            format!("tree:{hash}")
+        );
+        let archive = Fixture(fixture.0.with_extension("archive"));
+        fs::create_dir_all(archive.0.join("libavcodec")).unwrap();
+        for name in ["configure", ".gitignore", "libavcodec/h264dec.c"] {
+            fs::copy(fixture.0.join(name), archive.0.join(name)).unwrap();
+        }
+        assert_eq!(
+            verify_source(&archive.0, &commit, &hash),
+            format!("tree:{hash}")
+        );
+    }
+
+    #[test]
+    fn ignored_generated_files_in_clean_git_checkout_are_rejected() {
+        let (fixture, commit, hash) = pinned_shape_fixture();
+        for ignored in ["config.h", "libavcodec/codec_list.c"] {
+            fs::write(fixture.0.join(ignored), b"unexpected generated header\n").unwrap();
+            let status = Command::new("git")
+                .current_dir(&fixture.0)
+                .args(["status", "--porcelain", "--untracked-files=all"])
+                .output()
+                .unwrap();
+            assert!(status.status.success() && status.stdout.is_empty());
+            let result = std::panic::catch_unwind(|| verify_source(&fixture.0, &commit, &hash));
+            assert!(
+                result.is_err(),
+                "ignored {ignored} bypassed source manifest"
+            );
+            fs::remove_file(fixture.0.join(ignored)).unwrap();
+            assert_eq!(
+                verify_source(&fixture.0, &commit, &hash),
+                format!("tree:{hash}")
+            );
+        }
+    }
 }
