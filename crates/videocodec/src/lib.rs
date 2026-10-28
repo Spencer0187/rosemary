@@ -22,6 +22,12 @@ use std::time::Duration;
 
 const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
 const AV_FRAME_FLAG_CORRUPT: i32 = 1 << 0;
+// Positive native frame-rejection status, distinct from fatal FFmpeg errors.
+const NATIVE_PICTURE_REJECTED: i32 = 6;
+#[cfg(test)]
+const TEST_SWS_CONTEXT_FAILURE: i32 = 1;
+#[cfg(test)]
+const TEST_CONVERTED_FRAME_FAILURE: i32 = 2;
 
 fn checked_packet_size(a: usize, b: usize) -> Result<usize, Error> {
     a.checked_add(b)
@@ -683,10 +689,10 @@ impl Decoder {
                     self.reap_dropped()?;
                     return Ok(None);
                 }
-                6 if view.identity_valid != 0 => {
+                NATIVE_PICTURE_REJECTED if view.identity_valid != 0 => {
                     self.process_view(&view, Some(Error::InvalidImageLayout))?;
                 }
-                6 => return Err(self.latch(Error::MissingIdentity)),
+                NATIVE_PICTURE_REJECTED => return Err(self.latch(Error::MissingIdentity)),
                 negative => return Err(self.latch(Error::Codec(negative))),
             }
         }
@@ -1321,7 +1327,7 @@ mod tests {
     #[test]
     fn conversion_allocation_failure_is_fatal_after_frame_identity() {
         let stream = include_bytes!("../tests/fixtures/blue_high444_32x32.h264");
-        for stage in [1, 2] {
+        for stage in [TEST_SWS_CONTEXT_FAILURE, TEST_CONVERTED_FRAME_FAILURE] {
             let mut decoder = decoder_for_fixture(stream);
             // SAFETY: local native decoder; the hook fires only after the
             // picture has an opaque sample identity in the conversion path.
@@ -1358,7 +1364,12 @@ mod tests {
             packet.extend_from_slice(nal);
         }
         // SAFETY: native decoder is exclusively owned by the test.
-        unsafe { rosemary_h264_test_fail_converter_allocation(decoder.handle.as_ptr(), 2) };
+        unsafe {
+            rosemary_h264_test_fail_converter_allocation(
+                decoder.handle.as_ptr(),
+                TEST_CONVERTED_FRAME_FAILURE,
+            )
+        };
         let sample = AccessUnit {
             id: 733,
             bytes: &packet,

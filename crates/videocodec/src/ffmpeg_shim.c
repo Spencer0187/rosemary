@@ -21,6 +21,10 @@ typedef struct RosemaryOpaqueToken {
 #define ROSEMARY_MAX_NATIVE_PIXELS (4096LL * 4096LL)
 #define ROSEMARY_MAX_NATIVE_FRAME_BYTES (64U * 1024U * 1024U)
 #define ROSEMARY_MAX_NATIVE_LIVE_BYTES (256U * 1024U * 1024U)
+// Keep native result/status codes synchronized with the Rust FFI wrapper.
+#define ROSEMARY_H264_PICTURE_REJECTED 6
+#define ROSEMARY_TEST_SWS_CONTEXT_FAILURE 1
+#define ROSEMARY_TEST_CONVERTED_FRAME_FAILURE 2
 
 typedef struct RosemaryDecoder {
     size_t native_live_bytes;
@@ -337,10 +341,10 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if ((f->flags & AV_FRAME_FLAG_CORRUPT) || f->decode_error_flags) {
         out->flags = f->flags;
         out->decode_error_flags = f->decode_error_flags;
-        return 6;
+        return ROSEMARY_H264_PICTURE_REJECTED;
     }
     if (f->width <= 0 || f->height <= 0 || f->width > 32768 || f->height > 32768)
-        return 6;
+        return ROSEMARY_H264_PICTURE_REJECTED;
     AVFrame *source = f;
     int output_colorspace = source->colorspace;
     int color_range = f->color_range;
@@ -353,7 +357,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         f->format != AV_PIX_FMT_NV12) {
         // A whole-picture sws_scale mixes chroma across different fields.
         if (source->flags & AV_FRAME_FLAG_INTERLACED)
-            return 6;
+            return ROSEMARY_H264_PICTURE_REJECTED;
         int sws_matrix;
         switch (source->colorspace) {
         case AVCOL_SPC_RGB:
@@ -370,9 +374,9 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         case AVCOL_SPC_SMPTE240M: sws_matrix = SWS_CS_SMPTE240M; break;
         case AVCOL_SPC_BT2020_NCL: sws_matrix = SWS_CS_BT2020; break;
         // In particular, swscale cannot implement BT.2020 constant-luminance.
-        default: return 6;
+        default: return ROSEMARY_H264_PICTURE_REJECTED;
         }
-        if (decoder->test_fail_converter_allocation == 1) {
+        if (decoder->test_fail_converter_allocation == ROSEMARY_TEST_SWS_CONTEXT_FAILURE) {
             decoder->test_fail_converter_allocation = 0;
             return AVERROR(ENOMEM);
         }
@@ -396,7 +400,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
         decoder->converted->width = f->width;
         decoder->converted->height = f->height;
         decoder->converted->format = AV_PIX_FMT_YUV420P;
-        if (decoder->test_fail_converter_allocation == 2) {
+        if (decoder->test_fail_converter_allocation == ROSEMARY_TEST_CONVERTED_FRAME_FAILURE) {
             decoder->test_fail_converter_allocation = 0;
             return AVERROR(ENOMEM);
         }
