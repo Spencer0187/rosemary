@@ -5,6 +5,7 @@
 
 #include <libavcodec/avcodec.h>
 #include <libavutil/error.h>
+#include <libavutil/imgutils.h>
 #include <libavutil/buffer.h>
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
@@ -15,7 +16,15 @@ typedef struct RosemaryOpaqueToken {
     struct RosemaryOpaqueToken *next;
 } RosemaryOpaqueToken;
 
-typedef struct {
+// Hard limits apply before get_buffer2 asks FFmpeg to allocate decoded
+// reference frames. The separate Rust output queues do not cover this memory.
+#define ROSEMARY_MAX_NATIVE_PIXELS (4096LL * 4096LL)
+#define ROSEMARY_MAX_NATIVE_FRAME_BYTES (64U * 1024U * 1024U)
+#define ROSEMARY_MAX_NATIVE_LIVE_BYTES (256U * 1024U * 1024U)
+
+typedef struct RosemaryDecoder {
+    size_t native_live_bytes;
+    size_t native_peak_bytes;
     RosemaryOpaqueToken *tokens;
     AVCodecContext *context;
     AVPacket *packet;
@@ -23,6 +32,79 @@ typedef struct {
     AVFrame *converted;
     struct SwsContext *converter;
 } RosemaryDecoder;
+
+typedef struct {
+    RosemaryDecoder *decoder;
+    AVBufferRef *original;
+    size_t bytes;
+} RosemaryTrackedBuffer;
+
+static void rosemary_release_native_buffer(void *opaque, uint8_t *data) {
+    RosemaryTrackedBuffer *tracked = opaque;
+    (void)data;
+    tracked->decoder->native_live_bytes -= tracked->bytes;
+    av_buffer_unref(&tracked->original);
+    free(tracked);
+}
+
+static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame, int flags) {
+    RosemaryDecoder *decoder = context->opaque;
+    if (!decoder || frame->width <= 0 || frame->height <= 0 ||
+        (int64_t)frame->width * frame->height > ROSEMARY_MAX_NATIVE_PIXELS)
+        return AVERROR(ENOMEM);
+    // H.264's source format may be 10-bit or 4:4:4, not the I420 format we
+    // eventually expose. Reserve padded source storage before FFmpeg allocates.
+    int w = frame->width, h = frame->height;
+    int alignments[AV_NUM_DATA_POINTERS] = {0};
+    avcodec_align_dimensions2(context, &w, &h, alignments);
+    if (w <= 0 || h <= 0 || w > 16384 || h > 16384)
+        return AVERROR(ENOMEM);
+    int predicted = av_image_get_buffer_size(frame->format, w + 128, h + 128, 64);
+    if (predicted <= 0 || (size_t)predicted > ROSEMARY_MAX_NATIVE_FRAME_BYTES ||
+        (size_t)predicted > ROSEMARY_MAX_NATIVE_LIVE_BYTES - decoder->native_live_bytes)
+        return AVERROR(ENOMEM);
+    int result = avcodec_default_get_buffer2(context, frame, flags);
+    if (result < 0) return result;
+    // A default FFmpeg H.264 software frame uses at most four plane buffers.
+    // Wrap their AVBufferRefs, retaining the original allocation and charging
+    // it until the very last decoder reference is released.
+    size_t total = 0;
+    for (int i = 0; i < AV_NUM_DATA_POINTERS && frame->buf[i]; ++i) {
+        AVBufferRef *original = frame->buf[i];
+        size_t bytes = original->size;
+        if (bytes > ROSEMARY_MAX_NATIVE_FRAME_BYTES - total ||
+            bytes > ROSEMARY_MAX_NATIVE_LIVE_BYTES - decoder->native_live_bytes) {
+            av_frame_unref(frame);
+            return AVERROR(ENOMEM);
+        }
+        RosemaryTrackedBuffer *tracked = calloc(1, sizeof(*tracked));
+        if (!tracked) { av_frame_unref(frame); return AVERROR(ENOMEM); }
+        tracked->decoder = decoder;
+        tracked->original = original;
+        tracked->bytes = bytes;
+        AVBufferRef *wrapped = av_buffer_create(original->data, original->size,
+            rosemary_release_native_buffer, tracked, 0);
+        if (!wrapped) {
+            free(tracked);
+            av_frame_unref(frame);
+            return AVERROR(ENOMEM);
+        }
+        frame->buf[i] = wrapped;
+        decoder->native_live_bytes += bytes;
+        if (decoder->native_live_bytes > decoder->native_peak_bytes)
+            decoder->native_peak_bytes = decoder->native_live_bytes;
+        total += bytes;
+    }
+    return 0;
+}
+
+size_t rosemary_h264_native_peak_bytes(RosemaryDecoder *decoder) {
+    return decoder ? decoder->native_peak_bytes : 0;
+}
+size_t rosemary_h264_native_live_bytes(RosemaryDecoder *decoder) {
+    return decoder ? decoder->native_live_bytes : 0;
+}
+
 
 typedef struct {
     int32_t width;
@@ -51,7 +133,15 @@ RosemaryDecoder *rosemary_h264_new(void) {
     RosemaryDecoder *decoder = calloc(1, sizeof(*decoder));
     if (!decoder) return NULL;
     decoder->context = avcodec_alloc_context3(codec);
-    if (decoder->context) decoder->context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+    if (decoder->context) {
+        decoder->context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
+        decoder->context->max_pixels = ROSEMARY_MAX_NATIVE_PIXELS;
+        // Avoid multiplying live decoder references by frame-thread count.
+        decoder->context->thread_count = 1;
+        decoder->context->thread_type = 0;
+        decoder->context->opaque = decoder;
+        decoder->context->get_buffer2 = rosemary_guarded_get_buffer2;
+    }
     decoder->packet = av_packet_alloc();
     decoder->frame = av_frame_alloc();
     decoder->converted = av_frame_alloc();

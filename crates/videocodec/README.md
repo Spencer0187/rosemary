@@ -59,8 +59,10 @@ A picture individually exceeding the 64 MiB slot is reported as a frame-local
 drop with an error. Full queues return recoverable `Backpressure` without
 consuming the caller's access unit; after `pull`, retry the same ID.
 The dropped-completion queue is separately bounded to 1024 entries; poll
-`take_dropped` alongside `pull`. Delayed EOS output is pulled incrementally.
-`pull` is synchronous and ignores its timeout. An identified frame-local
+`take_dropped` alongside `pull`. Delayed EOS output is pulled incrementally,
+and successful `is_drained()` requires every accepted sample ID to be resolved
+and every completion notification consumed. `pull` is synchronous and ignores
+its timeout. An identified frame-local
 layout/conversion error is reported as `DroppedSample.error`, while decoder
 errors that invalidate the session or lose identity are latched as fatal.
 
@@ -70,7 +72,26 @@ The decoder checks collisions among in-flight outputs, pending inputs, and
 unconsumed dropped notifications without retaining an unbounded set of all
 historical IDs. Malformed inputs are validated before checking backpressure.
 The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
-with automatically assigned IDs and plane-based `Frame` output.
+with automatically assigned IDs and plane-based `Frame` output. When the
+completion queue stalls, these methods and `finish()` return recoverable
+`videocodec::Error::Backpressure`; consume notifications using the inherent
+`Decoder::take_dropped()` and retry the same unaccepted input. The legacy
+automatic-ID counter never emits the reserved exhaustion value, but the
+`mediabackend` trait accepts the entire opaque `u64` identity domain.
+
+The pinned FFmpeg H.264 decoder rejects SPS dimensions above 4096² pixels
+before a picture allocation, and its guarded `get_buffer2` enforces a 64 MiB
+source-frame request limit with a 256 MiB budget for live native reference
+buffers. The source-format and bit depth determine these charges (not the
+converted I420 bytes); single-frame decoding threads avoid multiplying the
+reference budget by frame-thread count. Converted buffers and Rust's bounded
+output FIFO are separate allocations. These safeguards limit decoded-picture
+allocations, not compressed packet storage or all FFmpeg parser scratch memory.
+
+FFmpeg `repeat_pict` represents frame doubling/tripling for progressive H.264
+picture-timing SEI. Only interlaced first-field repetition maps to
+`FrameLayout.repeat_first_field`; the shared layout does not represent
+progressive frame repetition, which is left unset rather than misrepresented.
 
 FFmpeg reserves `i64::MIN` for absent timestamps, so callers supplying that
 exact number receive `InvalidTimestamp` rather than silent corruption.
