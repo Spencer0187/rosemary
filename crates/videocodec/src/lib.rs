@@ -8,6 +8,14 @@ use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
 
+const MAX_PACKET_BYTES: usize = 64 * 1024 * 1024;
+
+fn checked_packet_size(a: usize, b: usize) -> Result<usize, Error> {
+    a.checked_add(b)
+        .filter(|&size| size <= MAX_PACKET_BYTES)
+        .ok_or(Error::InvalidPacket)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PixelFormat {
     I420,
@@ -108,10 +116,10 @@ impl NalLength {
 /// Converts a single AVCC access unit to Annex B, validating every length field.
 /// An empty or incomplete sample must never enter the native codec.
 pub fn avcc_to_annex_b(sample: &[u8], length: NalLength) -> Result<Vec<u8>, Error> {
-    if sample.is_empty() || sample.len() > 64 * 1024 * 1024 {
+    if sample.is_empty() || sample.len() > MAX_PACKET_BYTES {
         return Err(Error::InvalidPacket);
     }
-    let mut out = Vec::with_capacity(sample.len().saturating_add(16));
+    let mut out = Vec::new();
     let mut remaining = sample;
     while !remaining.is_empty() {
         let width = length.width();
@@ -128,11 +136,50 @@ pub fn avcc_to_annex_b(sample: &[u8], length: NalLength) -> Result<Vec<u8>, Erro
         if nal[0] & 0x1f == 0 || nal[0] & 0x80 != 0 {
             return Err(Error::InvalidPacket);
         }
+        checked_packet_size(out.len(), checked_packet_size(4, nal.len())?)?;
         out.extend_from_slice(&[0, 0, 0, 1]);
         out.extend_from_slice(nal);
         remaining = &remaining[nal_size..];
     }
     Ok(out)
+}
+
+// Keep a leading access-unit delimiter ahead of the parameter sets. H.264
+// requires an AUD, when present, to be the first NAL of an access unit.
+fn prepend_headers(headers: &[u8], sample: &[u8]) -> Result<Vec<u8>, Error> {
+    let total = checked_packet_size(headers.len(), sample.len())?;
+    let aud_header = if sample.starts_with(&[0, 0, 0, 1]) {
+        Some(4)
+    } else if sample.starts_with(&[0, 0, 1]) {
+        Some(3)
+    } else {
+        None
+    };
+    let insertion = aud_header
+        .filter(|&at| {
+            sample
+                .get(at)
+                .is_some_and(|nal| nal & 0x1f == 9 && nal & 0x80 == 0)
+        })
+        .map_or(0, |start| {
+            let remaining = &sample[start + 1..];
+            remaining
+                .windows(3)
+                .position(|window| window == [0, 0, 1])
+                .map_or(sample.len(), |next| {
+                    let next = if next > 0 && remaining[next - 1] == 0 {
+                        next - 1
+                    } else {
+                        next
+                    };
+                    start + 1 + next
+                })
+        });
+    let mut packet = Vec::with_capacity(total);
+    packet.extend_from_slice(&sample[..insertion]);
+    packet.extend_from_slice(headers);
+    packet.extend_from_slice(&sample[insertion..]);
+    Ok(packet)
 }
 
 /// Stateful H.264 decoder. One owner at a time; guest frameworks decide which
@@ -166,6 +213,8 @@ impl Decoder {
             if set.is_empty() || set[0] & 0x80 != 0 || !matches!(set[0] & 0x1f, 7 | 8 | 13) {
                 return Err(Error::InvalidParameterSet);
             }
+            checked_packet_size(headers.len(), checked_packet_size(4, set.len())?)
+                .map_err(|_| Error::InvalidParameterSet)?;
             headers.extend_from_slice(&[0, 0, 0, 1]);
             headers.extend_from_slice(set);
         }
@@ -203,12 +252,12 @@ impl Decoder {
         if self.finished {
             return Err(Error::Drained);
         }
-        if sample.is_empty() || sample.len() > 64 * 1024 * 1024 {
+        if sample.is_empty() || sample.len() > MAX_PACKET_BYTES {
             return Err(Error::InvalidPacket);
         }
         let owned;
         let packet = if self.needs_headers {
-            owned = [self.headers.as_slice(), sample].concat();
+            owned = prepend_headers(&self.headers, sample)?;
             &owned[..]
         } else {
             sample
@@ -514,6 +563,43 @@ mod tests {
         frames.extend(decoder.finish().unwrap());
         assert_eq!(frames.len(), 8);
         assert!(frames.iter().all(|f| f.width == 64 && f.height == 64));
+    }
+
+    #[test]
+    fn rejects_packet_expansion_above_limit() {
+        assert_eq!(
+            checked_packet_size(MAX_PACKET_BYTES, 1),
+            Err(Error::InvalidPacket)
+        );
+        assert_eq!(
+            checked_packet_size(usize::MAX, 1),
+            Err(Error::InvalidPacket)
+        );
+        assert_eq!(
+            checked_packet_size(MAX_PACKET_BYTES - 4, 4),
+            Ok(MAX_PACKET_BYTES)
+        );
+        assert_eq!(
+            prepend_headers(&[0; 8], &vec![0; MAX_PACKET_BYTES]),
+            Err(Error::InvalidPacket)
+        );
+    }
+
+    #[test]
+    fn inserts_parameter_sets_after_leading_aud() {
+        let headers = [0, 0, 0, 1, 0x67, 0x42, 0x80];
+        for aud in [&[0, 0, 1, 9, 0xf0][..], &[0, 0, 0, 1, 9, 0xf0][..]] {
+            let mut sample = aud.to_vec();
+            sample.extend_from_slice(&[0, 0, 0, 1, 0x65, 0x42]);
+            let packet = prepend_headers(&headers, &sample).unwrap();
+            assert!(packet.starts_with(aud));
+            assert_eq!(&packet[aud.len()..aud.len() + headers.len()], headers);
+            assert_eq!(&packet[aud.len() + headers.len()..], &sample[aud.len()..]);
+        }
+        let sample = [0, 0, 0, 1, 0x65, 0x42];
+        let packet = prepend_headers(&headers, &sample).unwrap();
+        assert!(packet.starts_with(&headers));
+        assert!(packet.ends_with(&sample));
     }
 
     #[test]
