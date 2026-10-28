@@ -47,16 +47,19 @@ impl Source {
     ///
     /// Cleared *before* the callback, so that a callback which signals its own
     /// source runs again next time round rather than never.
+    ///
+    /// A signalled source without a callback is still a source handled, as in
+    /// Apple's loop: a thread that parks in its loop and is woken that way
+    /// relies on the run returning.
     fn fire(&self) -> bool {
         if !self.signalled.swap(false, Ordering::AcqRel) || !self.is_valid() {
             return false;
         }
-        let Some(perform) = self.perform else {
-            return false;
-        };
-        // SAFETY: `perform` is a `void (*)(void *)` the creator supplied, and
-        // `info` is the pointer it asked to be given back.
-        unsafe { perform(self.info as *mut c_void) };
+        if let Some(perform) = self.perform {
+            // SAFETY: `perform` is a `void (*)(void *)` the creator supplied, and
+            // `info` is the pointer it asked to be given back.
+            unsafe { perform(self.info as *mut c_void) };
+        }
         true
     }
 }
@@ -862,6 +865,31 @@ mod tests {
             result::TIMED_OUT
         );
         assert_eq!(calls(), 1);
+    }
+
+    /// A thread parked in its loop and woken by signalling a source that has no
+    /// callback gets its run back, as it does on a Mac.
+    #[test]
+    fn a_signalled_source_without_a_callback_ends_the_run() {
+        let loop_ = Arc::new(RunLoop::new());
+        let source = new_source(None, 0);
+        loop_.add_source(&source, DEFAULT_MODE);
+        assert_eq!(
+            loop_.run_in_mode(DEFAULT_MODE, 0.01, true),
+            result::TIMED_OUT
+        );
+
+        let woken = Arc::clone(&loop_);
+        let waker = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            source.signal();
+            woken.wake();
+        });
+        assert_eq!(
+            loop_.run_in_mode(DEFAULT_MODE, 10.0, true),
+            result::HANDLED_SOURCE
+        );
+        waker.join().unwrap();
     }
 
     #[test]
