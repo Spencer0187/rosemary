@@ -3448,6 +3448,8 @@ name = "videocodec"
 version = "0.4.1"
 dependencies = [
  "cc",
+ "mediabackend",
+ "sha2 0.10.9",
 ]
 
 [[package]]
