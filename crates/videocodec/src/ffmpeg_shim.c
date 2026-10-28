@@ -26,7 +26,10 @@ typedef struct RosemaryDecoder {
     size_t native_live_bytes;
     size_t native_peak_bytes;
     int source_budget_refused;
+    int source_budget_identity_valid;
+    uint64_t source_budget_id;
     int last_send_error;
+    int test_send_enomem_after_accept;
     RosemaryOpaqueToken *tokens;
     AVCodecContext *context;
     AVPacket *packet;
@@ -49,28 +52,34 @@ static void rosemary_release_native_buffer(void *opaque, uint8_t *data) {
     free(tracked);
 }
 
+static int rosemary_refuse_source_budget(RosemaryDecoder *decoder, const AVFrame *frame) {
+    decoder->source_budget_refused = 1;
+    if (frame->opaque_ref && frame->opaque_ref->size == sizeof(uint64_t)) {
+        memcpy(&decoder->source_budget_id, frame->opaque_ref->data, sizeof(uint64_t));
+        decoder->source_budget_identity_valid = 1;
+    }
+    return AVERROR(ENOMEM);
+}
+
 static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame, int flags) {
     RosemaryDecoder *decoder = context->opaque;
     if (!decoder) return AVERROR(EINVAL);
-    if (frame->width <= 0 || frame->height <= 0 ||
-        (int64_t)frame->width * frame->height > ROSEMARY_MAX_NATIVE_PIXELS) {
-        decoder->source_budget_refused = 1;
-        return AVERROR(ENOMEM);
-    }
+    if (frame->width <= 0 || frame->height <= 0) return AVERROR(EINVAL);
+    if ((int64_t)frame->width * frame->height > ROSEMARY_MAX_NATIVE_PIXELS)
+        return rosemary_refuse_source_budget(decoder, frame);
     // H.264's source format may be 10-bit or 4:4:4, not the I420 format we
     // eventually expose. Reserve padded source storage before FFmpeg allocates.
     int w = frame->width, h = frame->height;
     int alignments[AV_NUM_DATA_POINTERS] = {0};
     avcodec_align_dimensions2(context, &w, &h, alignments);
-    if (w <= 0 || h <= 0 || w > 16384 || h > 16384) {
-        decoder->source_budget_refused = 1;
-        return AVERROR(ENOMEM);
-    }
+    if (w <= 0 || h <= 0) return AVERROR(EINVAL);
+    if (w > 16384 || h > 16384)
+        return rosemary_refuse_source_budget(decoder, frame);
     int predicted = av_image_get_buffer_size(frame->format, w + 128, h + 128, 64);
-    if (predicted <= 0 || (size_t)predicted > ROSEMARY_MAX_NATIVE_FRAME_BYTES ||
+    if (predicted <= 0) return AVERROR(EINVAL);
+    if ((size_t)predicted > ROSEMARY_MAX_NATIVE_FRAME_BYTES ||
         (size_t)predicted > ROSEMARY_MAX_NATIVE_LIVE_BYTES - decoder->native_live_bytes) {
-        decoder->source_budget_refused = 1;
-        return AVERROR(ENOMEM);
+        return rosemary_refuse_source_budget(decoder, frame);
     }
     int result = avcodec_default_get_buffer2(context, frame, flags);
     if (result < 0) return result;
@@ -83,9 +92,9 @@ static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame,
         size_t bytes = original->size;
         if (bytes > ROSEMARY_MAX_NATIVE_FRAME_BYTES - total ||
             bytes > ROSEMARY_MAX_NATIVE_LIVE_BYTES - decoder->native_live_bytes) {
+            int error = rosemary_refuse_source_budget(decoder, frame);
             av_frame_unref(frame);
-            decoder->source_budget_refused = 1;
-            return AVERROR(ENOMEM);
+            return error;
         }
         RosemaryTrackedBuffer *tracked = calloc(1, sizeof(*tracked));
         if (!tracked) { av_frame_unref(frame); return AVERROR(ENOMEM); }
@@ -112,6 +121,18 @@ int rosemary_h264_last_send_error(RosemaryDecoder *decoder) {
     return decoder ? decoder->last_send_error : AVERROR(EINVAL);
 }
 
+// Enabled only by a test-only Rust FFI declaration; the fault occurs after
+// libavcodec has actually consumed the next packet.
+void rosemary_h264_test_send_enomem_after_accept(RosemaryDecoder *decoder) {
+    if (decoder) decoder->test_send_enomem_after_accept = 1;
+}
+
+int rosemary_h264_last_budget_id(RosemaryDecoder *decoder, uint64_t *id) {
+    if (!decoder || !id || !decoder->source_budget_identity_valid) return 0;
+    *id = decoder->source_budget_id;
+    return 1;
+}
+
 size_t rosemary_h264_native_peak_bytes(RosemaryDecoder *decoder) {
     return decoder ? decoder->native_peak_bytes : 0;
 }
@@ -135,6 +156,7 @@ typedef struct {
     int32_t aspect_num;
     int32_t aspect_den;
     int32_t flags;
+    int32_t decode_error_flags;
     int32_t repeat_pict;
     size_t crop_left, crop_top, crop_right, crop_bottom;
     const uint8_t *planes[3];
@@ -220,7 +242,12 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     }
     token->id = id;
     decoder->source_budget_refused = 0;
+    decoder->source_budget_identity_valid = 0;
     result = avcodec_send_packet(decoder->context, decoder->packet);
+    if (decoder->test_send_enomem_after_accept && result == 0) {
+        decoder->test_send_enomem_after_accept = 0;
+        result = AVERROR(ENOMEM);
+    }
     decoder->last_send_error = result;
     av_packet_unref(decoder->packet);
     // EAGAIN is guaranteed not to consume input. Other errors can occur
@@ -234,10 +261,16 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
         free(token);
     }
     if (result == AVERROR(EAGAIN)) return 1;
-    if (decoder->source_budget_refused)
+    // H.264 maps a failed get_buffer2(ENOMEM) to INVALIDDATA in decode.c.
+    // This is a known guarded allocation refusal only when the callback
+    // itself recorded it; unrelated errors remain fatal.
+    if (decoder->source_budget_refused &&
+        (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA))
         return 4; // Consumed packet, decoder source-frame budget exceeded.
+    if (result == AVERROR_INVALIDDATA)
+        return 3; // Recoverable corruption, ownership remains tracked.
     if (result < 0)
-        return 3; // Conservatively accepted after entering libavcodec.
+        return 5; // Potentially consumed, but decoder state is fatal.
     return result;
 }
 
@@ -271,8 +304,17 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if (!decoder || !out) return AVERROR(EINVAL);
     av_frame_unref(decoder->frame);
     decoder->source_budget_refused = 0;
+    decoder->source_budget_identity_valid = 0;
     int result = avcodec_receive_frame(decoder->context, decoder->frame);
-    if (result < 0 && decoder->source_budget_refused) return 4;
+    if (decoder->source_budget_refused &&
+        (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA)) {
+        memset(out, 0, sizeof(*out));
+        if (decoder->source_budget_identity_valid) {
+            out->identity_valid = 1;
+            out->id = decoder->source_budget_id;
+        }
+        return 4;
+    }
     if (result == AVERROR(EAGAIN)) return 1;
     if (result == AVERROR_EOF) return 2;
     if (result < 0) return result;
@@ -283,6 +325,11 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if (f->opaque_ref && f->opaque_ref->size == sizeof(out->id)) {
         memcpy(&out->id, f->opaque_ref->data, sizeof(out->id));
         out->identity_valid = 1;
+    }
+    if ((f->flags & AV_FRAME_FLAG_CORRUPT) || f->decode_error_flags) {
+        out->flags = f->flags;
+        out->decode_error_flags = f->decode_error_flags;
+        return AVERROR_INVALIDDATA;
     }
     if (f->width <= 0 || f->height <= 0 || f->width > 32768 || f->height > 32768)
         return AVERROR_INVALIDDATA;
@@ -359,6 +406,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     out->aspect_num = source->sample_aspect_ratio.num;
     out->aspect_den = source->sample_aspect_ratio.den;
     out->flags = source->flags;
+    out->decode_error_flags = source->decode_error_flags;
     out->repeat_pict = source->repeat_pict;
     out->crop_left = source->crop_left;
     out->crop_top = source->crop_top;

@@ -107,15 +107,29 @@ have consumed it, `AVERROR_INVALIDDATA` is acknowledged as accepted;
 its opaque ID is retained and completed as a dropped sample with a decode
 error if no output picture arrives. Clients must not resubmit it. This
 allows the same session to recover at the next IDR without losing ownership
-of a corrupted access unit.
+of a corrupted access unit. Other negative results from the native send
+call (including non-budget `ENOMEM` and unexpected decoder-state errors)
+remain **fatal**, even when FFmpeg may have consumed the packet. Their
+sample identity is retained for session teardown; they are never represented
+as a successful recoverable submission.
 
 Native source-frame admission is limited by the 4096² SPS-pixel bound,
 64 MiB per-picture source allocation estimate and 256 MiB tracked live
 reference allocation budget. A predictable frame-budget rejection is
 reported as `SourceFrameTooLarge` on that sample's dropped completion,
 not as a fatal decoder state. A later supported IDR may still recover.
-This does not turn arbitrary FFmpeg ENOMEM or unknown decoder errors into
-recoverable conditions.
+When source allocation is refused, the guarded FFmpeg callback records
+the **originating picture's** opaque sample ID. That picture is completed
+immediately as a frame-local error, including when allocation occurs during
+`avcodec_receive_frame` after a later packet was submitted. A missing or
+unknown picture ID is fatal, not an error-free discard. Arbitrary FFmpeg
+`ENOMEM` or unexpected decoder errors are not recoverable.
+
+FFmpeg frames marked with `AV_FRAME_FLAG_CORRUPT` or nonzero
+`decode_error_flags` are not returned as clean decoded output. Identified
+corrupt pictures complete through `DroppedSample.error` (`CorruptFrame`),
+consistent with the other media decoder's corrupt-frame discard policy.
+This includes error-concealed output that FFmpeg could otherwise render.
 
 Interlaced H.264 pictures needing a high-chroma or high-bit-depth swscale
 conversion are rejected as identified frame-local errors: whole-picture
