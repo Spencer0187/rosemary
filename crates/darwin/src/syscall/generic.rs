@@ -70,6 +70,16 @@ fn handle_mach_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         numbers::mach::_kernelrpc_mach_vm_protect_trap => Ok(unsafe {
             mach::vm::vm_protect(args[0] as _, args[1], args[2], args[3] as _, args[4] as _) as _
         }),
+        numbers::mach::_kernelrpc_mach_vm_map_trap => Ok(unsafe {
+            mach::vm::mach_vm_map_trap(
+                args[0] as _,
+                args[1] as _,
+                args[2],
+                args[3],
+                args[4] as _,
+                args[5] as _,
+            ) as _
+        }),
         numbers::mach::_kernelrpc_mach_vm_deallocate_trap => {
             Ok(unsafe { mach::vm::vm_deallocate(args[0] as _, args[1], args[2]) as _ })
         }

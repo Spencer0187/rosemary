@@ -6,6 +6,25 @@ pub mod signal;
 /// than a pipe does.
 pub mod memory {
     pub use crate::memory::piped::{read, write};
+
+    pub fn object() -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: a NUL-terminated name, which only labels the object.
+        match unsafe { libc::memfd_create(c"rosemary-memory-object".as_ptr(), libc::MFD_CLOEXEC) } {
+            -1 => Err(std::io::Error::last_os_error()),
+            // SAFETY: a descriptor the call just opened.
+            fd => Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) }),
+        }
+    }
+
+    pub fn exclude_from_fork(address: usize, len: usize) -> std::io::Result<()> {
+        // SAFETY: changes only what a child inherits of the range.
+        match unsafe { libc::minherit(address as *mut core::ffi::c_void, len, libc::INHERIT_NONE) }
+        {
+            0 => Ok(()),
+            _ => Err(std::io::Error::last_os_error()),
+        }
+    }
 }
 
 use std::ffi::{CStr, c_char};

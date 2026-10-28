@@ -4,8 +4,12 @@ use starnix::process::Region;
 
 use server::task::{TaskOp, TaskOutcome};
 
+use super::entry::{self, Entry};
 use super::kern::*;
-use super::local::{self, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE};
+use super::local::{
+    self, Backing, VM_FLAGS_ANYWHERE, VM_PROT_ALL, VM_PROT_EXECUTE, VM_PROT_IS_MASK, VM_PROT_READ,
+    VM_PROT_WRITE,
+};
 use super::remote;
 use super::space::{self, MACH_PORT_NULL, Name, Target};
 
@@ -29,6 +33,9 @@ const SM_SHARED: u8 = 3;
 const VM_INHERIT_COPY: u32 = 1;
 /// `VM_INHERIT_SHARE`.
 const VM_INHERIT_SHARE: u32 = 0;
+/// `VM_INHERIT_NONE`, which leaves the range out of a child, and is
+/// `VM_INHERIT_LAST_VALID`.
+const VM_INHERIT_NONE: u32 = 2;
 
 /// `VM_BEHAVIOR_DEFAULT`.
 const VM_BEHAVIOR_DEFAULT: i32 = 0;
@@ -122,7 +129,7 @@ fn region(task: Name, address: u64) -> Result<Region, i32> {
 }
 
 /// A region's `VM_PROT_*` bits.
-fn protection(region: &Region) -> i32 {
+pub(super) fn protection(region: &Region) -> i32 {
     let mut protection = 0;
     if region.read {
         protection |= VM_PROT_READ;
@@ -392,11 +399,11 @@ pub unsafe extern "C" fn vm_region_recurse_64(
     KERN_SUCCESS
 }
 
-/// Say once that `vm_allocate` was asked for something it does not do, because
-/// the alternative is a caller left guessing at a bare `KERN_INVALID_ARGUMENT`.
-fn unsupported_flags(flags: i32) {
+/// Say once that `call` was asked for something it does not do, because the
+/// alternative is a caller left guessing at a bare `KERN_INVALID_ARGUMENT`.
+fn unsupported_flags(call: &str, flags: i32) {
     static SAID: std::sync::Once = std::sync::Once::new();
-    SAID.call_once(|| eprintln!("rosemary: vm_allocate: unsupported flags {flags:#x}"));
+    SAID.call_once(|| eprintln!("rosemary: {call}: unsupported flags {flags:#x}"));
 }
 
 /// `kern_return_t vm_allocate(vm_map_t target_task, vm_address_t *address,
@@ -437,11 +444,230 @@ pub unsafe extern "C" fn vm_allocate(task: Name, address: *mut u64, size: u64, f
             KERN_SUCCESS
         }
         Err(KERN_INVALID_ARGUMENT) => {
-            unsupported_flags(flags);
+            unsupported_flags("vm_allocate", flags);
             KERN_INVALID_ARGUMENT
         }
         Err(code) => code,
     }
+}
+
+/// `kern_return_t mach_vm_map(vm_map_t target_task, mach_vm_address_t
+/// *address, mach_vm_size_t size, mach_vm_offset_t mask, int flags,
+/// mem_entry_name_port_t object, memory_object_offset_t offset, boolean_t
+/// copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t
+/// inheritance)`, and `vm_map` and `vm_map_64`, the same call on a 64-bit
+/// task.
+///
+/// Zero-filled memory for `MACH_PORT_NULL`, or a named entry's object from
+/// `offset`: shared with every other mapping of it, or with `copy` a private
+/// copy of it as it is now. Placed as `vm_allocate` places memory, aligned to
+/// `mask` when anywhere.
+///
+/// FIXME (ACCURACY): `max_protection` is checked against the entry and then
+/// not kept, as in [`local::protect`]. And an entry's object mapped with
+/// `VM_INHERIT_COPY` is shared with a child, not copied into it: a host has no
+/// copy-on-fork of a shared mapping.
+///
+/// # Safety
+///
+/// `address` is readable and writable.
+pub unsafe extern "C" fn mach_vm_map(
+    task: Name,
+    address: *mut u64,
+    size: u64,
+    mask: u64,
+    flags: i32,
+    object: Name,
+    offset: u64,
+    copy: u32,
+    cur_protection: i32,
+    max_protection: i32,
+    inheritance: u32,
+) -> i32 {
+    if address.is_null() {
+        return KERN_INVALID_ARGUMENT;
+    }
+    match space::target(task) {
+        Err(code) => return code,
+        Ok(Target::Local) => {}
+        Ok(Target::Remote { .. }) => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| eprintln!("rosemary: mach_vm_map: another task is not supported"));
+            return KERN_INVALID_ARGUMENT;
+        }
+    }
+    let valid = VM_PROT_ALL | VM_PROT_IS_MASK;
+    if cur_protection & !valid != 0 || max_protection & !valid != 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if cur_protection & max_protection & VM_PROT_ALL != cur_protection & VM_PROT_ALL {
+        return KERN_INVALID_ARGUMENT;
+    }
+    if inheritance > VM_INHERIT_NONE || size == 0 {
+        return KERN_INVALID_ARGUMENT;
+    }
+    let page = super::info::page_size();
+    let anywhere = flags & VM_FLAGS_ANYWHERE != 0;
+    // SAFETY: the caller states `address` is readable.
+    let hint = unsafe { *address };
+    let placement = match anywhere {
+        true => size.checked_next_multiple_of(page).map(|len| (0, len)),
+        false => local::pages(hint, size),
+    };
+    let Some((start, length)) = placement else {
+        return KERN_INVALID_ARGUMENT;
+    };
+    let mut protection = cur_protection & VM_PROT_ALL;
+    let source = match object {
+        MACH_PORT_NULL => None,
+        name => {
+            let entry = match entry::lookup(name) {
+                Ok(entry) => entry,
+                Err(code) => return code,
+            };
+            let mut max = max_protection & VM_PROT_ALL;
+            if max_protection & VM_PROT_IS_MASK != 0 {
+                max &= entry.protection;
+            }
+            if cur_protection & VM_PROT_IS_MASK != 0 {
+                protection &= entry.protection;
+            }
+            if entry.protection & max != max || entry.protection & protection != protection {
+                return KERN_INVALID_RIGHT;
+            }
+            // A mapping starts on a page of the object, which `mmap` insists
+            // on and Mach's own callers always give.
+            if !offset.is_multiple_of(page)
+                || offset.checked_add(size).is_none_or(|end| end > entry.size)
+            {
+                return KERN_INVALID_ARGUMENT;
+            }
+            Some((entry, offset))
+        }
+    };
+    let placed = match source {
+        Some((entry, offset)) if copy == 0 => {
+            map_shared(start, length, mask, flags, &entry, offset)
+        }
+        Some((entry, offset)) => map_copy(start, length, mask, flags, inheritance, &entry, offset),
+        None => {
+            let backing = match inheritance {
+                VM_INHERIT_SHARE => Backing::Shared,
+                _ => Backing::Private,
+            };
+            local::place(start, length, mask, flags, backing, libc::PROT_NONE)
+        }
+    };
+    let placed = match placed {
+        Ok(placed) => placed,
+        Err(code) => {
+            if code == KERN_INVALID_ARGUMENT {
+                unsupported_flags("mach_vm_map", flags);
+            }
+            return code;
+        }
+    };
+    let rc = finish(placed, length, protection, inheritance);
+    if rc != KERN_SUCCESS {
+        entry::forget(placed, length);
+        // SAFETY: the mapping just made, which nothing else has been told of.
+        unsafe { libc::munmap(placed as *mut std::ffi::c_void, length as usize) };
+        return rc;
+    }
+    // SAFETY: the caller states `address` is writable.
+    unsafe { *address = placed };
+    KERN_SUCCESS
+}
+
+/// `_kernelrpc_mach_vm_map_trap`: [`mach_vm_map`] of zero-filled memory, with
+/// every maximum protection and inherited by copy.
+///
+/// # Safety
+///
+/// As [`mach_vm_map`].
+pub unsafe fn mach_vm_map_trap(
+    task: Name,
+    address: *mut u64,
+    size: u64,
+    mask: u64,
+    flags: i32,
+    cur_protection: i32,
+) -> i32 {
+    // SAFETY: the caller's obligation.
+    unsafe {
+        mach_vm_map(
+            task,
+            address,
+            size,
+            mask,
+            flags,
+            MACH_PORT_NULL,
+            0,
+            0,
+            cur_protection,
+            VM_PROT_ALL,
+            VM_INHERIT_COPY,
+        )
+    }
+}
+
+/// `entry`'s object from `offset`, shared, and recorded so an entry can be
+/// made from the mapping in turn.
+fn map_shared(
+    start: u64,
+    length: u64,
+    mask: u64,
+    flags: i32,
+    entry: &Entry,
+    offset: u64,
+) -> Result<u64, i32> {
+    let at = entry.offset + offset;
+    let backing = Backing::Object {
+        fd: entry.object.fd(),
+        offset: at,
+    };
+    let placed = local::place(start, length, mask, flags, backing, libc::PROT_NONE)?;
+    entry::record(placed, length, entry.object.clone(), at);
+    Ok(placed)
+}
+
+/// Fresh memory holding `entry`'s bytes from `offset` as they are now.
+fn map_copy(
+    start: u64,
+    length: u64,
+    mask: u64,
+    flags: i32,
+    inheritance: u32,
+    entry: &Entry,
+    offset: u64,
+) -> Result<u64, i32> {
+    let backing = match inheritance {
+        VM_INHERIT_SHARE => Backing::Shared,
+        _ => Backing::Private,
+    };
+    let writable = libc::PROT_READ | libc::PROT_WRITE;
+    let placed = local::place(start, length, mask, flags, backing, writable)?;
+    // Past the entry's end the copy is zero, as the rest of a fresh page is.
+    let len = length.min(entry.size - offset);
+    // SAFETY: the mapping just made writable.
+    if let Err(code) = unsafe { entry::copy_out(entry, offset, placed, len) } {
+        // SAFETY: as above, and nothing else has seen it.
+        unsafe { libc::munmap(placed as *mut std::ffi::c_void, length as usize) };
+        return Err(code);
+    }
+    Ok(placed)
+}
+
+/// Give a new mapping the protection and inheritance asked for. The
+/// protection goes through [`local::protect`], so the runtime's hook sees an
+/// executable mapping as it sees one from `mprotect`.
+fn finish(placed: u64, length: u64, protection: i32, inheritance: u32) -> i32 {
+    if inheritance == VM_INHERIT_NONE
+        && starnix::memory::exclude_from_fork(placed as usize, length as usize).is_err()
+    {
+        return KERN_FAILURE;
+    }
+    local::protect(placed, length, false, protection)
 }
 
 /// `kern_return_t vm_deallocate(vm_map_t target_task, vm_address_t address,
@@ -453,8 +679,13 @@ pub unsafe extern "C" fn vm_allocate(task: Name, address: *mut u64, size: u64, f
 pub unsafe extern "C" fn vm_deallocate(task: Name, address: u64, size: u64) -> i32 {
     match space::target(task) {
         Err(code) => code,
-        // SAFETY: the caller's obligation.
-        Ok(Target::Local) => unsafe { local::deallocate(address, size) },
+        Ok(Target::Local) => {
+            if let Some((start, len)) = local::pages(address, size) {
+                entry::forget(start, len);
+            }
+            // SAFETY: the caller's obligation.
+            unsafe { local::deallocate(address, size) }
+        }
         Ok(Target::Remote { pid, image }) => {
             remote::done(task, pid, image, TaskOp::Deallocate { address, size })
         }
@@ -667,7 +898,7 @@ pub extern "C" fn vm_copy(task: Name, source: u64, size: u64, dest: u64) -> i32 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mach::local::VM_FLAGS_ANYWHERE;
+    use crate::mach::info::page_size;
     use crate::mach::space::{HOST_SELF, TASK_SELF};
 
     fn map(prot: i32) -> u64 {
@@ -917,5 +1148,93 @@ mod tests {
         assert_eq!(address, taken);
         // SAFETY: the allocation above.
         unsafe { vm_deallocate(TASK_SELF, taken, 4096) };
+    }
+
+    fn vm_map(address: &mut u64, size: u64, mask: u64, flags: i32, cur: i32, max: i32) -> i32 {
+        // SAFETY: a writable out-parameter.
+        unsafe {
+            mach_vm_map(
+                TASK_SELF,
+                address,
+                size,
+                mask,
+                flags,
+                MACH_PORT_NULL,
+                0,
+                0,
+                cur,
+                max,
+                VM_INHERIT_COPY,
+            )
+        }
+    }
+
+    /// A mask is an alignment when anywhere: an allocator asking for a
+    /// megabyte-aligned arena gets one, zero-filled.
+    #[test]
+    fn maps_zeroed_memory_aligned_to_the_mask() {
+        const MASK: u64 = (1 << 20) - 1;
+        let rw = VM_PROT_READ | VM_PROT_WRITE;
+        let mut address = 0;
+        let size = 3 * page_size();
+        let rc = vm_map(&mut address, size, MASK, VM_FLAGS_ANYWHERE, rw, VM_PROT_ALL);
+        assert_eq!(rc, KERN_SUCCESS);
+        assert_eq!(address & MASK, 0);
+        // SAFETY: the mapping just made, readable and writable.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, size as usize) };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        bytes[size as usize - 1] = 1;
+        unsafe { vm_deallocate(TASK_SELF, address, size) };
+    }
+
+    /// The requested protection is the mapping's, not `vm_allocate`'s
+    /// read-write default.
+    #[test]
+    fn a_mapping_has_the_protection_asked_for() {
+        let mut address = 0;
+        let rc = vm_map(
+            &mut address,
+            1,
+            0,
+            VM_FLAGS_ANYWHERE,
+            VM_PROT_READ,
+            VM_PROT_ALL,
+        );
+        assert_eq!(rc, KERN_SUCCESS);
+        let data = [1_u8];
+        assert_eq!(
+            vm_write(TASK_SELF, address, data.as_ptr() as u64, 1),
+            KERN_PROTECTION_FAILURE
+        );
+        unsafe { vm_deallocate(TASK_SELF, address, page_size()) };
+    }
+
+    #[test]
+    fn a_fixed_address_off_the_mask_is_no_space() {
+        let mut address = 0x7000_0000_0000 + page_size();
+        let rc = vm_map(
+            &mut address,
+            page_size(),
+            (1 << 20) - 1,
+            0,
+            VM_PROT_READ,
+            VM_PROT_ALL,
+        );
+        assert_eq!(rc, KERN_NO_SPACE);
+    }
+
+    #[test]
+    fn a_protection_above_the_maximum_or_an_empty_range_is_refused() {
+        let mut address = 0;
+        let rw = VM_PROT_READ | VM_PROT_WRITE;
+        let anywhere = VM_FLAGS_ANYWHERE;
+        assert_eq!(
+            vm_map(&mut address, page_size(), 0, anywhere, rw, VM_PROT_READ),
+            KERN_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            vm_map(&mut address, 0, 0, anywhere, rw, rw),
+            KERN_INVALID_ARGUMENT
+        );
     }
 }

@@ -2832,9 +2832,10 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     sig!("mach_port_mod_refs", I32, U32, U32, U32, I32),
     sig!("mach_port_type", I32, U32, U32, P),
     //
-    // Passthrough, and unlike `mmap` they need no shim: none of these carries
-    // a protection argument, so none of them can hand the guest a page this
+    // Passthrough, and unlike `mmap` they need no shim: none of these maps
+    // memory with a protection, so none of them can hand the guest a page this
     // CPU would be asked to execute.
+    sig!("mach_make_memory_entry", I32, U32, P, U64, I32, P, U32),
     sig!("mach_make_memory_entry_64", I32, U32, P, U64, I32, P, U32),
     sig!("mach_vm_allocate", I32, U32, P, U64, I32),
     sig!("mach_vm_deallocate", I32, U32, U64, U64),
@@ -2855,6 +2856,43 @@ pub static SIGNATURES: &[FunctionAbi] = &[
     // same bookkeeping as the `mprotect` shim (`shims::vmmap::protect_hook`).
     sig!("mach_vm_protect", I32, U32, U64, U64, U32, I32),
     sig!("vm_protect", I32, U32, U64, U64, U32, I32),
+    // `kern_return_t mach_vm_map(vm_map_t, mach_vm_address_t *, mach_vm_size_t,
+    // mach_vm_offset_t mask, int flags, mem_entry_name_port_t, memory_object_offset_t,
+    // boolean_t copy, vm_prot_t cur, vm_prot_t max, vm_inherit_t)`, whose
+    // protection takes the same path.
+    sig!(
+        "mach_vm_map",
+        I32,
+        U32,
+        P,
+        U64,
+        U64,
+        I32,
+        U32,
+        U64,
+        U32,
+        I32,
+        I32,
+        U32
+    ),
+    sig!(
+        "vm_map", I32, U32, P, U64, U64, I32, U32, U64, U32, I32, I32, U32
+    ),
+    sig!(
+        "vm_map_64",
+        I32,
+        U32,
+        P,
+        U64,
+        U64,
+        I32,
+        U32,
+        U64,
+        U32,
+        I32,
+        I32,
+        U32
+    ),
     sig!("mach_thread_self", U32),
     sig!("mach_timebase_info", I32, P),
     sig!("madvise", U64, P, U64, I32),

@@ -7,6 +7,12 @@ pub mod signal;
 /// than a pipe does.
 pub mod memory {
     pub use crate::memory::piped::{read, write};
+
+    pub use crate::memory::named::object;
+
+    pub fn exclude_from_fork(_address: usize, _len: usize) -> std::io::Result<()> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
 use std::io;
