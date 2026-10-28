@@ -33,7 +33,9 @@ its other 36 crates as `default-members`, so a plain root `cargo build` or
 explicitly with `cargo test -p videocodec` (including `--test source_integrity`)
 or as part of `cargo test --workspace`. A dedicated decoder CI job fetches
 the immutable FFmpeg source before Cargo builds, checks default-member
-selection, and runs all decoder tests and strict Clippy. The existing Nix package selects
+selection, and runs all decoder tests and strict Clippy natively on Linux
+x86-64 and macOS ARM64. The CI membership assertion requires every workspace
+crate other than `videocodec` to remain part of default builds and tests. The existing Nix package selects
 `--package rosemary --bin rosemary`, while the Arch recipe builds a prior
 release. Adding this crate to the workspace does not enable guest VideoToolbox
 or include a decoder in either release artifact.

@@ -5,6 +5,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
       - 'crates/videocodec/**'
       - 'crates/mediabackend/**'
       - '.github/workflows/videocodec.yml'
@@ -13,6 +14,7 @@ on:
     paths:
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'crates/*/Cargo.toml'
       - 'crates/videocodec/**'
       - 'crates/mediabackend/**'
       - '.github/workflows/videocodec.yml'
@@ -22,13 +24,24 @@ permissions:
 
 jobs:
   native:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Confirm the unshipped decoder is opt-in
+      - name: Confirm host architecture
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then
+            test "$(uname -m)" = arm64
+          else
+            test "$(uname -m)" = x86_64
+          fi
+      - name: Confirm only the unshipped decoder is opt-in
         run: |
           cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/workspace.json"
           python3 - "$RUNNER_TEMP/workspace.json" <<'PY'
@@ -36,12 +49,18 @@ jobs:
           with open(sys.argv[1], encoding='utf-8') as f:
               metadata = json.load(f)
           packages = {p['name']: p['id'] for p in metadata['packages']}
-          assert packages['videocodec'] in metadata['workspace_members']
-          assert packages['videocodec'] not in metadata['workspace_default_members']
-          assert packages['rosemary'] in metadata['workspace_default_members']
+          members = set(metadata['workspace_members'])
+          defaults = set(metadata['workspace_default_members'])
+          assert packages['videocodec'] in members
+          assert defaults == members - {packages['videocodec']}, (
+              'unexpected default workspace membership',
+              sorted(members - defaults),
+              sorted(defaults - members),
+          )
           PY
       - name: Prefetch immutable FFmpeg source
         run: |
+          set -o pipefail
           mkdir -p "$RUNNER_TEMP/ffmpeg-source"
           curl --fail --location --retry 3 \
             'https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/946fcce07b6dcd0331c8cc609192aeff5e1924f8' \
