@@ -71,8 +71,9 @@ ordered, but the caller must provide distinct IDs for the life of a session.
 The decoder checks collisions among in-flight outputs, pending inputs, and
 unconsumed dropped notifications without retaining an unbounded set of all
 historical IDs. AVCC framing, NAL headers and expanded packet size are
-validated before checking backpressure, but the Annex B output allocation
-and copy occur only after the output queue admits the packet.
+validated before checking backpressure, but Annex B output allocation and
+copy occur only after the packet can enter the decoder, including in the
+legacy AVCC API.
 The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
 with automatically assigned IDs and plane-based `Frame` output. When the
 completion queue stalls, these methods and `finish()` return recoverable
@@ -99,11 +100,28 @@ picture-timing SEI. Only interlaced first-field repetition maps to
 `FrameLayout.repeat_first_field`; the shared layout does not represent
 progressive frame repetition, which is left unset rather than misrepresented.
 
-A compressed packet rejected with FFmpeg's `AVERROR_INVALIDDATA` is
-reported as `InvalidPacket` without latching decoder failure. Rejected
-packets do not consume an ID, and the same decoder can attempt recovery
-at a subsequent valid IDR. Other native failures that may invalidate
-identity accounting remain terminal.
+A decode error from `avcodec_send_packet` does not imply a rejected
+input: FFmpeg may have retained the opaque packet after accepting it.
+`EAGAIN` and pre-call failures do not consume the input. Once FFmpeg may
+have consumed it, `AVERROR_INVALIDDATA` is acknowledged as accepted;
+its opaque ID is retained and completed as a dropped sample with a decode
+error if no output picture arrives. Clients must not resubmit it. This
+allows the same session to recover at the next IDR without losing ownership
+of a corrupted access unit.
+
+Native source-frame admission is limited by the 4096² SPS-pixel bound,
+64 MiB per-picture source allocation estimate and 256 MiB tracked live
+reference allocation budget. A predictable frame-budget rejection is
+reported as `SourceFrameTooLarge` on that sample's dropped completion,
+not as a fatal decoder state. A later supported IDR may still recover.
+This does not turn arbitrary FFmpeg ENOMEM or unknown decoder errors into
+recoverable conditions.
+
+Interlaced H.264 pictures needing a high-chroma or high-bit-depth swscale
+conversion are rejected as identified frame-local errors: whole-picture
+vertical resampling would mix chroma between fields. Native supported
+8-bit 4:2:0 interlaced frames are left untouched. Field-aware conversion
+is not implemented in this backend.
 
 BT.2020 constant-luminance signals map to the distinct shared
 `ColorMatrix::Bt2020Cl` instead of non-constant-luminance `Bt2020`.
