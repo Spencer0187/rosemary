@@ -970,6 +970,126 @@ mod tests {
     }
 
     #[test]
+    fn sample_duration_matches_native_epoch_rounding_and_intermediate_overflow() {
+        let cases = [
+            (
+                "epoch neutral lhs",
+                CMTimeMake(1, 2),
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(1, 3)
+                },
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(5, 6)
+                },
+            ),
+            (
+                "epoch neutral rhs",
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(1, 2)
+                },
+                CMTimeMake(1, 3),
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(5, 6)
+                },
+            ),
+            (
+                "matching nonzero epochs",
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(1, 2)
+                },
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(1, 3)
+                },
+                CMTimeMake(5, 6),
+            ),
+            (
+                "different nonzero epochs",
+                CMTime {
+                    epoch: 7,
+                    ..CMTimeMake(1, 2)
+                },
+                CMTime {
+                    epoch: 8,
+                    ..CMTimeMake(1, 3)
+                },
+                CMTime::INVALID,
+            ),
+            (
+                "rounded zero lhs",
+                CMTime {
+                    value: 0,
+                    timescale: 2,
+                    flags: 3,
+                    epoch: 0,
+                },
+                CMTimeMake(1, 3),
+                CMTime {
+                    flags: 3,
+                    ..CMTimeMake(1, 3)
+                },
+            ),
+            (
+                "rounded zero rhs",
+                CMTimeMake(1, 3),
+                CMTime {
+                    value: 0,
+                    timescale: 2,
+                    flags: 3,
+                    epoch: 0,
+                },
+                CMTime {
+                    flags: 3,
+                    ..CMTimeMake(1, 3)
+                },
+            ),
+            (
+                "overflow during conversion",
+                CMTimeMake(-5420539530132427298, 7),
+                CMTimeMake(2375011267000674195, 2),
+                CMTime {
+                    value: 2891999904369932385,
+                    timescale: 7,
+                    flags: 3,
+                    epoch: 0,
+                },
+            ),
+        ];
+        for (label, a, b, expected) in cases {
+            let timing = [a, b].map(|duration| CMSampleTimingInfo {
+                duration,
+                presentation_time_stamp: CMTimeMake(0, 1),
+                decode_time_stamp: CMTime::INVALID,
+            });
+            let mut output = core::ptr::null();
+            unsafe {
+                assert_eq!(
+                    CMSampleBufferCreateReady(
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        2,
+                        2,
+                        timing.as_ptr(),
+                        0,
+                        core::ptr::null(),
+                        &mut output,
+                    ),
+                    0,
+                    "{label}"
+                );
+                assert_eq!(CMSampleBufferGetDuration(output), expected, "{label}");
+                corefoundation::api::CFRelease(output);
+            }
+        }
+    }
+
+    #[test]
     fn duration_preserves_native_coremedia_special_states() {
         let block = unsafe { create_block() };
         let numeric = CMTimeMake(2, 30);

@@ -71,17 +71,35 @@ pub(crate) fn add_time(a: CMTime, b: CMTime) -> CMTime {
     if flags & INDEFINITE != 0 {
         return special(INDEFINITE);
     }
-    if !a.is_numeric() || !b.is_numeric() || a.epoch != b.epoch {
+    if !a.is_numeric() || !b.is_numeric() || (a.epoch != 0 && b.epoch != 0 && a.epoch != b.epoch) {
         return CMTime::INVALID;
     }
+    // CoreMedia treats zero epochs as neutral, while adding matching nonzero
+    // epochs produces a time in epoch zero.
+    let epoch = if a.epoch == 0 {
+        b.epoch
+    } else if b.epoch == 0 {
+        a.epoch
+    } else {
+        0
+    };
+    let rounded_flags = (a.flags | b.flags) & HAS_BEEN_ROUNDED;
     // Prefer an exact common timescale. CoreMedia falls back to a nanosecond
     // scale when the LCM is not representable as a CMTime timescale.
     // Continue reducing the scale if the sum's 64-bit numerator would overflow.
     if a.value == 0 {
-        return b;
+        return CMTime {
+            flags: b.flags | rounded_flags,
+            epoch,
+            ..b
+        };
     }
     if b.value == 0 {
-        return a;
+        return CMTime {
+            flags: a.flags | rounded_flags,
+            epoch,
+            ..a
+        };
     }
     let gcd = gcd(u64::from(a.timescale as u32), u64::from(b.timescale as u32));
     let lcm = i64::from(a.timescale) / gcd as i64 * i64::from(b.timescale);
@@ -90,7 +108,11 @@ pub(crate) fn add_time(a: CMTime, b: CMTime) -> CMTime {
         let (lhs, lhs_rounded) = rescale_rounded(a.value, a.timescale, scale);
         let (rhs, rhs_rounded) = rescale_rounded(b.value, b.timescale, scale);
         let sum = lhs + rhs;
-        if let Ok(value) = i64::try_from(sum) {
+        // A native intermediate must itself fit in i64 before the addition;
+        // cancellation cannot hide an out-of-range converted operand.
+        if let (Ok(_), Ok(_), Ok(value)) =
+            (i64::try_from(lhs), i64::try_from(rhs), i64::try_from(sum))
+        {
             return CMTime {
                 value,
                 timescale: scale,
@@ -101,7 +123,7 @@ pub(crate) fn add_time(a: CMTime, b: CMTime) -> CMTime {
                     } else {
                         0
                     },
-                epoch: a.epoch,
+                epoch,
             };
         }
         if scale == 1 {
@@ -248,13 +270,95 @@ mod tests {
             compare_numeric(different_epoch, CMTimeMake(100, 1)),
             Some(Ordering::Greater)
         );
-        assert_eq!(add_time(different_epoch, CMTimeMake(1, 2)), CMTime::INVALID);
+        assert_eq!(
+            add_time(different_epoch, CMTimeMake(1, 2)),
+            CMTime {
+                value: 2,
+                timescale: 2,
+                flags: VALID,
+                epoch: 1
+            }
+        );
         assert!(
             CMTimeGetSeconds(CMTime {
                 timescale: -1,
                 ..CMTimeMake(1, 1)
             })
             .is_nan()
+        );
+    }
+
+    #[test]
+    fn native_epoch_and_rounded_zero_addition_semantics() {
+        let a = CMTimeMake(1, 2);
+        let b = CMTimeMake(1, 3);
+        for (ae, be, expected_epoch, valid) in [
+            (0, 0, 0, true),
+            (0, 7, 7, true),
+            (7, 0, 7, true),
+            (7, 7, 0, true),
+            (7, 8, 0, false),
+            (-7, -7, 0, true),
+            (0, -7, -7, true),
+            (8, -7, 0, false),
+        ] {
+            let lhs = CMTime { epoch: ae, ..a };
+            let rhs = CMTime { epoch: be, ..b };
+            let result = add_time(lhs, rhs);
+            assert_eq!(
+                result,
+                if valid {
+                    CMTime {
+                        value: 5,
+                        timescale: 6,
+                        flags: VALID,
+                        epoch: expected_epoch,
+                    }
+                } else {
+                    CMTime::INVALID
+                },
+                "epochs {ae}+{be}"
+            );
+        }
+        let rounded_zero = CMTime {
+            value: 0,
+            timescale: 2,
+            flags: VALID | HAS_BEEN_ROUNDED,
+            epoch: 7,
+        };
+        for (left, right) in [(rounded_zero, b), (b, rounded_zero)] {
+            assert_eq!(
+                add_time(left, right),
+                CMTime {
+                    value: 1,
+                    timescale: 3,
+                    flags: VALID | HAS_BEEN_ROUNDED,
+                    epoch: 7,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn native_intermediate_overflow_reduces_timescale_before_cancellation() {
+        let a = CMTimeMake(-5420539530132427298, 7);
+        let b = CMTimeMake(2375011267000674195, 2);
+        let expected = CMTime {
+            value: 2891999904369932385,
+            timescale: 7,
+            flags: 3,
+            epoch: 0,
+        };
+        assert_eq!(add_time(a, b), expected);
+        assert_eq!(
+            add_time(
+                CMTime {
+                    flags: VALID | HAS_BEEN_ROUNDED,
+                    ..a
+                },
+                b
+            ),
+            expected
         );
     }
 

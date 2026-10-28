@@ -12,6 +12,7 @@ const BAD_OFFSET: i32 = -12703;
 const BAD_LENGTH: i32 = -12704;
 const BAD_POINTER: i32 = -12705;
 const EMPTY_BUFFER: i32 = -12706;
+const UNALLOCATED_BLOCK: i32 = -12707;
 const ALLOC_FAILED: i32 = -12701;
 const STRUCT_ALLOC_FAILED: i32 = -12700;
 const ASSURE_NOW: u32 = 1;
@@ -75,15 +76,25 @@ impl Storage {
             .allocate()
     }
 
-    fn pointer(&mut self, offset: usize) -> Result<*mut u8, i32> {
-        let mut shared = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
-        let status = shared.allocate();
+    // Reading must not change a deferred block's allocation state. Apple
+    // returns kCMBlockBufferUnallocatedBlockErr until memory is explicitly
+    // assured or an operation such as ReplaceDataBytes creates its storage.
+    fn pointer(&self, offset: usize) -> Result<*mut u8, i32> {
+        let shared = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
+        if shared.memory.is_null() {
+            return Err(UNALLOCATED_BLOCK);
+        }
+        // SAFETY: creation validates start+length within allocation capacity;
+        // all aliases retain this allocation and its bytes never move.
+        Ok(unsafe { shared.memory.add(self.start + offset) })
+    }
+
+    fn pointer_assuring_allocation(&mut self, offset: usize) -> Result<*mut u8, i32> {
+        let status = self.allocate();
         if status != 0 {
             return Err(status);
         }
-        // SAFETY: creation validates start+length within allocation capacity;
-        // all aliases hold the same allocation alive and its bytes never move.
-        Ok(unsafe { shared.memory.add(self.start + offset) })
+        self.pointer(offset)
     }
 }
 
@@ -253,11 +264,26 @@ pub unsafe extern "C" fn CMBlockBufferCreateContiguous(
         length
     };
     if length > source_len - offset {
-        return BAD_OFFSET;
+        return BAD_LENGTH;
     }
     if !corefoundation::api::supports_malloc_allocator(block_allocator) || !custom_source.is_null()
     {
         return BAD_CUSTOM_SOURCE;
+    }
+    // Contiguity cannot be established by allocating an uninitialized source.
+    // Even the force-copy/assure flags must reject a deferred source until its
+    // actual bytes have become available.
+    {
+        let guard = original.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .allocation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .memory
+            .is_null()
+        {
+            return UNALLOCATED_BLOCK;
+        }
     }
     // The force-copy flag explicitly overrides the aliasing fast path. This
     // new owned allocation does not change if the original is later modified.
@@ -348,7 +374,7 @@ pub unsafe extern "C" fn CMBlockBufferGetDataPointer(
     let Some(contents) = (unsafe { storage(handle) }) else {
         return BAD_POINTER;
     };
-    let mut guard = contents.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = contents.lock().unwrap_or_else(|e| e.into_inner());
     if guard.length == 0 {
         return EMPTY_BUFFER;
     }
@@ -385,7 +411,7 @@ pub unsafe extern "C" fn CMBlockBufferCopyDataBytes(
     let Some(contents) = (unsafe { storage(handle) }) else {
         return BAD_POINTER;
     };
-    let mut guard = contents.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = contents.lock().unwrap_or_else(|e| e.into_inner());
     if offset > guard.length {
         return BAD_OFFSET;
     }
@@ -425,7 +451,7 @@ pub unsafe extern "C" fn CMBlockBufferReplaceDataBytes(
     if source.is_null() {
         return BAD_POINTER;
     }
-    let pointer = match guard.pointer(offset) {
+    let pointer = match guard.pointer_assuring_allocation(offset) {
         Ok(pointer) => pointer,
         Err(status) => return status,
     };
@@ -877,6 +903,122 @@ mod tests {
             );
             assert_eq!(&readback, b"xxxx");
             corefoundation::api::CFRelease(independent);
+        }
+    }
+
+    #[test]
+    fn deferred_blocks_reject_access_until_replace_allocates_backing() {
+        for flags in [0u32, ASSURE_NOW] {
+            let mut source = core::ptr::null();
+            unsafe {
+                assert_eq!(
+                    CMBlockBufferCreateWithMemoryBlock(
+                        core::ptr::null(),
+                        core::ptr::null_mut(),
+                        4,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                        4,
+                        flags,
+                        &mut source,
+                    ),
+                    0
+                );
+                let expected = if flags == 0 { UNALLOCATED_BLOCK } else { 0 };
+                let mut pointer = core::ptr::null_mut();
+                assert_eq!(
+                    CMBlockBufferGetDataPointer(
+                        source,
+                        0,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                        &mut pointer
+                    ),
+                    expected
+                );
+                let mut copied = [0u8; 4];
+                assert_eq!(
+                    CMBlockBufferCopyDataBytes(source, 0, 4, copied.as_mut_ptr().cast()),
+                    expected
+                );
+                for copy_flags in [
+                    0u32,
+                    ASSURE_NOW,
+                    ALWAYS_COPY_DATA,
+                    ASSURE_NOW | ALWAYS_COPY_DATA,
+                ] {
+                    let mut contiguous = core::ptr::null();
+                    let status = CMBlockBufferCreateContiguous(
+                        core::ptr::null(),
+                        source,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                        4,
+                        copy_flags,
+                        &mut contiguous,
+                    );
+                    if flags == 0 {
+                        assert_eq!(status, UNALLOCATED_BLOCK, "flags {copy_flags}");
+                        assert!(contiguous.is_null());
+                    } else {
+                        assert_eq!(status, 0, "flags {copy_flags}");
+                        corefoundation::api::CFRelease(contiguous);
+                    }
+                }
+                assert_eq!(
+                    CMBlockBufferReplaceDataBytes(b"ABCD".as_ptr().cast(), source, 0, 4),
+                    0
+                );
+                assert_eq!(
+                    CMBlockBufferCopyDataBytes(source, 0, 4, copied.as_mut_ptr().cast()),
+                    0
+                );
+                assert_eq!(&copied, b"ABCD");
+                corefoundation::api::CFRelease(source);
+            }
+        }
+    }
+
+    #[test]
+    fn contiguous_invalid_length_is_distinct_from_invalid_starting_offset() {
+        let mut source = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ASSURE_NOW,
+                    &mut source,
+                ),
+                0
+            );
+            for (offset, length, expected) in
+                [(3, 2, BAD_LENGTH), (0, 5, BAD_LENGTH), (4, 1, BAD_OFFSET)]
+            {
+                let mut contiguous = core::ptr::dangling::<c_void>();
+                assert_eq!(
+                    CMBlockBufferCreateContiguous(
+                        core::ptr::null(),
+                        source,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        offset,
+                        length,
+                        0,
+                        &mut contiguous,
+                    ),
+                    expected
+                );
+                assert!(contiguous.is_null());
+            }
+            corefoundation::api::CFRelease(source);
         }
     }
 
