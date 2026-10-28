@@ -314,6 +314,12 @@ pub fn shim_for(name: &str) -> Option<Shim> {
         "CMSampleBufferGetPresentationTimeStamp" => {
             bind!("CMSampleBufferGetPresentationTimeStamp" => presentation_time_stamp)
         }
+        "CMSampleBufferGetDecodeTimeStamp" => {
+            bind!("CMSampleBufferGetDecodeTimeStamp" => presentation_time_stamp)
+        }
+        "CMSampleBufferGetDuration" => {
+            bind!("CMSampleBufferGetDuration" => presentation_time_stamp)
+        }
         "VTCompressionSessionCompleteFrames" => {
             bind!("VTCompressionSessionCompleteFrames" => complete_frames)
         }
@@ -355,6 +361,17 @@ mod tests {
         let words = time.to_words();
         assert_eq!(words, [0x0102_0304_0506_0708, (1 << 32) | 600, u64::MAX]);
         assert_eq!(CmTime::from_words(words), time);
+    }
+
+    #[test]
+    fn all_sample_time_getters_use_the_guest_struct_return_shim() {
+        for name in [
+            "CMSampleBufferGetPresentationTimeStamp",
+            "CMSampleBufferGetDecodeTimeStamp",
+            "CMSampleBufferGetDuration",
+        ] {
+            assert!(shim_for(name).is_some(), "{name}");
+        }
     }
 
     /// Twelve bytes and three members, which is what makes the SysV return
