@@ -17,7 +17,6 @@ const REQUIRED_PARAMETER: i32 = -12731;
 const INVALID_ENTRY_COUNT: i32 = -12738;
 const ALLOCATION_FAILED: i32 = -12730;
 const BUFFER_NOT_READY: i32 = -12733;
-const INVALID_SAMPLE_DATA: i32 = -12742;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,6 +146,11 @@ pub unsafe extern "C" fn CMSampleBufferCreate(
         return REQUIRED_PARAMETER;
     }
     unsafe { *out = core::ptr::null() };
+    if allocator
+        == corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null)
+    {
+        return ALLOCATION_FAILED;
+    }
     if !corefoundation::api::supports_malloc_allocator(allocator) {
         return REQUIRED_PARAMETER;
     }
@@ -184,20 +188,9 @@ pub unsafe extern "C" fn CMSampleBufferCreate(
         // SAFETY: validated caller-provided readable sizes array.
         unsafe { core::slice::from_raw_parts(size_array, num_size_entries as usize) }.to_vec()
     };
-    if !data.is_null() && !sizes.is_empty() {
-        let total = if sizes.len() == 1 {
-            sizes[0].checked_mul(num_samples as usize)
-        } else {
-            sizes
-                .iter()
-                .try_fold(0usize, |sum, size| sum.checked_add(*size))
-        };
-        // Sample size metadata can exceed the bytes currently present in the
-        // block. Bounds are checked when callers actually access block data.
-        if total.is_none() {
-            return INVALID_SAMPLE_DATA;
-        }
-    }
+    // Sample sizes are caller-owned metadata, not a contiguous extent. Apple
+    // accepts SIZE_MAX entries even when their sum or product overflows size_t.
+    // Actual byte reads remain bounded by CMBlockBuffer's checked operations.
 
     // Retain dependencies only after validation has succeeded.
     // SAFETY: both references were type-checked above.
@@ -343,28 +336,57 @@ pub unsafe extern "C" fn CMSampleBufferMakeDataReady(handle: *const c_void) -> i
     status
 }
 
-/// Earliest numerical time, including out-of-presentation-order samples.
-/// An unorderable entry cannot produce a reliable timestamp.
+/// The earliest timestamp uses CoreMedia's time ordering. Invalid entries
+/// are excluded unless all entries are invalid. Among the remaining values,
+/// negative infinity precedes finite numeric times, then indefinite, then
+/// positive infinity. Numeric times compare exactly by epoch and timescale.
 fn earliest_time(
     timing: &[CMSampleTimingInfo],
     get: impl Fn(&CMSampleTimingInfo) -> CMTime,
 ) -> CMTime {
-    let Some(first) = timing.first() else {
-        return CMTime::INVALID;
-    };
-    let mut earliest = get(first);
-    if timing.len() == 1 {
-        return earliest;
-    }
-    for entry in timing.iter().skip(1) {
-        let candidate = get(entry);
-        match time::compare_numeric(candidate, earliest) {
-            Some(core::cmp::Ordering::Less) => earliest = candidate,
-            Some(_) => {}
-            None => return CMTime::INVALID,
+    fn rank(time: CMTime) -> Option<u8> {
+        if time.flags & time::VALID == 0 {
+            return None;
         }
+        if time.flags & time::NEGATIVE_INFINITY != 0 {
+            return Some(0);
+        }
+        if time.is_numeric() {
+            return Some(1);
+        }
+        if time.flags & time::INDEFINITE != 0 {
+            return Some(2);
+        }
+        if time.flags & time::POSITIVE_INFINITY != 0 {
+            return Some(3);
+        }
+        None
     }
-    earliest
+
+    let mut earliest: Option<CMTime> = None;
+    for entry in timing {
+        let candidate = get(entry);
+        let Some(candidate_rank) = rank(candidate) else {
+            continue;
+        };
+        earliest = match earliest {
+            None => Some(candidate),
+            Some(current) => {
+                let current_rank = rank(current).expect("selected timestamp is valid");
+                if candidate_rank < current_rank
+                    || (candidate_rank == current_rank
+                        && candidate_rank == 1
+                        && time::compare_numeric(candidate, current)
+                            == Some(core::cmp::Ordering::Less))
+                {
+                    Some(candidate)
+                } else {
+                    Some(current)
+                }
+            }
+        };
+    }
+    earliest.unwrap_or(CMTime::INVALID)
 }
 
 /// # Safety
@@ -970,6 +992,164 @@ mod tests {
     }
 
     #[test]
+    fn mixed_special_timestamps_follow_native_coremedia_order_for_pts_and_dts() {
+        // Apple's two-entry oracle establishes this ordering: negative
+        // infinity < numeric < indefinite < positive infinity, while invalid
+        // timestamps are skipped. Numeric timestamps compare epochs first.
+        let invalid = CMTime::INVALID;
+        let indefinite = CMTime {
+            flags: time::VALID | time::INDEFINITE,
+            ..invalid
+        };
+        let positive = CMTime {
+            flags: time::VALID | time::POSITIVE_INFINITY,
+            ..invalid
+        };
+        let negative = CMTime {
+            flags: time::VALID | time::NEGATIVE_INFINITY,
+            ..invalid
+        };
+        let numeric = time::CMTimeMake(1, 30);
+        let numeric_neg = time::CMTimeMake(-1, 30);
+        let zero = time::CMTimeMake(0, 1);
+        let epoch7 = CMTime {
+            epoch: 7,
+            ..numeric
+        };
+        let epoch8 = CMTime {
+            epoch: 8,
+            ..numeric
+        };
+        let times = [
+            invalid,
+            indefinite,
+            positive,
+            negative,
+            numeric,
+            numeric_neg,
+            zero,
+            epoch7,
+            epoch8,
+        ];
+        let rank = [4u8, 2, 3, 0, 1, 1, 1, 1, 1];
+        for (i, &a) in times.iter().enumerate() {
+            for (j, &b) in times.iter().enumerate() {
+                let expected = if i == 0 {
+                    b
+                } else if j == 0 {
+                    a
+                } else if rank[i] != rank[j] {
+                    if rank[i] < rank[j] { a } else { b }
+                } else if rank[i] == 1
+                    && time::compare_numeric(b, a) == Some(core::cmp::Ordering::Less)
+                {
+                    b
+                } else {
+                    a
+                };
+                let timing = [a, b].map(|stamp| CMSampleTimingInfo {
+                    duration: time::CMTimeMake(1, 30),
+                    presentation_time_stamp: stamp,
+                    decode_time_stamp: stamp,
+                });
+                let mut output = core::ptr::null();
+                unsafe {
+                    assert_eq!(
+                        CMSampleBufferCreateReady(
+                            core::ptr::null(),
+                            core::ptr::null(),
+                            core::ptr::null(),
+                            2,
+                            2,
+                            timing.as_ptr(),
+                            0,
+                            core::ptr::null(),
+                            &mut output,
+                        ),
+                        0,
+                        "construct {i}, {j}"
+                    );
+                    assert_eq!(
+                        CMSampleBufferGetPresentationTimeStamp(output),
+                        expected,
+                        "PTS {i}, {j}"
+                    );
+                    assert_eq!(
+                        CMSampleBufferGetDecodeTimeStamp(output),
+                        expected,
+                        "DTS {i}, {j}"
+                    );
+                    corefoundation::api::CFRelease(output);
+                }
+            }
+        }
+        // The first invalid entry must not hide a later finite timestamp, and
+        // an invalid-only sample must remain invalid.
+        assert_eq!(earliest_time(&[], |x| x.duration), CMTime::INVALID);
+    }
+
+    #[test]
+    fn overflowing_sample_size_metadata_is_preserved_exactly() {
+        let block = unsafe { create_block() };
+        let huge = usize::MAX;
+        unsafe {
+            for (count, sizes) in [(1, [huge, 0]), (2, [huge, 1]), (2, [huge, huge])] {
+                let mut output = core::ptr::null();
+                assert_eq!(
+                    CMSampleBufferCreateReady(
+                        core::ptr::null(),
+                        block,
+                        core::ptr::null(),
+                        2,
+                        0,
+                        core::ptr::null(),
+                        count,
+                        sizes.as_ptr(),
+                        &mut output,
+                    ),
+                    0,
+                    "{count} entries {sizes:?}"
+                );
+                assert_eq!(CMSampleBufferGetSampleSize(output, 0), huge);
+                assert_eq!(
+                    CMSampleBufferGetSampleSize(output, 1),
+                    if count == 1 { huge } else { sizes[1] }
+                );
+                let mut bytes = [0u8; 4];
+                assert_eq!(
+                    crate::block_buffer::CMBlockBufferCopyDataBytes(
+                        block,
+                        0,
+                        4,
+                        bytes.as_mut_ptr().cast(),
+                    ),
+                    0
+                );
+                corefoundation::api::CFRelease(output);
+            }
+            corefoundation::api::CFRelease(block);
+            let mut output = core::ptr::null();
+            assert_eq!(
+                CMSampleBufferCreateReady(
+                    corefoundation::api::standard_allocator(
+                        corefoundation::api::StandardAllocator::Null
+                    ),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    1,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null(),
+                    &mut output,
+                ),
+                ALLOCATION_FAILED
+            );
+            assert!(output.is_null());
+        }
+    }
+
+    #[test]
     fn sample_duration_matches_native_epoch_rounding_and_intermediate_overflow() {
         let cases = [
             (
@@ -1261,7 +1441,7 @@ mod tests {
                     core::ptr::null(),
                     &mut sample,
                 ),
-                REQUIRED_PARAMETER
+                ALLOCATION_FAILED
             );
             assert!(sample.is_null());
         }
@@ -1350,9 +1530,11 @@ mod tests {
                     overflowing.as_ptr(),
                     &mut result
                 ),
-                INVALID_SAMPLE_DATA
+                0
             );
-            assert!(result.is_null());
+            assert_eq!(CMSampleBufferGetSampleSize(result, 0), usize::MAX);
+            assert_eq!(CMSampleBufferGetSampleSize(result, 1), 1);
+            corefoundation::api::CFRelease(result);
             assert_eq!(
                 CMSampleBufferCreate(
                     core::ptr::null(),

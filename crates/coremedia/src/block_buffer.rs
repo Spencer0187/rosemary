@@ -186,6 +186,11 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
     }
     // SAFETY: out is a writable result slot.
     unsafe { *out = core::ptr::null() };
+    if allocator
+        == corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null)
+    {
+        return STRUCT_ALLOC_FAILED;
+    }
     if !corefoundation::api::supports_malloc_allocator(allocator) {
         return BAD_CUSTOM_SOURCE;
     }
@@ -200,10 +205,17 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
     }
     // Guest embedded CustomBlockSource callback pointers are not ABI-thunked.
     // Reject borrowed external memory rather than guessing who releases it.
-    if !memory.is_null()
-        || !corefoundation::api::supports_malloc_allocator(block_allocator)
-        || !custom_source.is_null()
+    if !memory.is_null() || !custom_source.is_null() {
+        return BAD_CUSTOM_SOURCE;
+    }
+    if block_allocator
+        == corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null)
     {
+        // NULL supplied memory necessarily requires backing allocation, which
+        // the distinguished null allocator explicitly cannot provide.
+        return ALLOC_FAILED;
+    }
+    if !corefoundation::api::supports_malloc_allocator(block_allocator) {
         return BAD_CUSTOM_SOURCE;
     }
     let mut storage = Storage {
@@ -245,6 +257,11 @@ pub unsafe extern "C" fn CMBlockBufferCreateContiguous(
         return BAD_POINTER;
     }
     unsafe { *out = core::ptr::null() };
+    if allocator
+        == corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null)
+    {
+        return STRUCT_ALLOC_FAILED;
+    }
     if !corefoundation::api::supports_malloc_allocator(allocator) {
         return BAD_CUSTOM_SOURCE;
     }
@@ -266,7 +283,12 @@ pub unsafe extern "C" fn CMBlockBufferCreateContiguous(
     if length > source_len - offset {
         return BAD_LENGTH;
     }
-    if !corefoundation::api::supports_malloc_allocator(block_allocator) || !custom_source.is_null()
+    if !custom_source.is_null() {
+        return BAD_CUSTOM_SOURCE;
+    }
+    let block_allocator_is_null = block_allocator
+        == corefoundation::api::standard_allocator(corefoundation::api::StandardAllocator::Null);
+    if !block_allocator_is_null && !corefoundation::api::supports_malloc_allocator(block_allocator)
     {
         return BAD_CUSTOM_SOURCE;
     }
@@ -288,6 +310,9 @@ pub unsafe extern "C" fn CMBlockBufferCreateContiguous(
     // The force-copy flag explicitly overrides the aliasing fast path. This
     // new owned allocation does not change if the original is later modified.
     if flags & ALWAYS_COPY_DATA != 0 {
+        if block_allocator_is_null {
+            return ALLOC_FAILED;
+        }
         let mut copied = core::ptr::null();
         let status = unsafe {
             CMBlockBufferCreateWithMemoryBlock(
@@ -519,7 +544,7 @@ mod tests {
                     0,
                     &mut out,
                 ),
-                BAD_CUSTOM_SOURCE
+                STRUCT_ALLOC_FAILED
             );
             assert!(out.is_null());
         }
@@ -593,7 +618,7 @@ mod tests {
                     ASSURE_NOW,
                     &mut output
                 ),
-                BAD_CUSTOM_SOURCE
+                ALLOC_FAILED
             );
             assert!(output.is_null());
             assert_eq!(
@@ -611,6 +636,139 @@ mod tests {
                 BAD_CUSTOM_SOURCE
             );
             assert!(output.is_null());
+        }
+    }
+
+    #[test]
+    fn native_null_allocator_matrix_for_block_creation_and_contiguous_views() {
+        use corefoundation::api::{StandardAllocator, standard_allocator};
+        let unsupported = standard_allocator(StandardAllocator::Null);
+        let mut source = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ASSURE_NOW,
+                    &mut source,
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"abcd".as_ptr().cast(), source, 0, 4),
+                0
+            );
+            // No backing allocation is necessary for an already contiguous view.
+            for flags in [0u32, ASSURE_NOW] {
+                let mut view = core::ptr::null();
+                assert_eq!(
+                    CMBlockBufferCreateContiguous(
+                        core::ptr::null(),
+                        source,
+                        unsupported,
+                        core::ptr::null(),
+                        0,
+                        4,
+                        flags,
+                        &mut view,
+                    ),
+                    0
+                );
+                let mut p = core::ptr::null_mut();
+                let mut q = core::ptr::null_mut();
+                assert_eq!(
+                    CMBlockBufferGetDataPointer(
+                        source,
+                        0,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                        &mut p
+                    ),
+                    0
+                );
+                assert_eq!(
+                    CMBlockBufferGetDataPointer(
+                        view,
+                        0,
+                        core::ptr::null_mut(),
+                        core::ptr::null_mut(),
+                        &mut q
+                    ),
+                    0
+                );
+                assert_eq!(p, q);
+                corefoundation::api::CFRelease(view);
+            }
+            let mut out = core::ptr::dangling::<c_void>();
+            for flags in [ALWAYS_COPY_DATA, ALWAYS_COPY_DATA | ASSURE_NOW] {
+                assert_eq!(
+                    CMBlockBufferCreateContiguous(
+                        core::ptr::null(),
+                        source,
+                        unsupported,
+                        core::ptr::null(),
+                        0,
+                        4,
+                        flags,
+                        &mut out,
+                    ),
+                    ALLOC_FAILED
+                );
+                assert!(out.is_null());
+            }
+            // NULL structure allocator cannot allocate the CF block object.
+            assert_eq!(
+                CMBlockBufferCreateContiguous(
+                    unsupported,
+                    source,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    0,
+                    &mut out,
+                ),
+                STRUCT_ALLOC_FAILED
+            );
+            assert!(out.is_null());
+            for flags in [0, ASSURE_NOW] {
+                assert_eq!(
+                    CMBlockBufferCreateWithMemoryBlock(
+                        core::ptr::null(),
+                        core::ptr::null_mut(),
+                        4,
+                        unsupported,
+                        core::ptr::null(),
+                        0,
+                        4,
+                        flags,
+                        &mut out,
+                    ),
+                    ALLOC_FAILED
+                );
+                assert!(out.is_null());
+                assert_eq!(
+                    CMBlockBufferCreateWithMemoryBlock(
+                        unsupported,
+                        core::ptr::null_mut(),
+                        4,
+                        core::ptr::null(),
+                        core::ptr::null(),
+                        0,
+                        4,
+                        flags,
+                        &mut out,
+                    ),
+                    STRUCT_ALLOC_FAILED
+                );
+                assert!(out.is_null());
+            }
+            corefoundation::api::CFRelease(source);
         }
     }
 
