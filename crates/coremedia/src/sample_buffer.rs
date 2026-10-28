@@ -167,11 +167,9 @@ pub unsafe extern "C" fn CMSampleBufferCreate(
     {
         return REQUIRED_PARAMETER;
     }
-    if !data.is_null() && num_samples == 0 {
-        // CoreMedia permits zero samples, but they cannot claim sizes.
-        if num_size_entries != 0 {
-            return INVALID_ENTRY_COUNT;
-        }
+    // Empty samples cannot carry per-sample size entries, even without data.
+    if num_samples == 0 && num_size_entries != 0 {
+        return INVALID_ENTRY_COUNT;
     }
 
     let timing = if num_timing_entries == 0 {
@@ -244,12 +242,6 @@ pub unsafe extern "C" fn CMSampleBufferCreateReady(
     size_array: *const usize,
     out: *mut *const c_void,
 ) -> i32 {
-    if data.is_null() {
-        if !out.is_null() {
-            unsafe { *out = core::ptr::null() };
-        }
-        return REQUIRED_PARAMETER;
-    }
     unsafe {
         CMSampleBufferCreate(
             allocator,
@@ -400,10 +392,10 @@ pub unsafe extern "C" fn CMSampleBufferGetDuration(handle: *const c_void) -> CMT
         return CMTime::INVALID;
     };
     let Some(first) = contents.timing.first() else {
-        return CMTime::INVALID;
+        return time::CMTimeMake(0, 1);
     };
     if contents.timing.len() == 1 {
-        return time::multiply_time(first.duration, contents.count);
+        return time::multiply_time(first.duration, contents.count.max(1));
     }
     let mut total = first.duration;
     for entry in contents.timing.iter().skip(1) {
@@ -432,7 +424,7 @@ pub unsafe extern "C" fn CMSampleBufferGetSampleAttachmentsArray(
     if *guard != 0 {
         return *guard as *const c_void;
     }
-    if create_if_necessary == 0 {
+    if create_if_necessary == 0 || contents.count == 0 {
         return core::ptr::null();
     }
     let mut dictionaries = Vec::new();
@@ -815,6 +807,79 @@ mod tests {
             );
             corefoundation::api::CFRelease(sample);
             corefoundation::api::CFRelease(block);
+        }
+    }
+
+    #[test]
+    fn null_data_ready_samples_and_default_duration_match_native() {
+        let mut output = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMSampleBufferCreateReady(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    1,
+                    0,
+                    core::ptr::null(),
+                    0,
+                    core::ptr::null(),
+                    &mut output
+                ),
+                0
+            );
+            assert!(!output.is_null());
+            assert!(CMSampleBufferGetDataBuffer(output).is_null());
+            assert_eq!(CMSampleBufferGetDuration(output), CMTimeMake(0, 1));
+            corefoundation::api::CFRelease(output);
+        }
+    }
+
+    #[test]
+    fn zero_sample_timing_size_and_attachment_contracts() {
+        let duration = CMTimeMake(12, 30);
+        let timing = CMSampleTimingInfo {
+            duration,
+            presentation_time_stamp: CMTimeMake(0, 30),
+            decode_time_stamp: CMTime::INVALID,
+        };
+        let mut output = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMSampleBufferCreateReady(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    1,
+                    &timing,
+                    0,
+                    core::ptr::null(),
+                    &mut output
+                ),
+                0
+            );
+            assert_eq!(CMSampleBufferGetNumSamples(output), 0);
+            assert_eq!(CMSampleBufferGetDuration(output), duration);
+            assert!(CMSampleBufferGetSampleAttachmentsArray(output, 0).is_null());
+            assert!(CMSampleBufferGetSampleAttachmentsArray(output, 1).is_null());
+            corefoundation::api::CFRelease(output);
+            let size = [4usize];
+            assert_eq!(
+                CMSampleBufferCreateReady(
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    0,
+                    core::ptr::null(),
+                    1,
+                    size.as_ptr(),
+                    &mut output
+                ),
+                INVALID_ENTRY_COUNT
+            );
+            assert!(output.is_null());
         }
     }
 

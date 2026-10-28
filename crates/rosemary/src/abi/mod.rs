@@ -384,6 +384,25 @@ mod callback_tests {
     use crate::thunk::ThunkSignature;
 
     #[test]
+    fn sample_readiness_callback_reenters_guest_only_on_slow_path() {
+        use super::{Classification, classify};
+        assert_eq!(
+            classify(0, "CMSampleBufferMakeDataReady"),
+            Classification::Slow
+        );
+        assert_eq!(
+            classify(0, "_CMSampleBufferMakeDataReady"),
+            Classification::Slow
+        );
+        let super::table::Lookup::Known(abi) =
+            super::table::lookup(0, "CMSampleBufferMakeDataReady")
+        else {
+            panic!("sample readiness import ABI is missing");
+        };
+        assert!(abi.reenters_guest);
+    }
+
+    #[test]
     fn a_null_typed_callback_needs_no_jit() {
         let signature = ThunkSignature::new(vec![], None).unwrap();
         assert_eq!(

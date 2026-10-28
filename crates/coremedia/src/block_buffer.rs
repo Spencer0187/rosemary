@@ -5,7 +5,7 @@
 use core::ffi::c_void;
 use objc::class::Class;
 use objc::object::Id;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 const BAD_CUSTOM_SOURCE: i32 = -12702;
 const BAD_OFFSET: i32 = -12703;
@@ -27,19 +27,21 @@ pub struct CustomBlockSource {
     _private: [u8; 0],
 }
 
-struct Storage {
+struct Allocation {
     memory: *mut u8,
     capacity: usize,
-    start: usize,
-    length: usize,
 }
 
-impl Storage {
+// The allocation pointer is read, allocated and freed only while its shared
+// Mutex is held, so distinct buffer views can own it across threads.
+unsafe impl Send for Allocation {}
+
+impl Allocation {
     fn allocate(&mut self) -> i32 {
         if !self.memory.is_null() {
             return 0;
         }
-        // SAFETY: the only supported backing memory comes from malloc.
+        // SAFETY: only malloc-backed storage is supported.
         let raw = unsafe { malloc(self.capacity) };
         if raw.is_null() {
             return ALLOC_FAILED;
@@ -47,25 +49,40 @@ impl Storage {
         self.memory = raw.cast();
         0
     }
+}
 
-    fn pointer(&mut self, offset: usize) -> Result<*mut u8, i32> {
-        let status = self.allocate();
-        if status != 0 {
-            return Err(status);
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        if !self.memory.is_null() {
+            // SAFETY: the last buffer retaining the allocation owns the free.
+            unsafe { free(self.memory.cast()) };
         }
-        // SAFETY: creation validates start + length <= capacity, callers check
-        // offset <= length, and memory remains fixed until the final release.
-        Ok(unsafe { self.memory.add(self.start + offset) })
     }
 }
 
-impl Drop for Storage {
-    fn drop(&mut self) {
-        if self.memory.is_null() {
-            return;
+struct Storage {
+    allocation: Arc<Mutex<Allocation>>,
+    start: usize,
+    length: usize,
+}
+
+impl Storage {
+    fn allocate(&mut self) -> i32 {
+        self.allocation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .allocate()
+    }
+
+    fn pointer(&mut self, offset: usize) -> Result<*mut u8, i32> {
+        let mut shared = self.allocation.lock().unwrap_or_else(|e| e.into_inner());
+        let status = shared.allocate();
+        if status != 0 {
+            return Err(status);
         }
-        // SAFETY: this storage is allocated exclusively by libc malloc.
-        unsafe { free(self.memory.cast()) };
+        // SAFETY: creation validates start+length within allocation capacity;
+        // all aliases hold the same allocation alive and its bytes never move.
+        Ok(unsafe { shared.memory.add(self.start + offset) })
     }
 }
 
@@ -163,8 +180,11 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
     if block_length == 0 || block_length > isize::MAX as usize {
         return BAD_LENGTH;
     }
-    if offset > block_length || length > block_length - offset {
+    if offset > block_length {
         return BAD_OFFSET;
+    }
+    if length == 0 || length > block_length - offset {
+        return BAD_LENGTH;
     }
     // Guest embedded CustomBlockSource callback pointers are not ABI-thunked.
     // Reject borrowed external memory rather than guessing who releases it.
@@ -175,8 +195,10 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
         return BAD_CUSTOM_SOURCE;
     }
     let mut storage = Storage {
-        memory: core::ptr::null_mut(),
-        capacity: block_length,
+        allocation: Arc::new(Mutex::new(Allocation {
+            memory: core::ptr::null_mut(),
+            capacity: block_length,
+        })),
         start: offset,
         length,
     };
@@ -232,43 +254,32 @@ pub unsafe extern "C" fn CMBlockBufferCreateContiguous(
     if length > source_len - offset {
         return BAD_OFFSET;
     }
-    let mut copy = core::ptr::null();
-    let status = unsafe {
-        CMBlockBufferCreateWithMemoryBlock(
-            core::ptr::null(),
-            core::ptr::null_mut(),
-            length,
-            block_allocator,
-            custom_source,
-            0,
-            length,
-            flags | ASSURE_NOW,
-            &mut copy,
-        )
-    };
-    if status != 0 {
-        return status;
+    if !corefoundation::api::supports_malloc_allocator(block_allocator) || !custom_source.is_null()
+    {
+        return BAD_CUSTOM_SOURCE;
     }
-    let mut pointer = core::ptr::null_mut();
-    let status = unsafe {
-        CMBlockBufferGetDataPointer(
-            copy,
-            0,
-            core::ptr::null_mut(),
-            core::ptr::null_mut(),
-            &mut pointer,
-        )
+    // Every represented block is already contiguous. A new view retains its
+    // allocation; releasing the original cannot invalidate the view.
+    let (allocation, start) = {
+        let guard = original.lock().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&guard.allocation), guard.start + offset)
     };
-    let status = if status == 0 {
-        unsafe { CMBlockBufferCopyDataBytes(source, offset, length, pointer.cast()) }
-    } else {
-        status
+    let mut view = Storage {
+        allocation,
+        start,
+        length,
     };
-    if status != 0 {
-        unsafe { corefoundation::api::CFRelease(copy) };
-        return status;
+    if flags & ASSURE_NOW != 0 {
+        let status = view.allocate();
+        if status != 0 {
+            return status;
+        }
     }
-    unsafe { *out = copy };
+    let result = new_buffer(view);
+    if result.is_null() {
+        return STRUCT_ALLOC_FAILED;
+    }
+    unsafe { *out = result };
     0
 }
 
@@ -332,11 +343,11 @@ pub unsafe extern "C" fn CMBlockBufferCopyDataBytes(
         return BAD_POINTER;
     };
     let mut guard = contents.lock().unwrap_or_else(|e| e.into_inner());
-    if offset > guard.length || length > guard.length - offset {
+    if offset > guard.length {
         return BAD_OFFSET;
     }
-    if length == 0 {
-        return 0;
+    if length == 0 || length > guard.length - offset {
+        return BAD_LENGTH;
     }
     if destination.is_null() {
         return BAD_POINTER;
@@ -362,11 +373,11 @@ pub unsafe extern "C" fn CMBlockBufferReplaceDataBytes(
         return BAD_POINTER;
     };
     let mut guard = contents.lock().unwrap_or_else(|e| e.into_inner());
-    if offset > guard.length || length > guard.length - offset {
+    if offset > guard.length {
         return BAD_OFFSET;
     }
-    if length == 0 {
-        return 0;
+    if length == 0 || length > guard.length - offset {
+        return BAD_LENGTH;
     }
     if source.is_null() {
         return BAD_POINTER;
@@ -584,11 +595,11 @@ mod tests {
             );
             assert_eq!(
                 CMBlockBufferCopyDataBytes(source, 3, 2, ptr.cast()),
-                BAD_OFFSET
+                BAD_LENGTH
             );
             assert_eq!(
                 CMBlockBufferReplaceDataBytes(b"a".as_ptr().cast(), source, 4, 1),
-                BAD_OFFSET
+                BAD_LENGTH
             );
             let mut destination = [0; 4];
             assert_eq!(
@@ -616,7 +627,7 @@ mod tests {
                 CMBlockBufferReplaceDataBytes(b"xyz".as_ptr().cast(), copy, 0, 3),
                 0
             );
-            assert_eq!(core::slice::from_raw_parts(ptr, available), b"BCD");
+            assert_eq!(core::slice::from_raw_parts(ptr, available), b"xyz");
             let mut bytes = [0; 3];
             assert_eq!(
                 CMBlockBufferCopyDataBytes(copy, 0, 3, bytes.as_mut_ptr().cast()),
@@ -629,6 +640,177 @@ mod tests {
             assert_eq!(CMBlockBufferGetDataLength(copy), 3);
             corefoundation::api::CFRelease(copy);
             corefoundation::api::CFRelease(source);
+        }
+    }
+
+    #[test]
+    fn aliased_contiguous_views_share_bytes_and_keep_allocation_alive() {
+        let mut source = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    8,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    2,
+                    4,
+                    ASSURE_NOW,
+                    &mut source
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"abcd".as_ptr().cast(), source, 0, 4),
+                0
+            );
+            let mut full = core::ptr::null();
+            assert_eq!(
+                CMBlockBufferCreateContiguous(
+                    core::ptr::null(),
+                    source,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    0,
+                    &mut full
+                ),
+                0
+            );
+            assert_ne!(full, source);
+            let mut source_ptr = core::ptr::null_mut();
+            let mut full_ptr = core::ptr::null_mut();
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    source,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut source_ptr
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    full,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut full_ptr
+                ),
+                0
+            );
+            assert_eq!(source_ptr, full_ptr);
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"xxxx".as_ptr().cast(), full, 0, 4),
+                0
+            );
+            let mut readback = [0; 4];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(source, 0, 4, readback.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&readback, b"xxxx");
+
+            let mut slice = core::ptr::null();
+            assert_eq!(
+                CMBlockBufferCreateContiguous(
+                    core::ptr::null(),
+                    full,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    1,
+                    2,
+                    0,
+                    &mut slice
+                ),
+                0
+            );
+            let mut slice_ptr = core::ptr::null_mut();
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    slice,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut slice_ptr
+                ),
+                0
+            );
+            assert_eq!(slice_ptr, source_ptr.add(1));
+            corefoundation::api::CFRelease(source);
+            corefoundation::api::CFRelease(full);
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"yz".as_ptr().cast(), slice, 0, 2),
+                0
+            );
+            let mut readback = [0; 2];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(slice, 0, 2, readback.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&readback, b"yz");
+            corefoundation::api::CFRelease(slice);
+        }
+    }
+
+    #[test]
+    fn zero_length_operations_and_out_of_range_classification_match_native() {
+        let mut block = core::ptr::dangling::<c_void>();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    0,
+                    0,
+                    &mut block
+                ),
+                BAD_LENGTH
+            );
+            assert!(block.is_null());
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ASSURE_NOW,
+                    &mut block
+                ),
+                0
+            );
+            let mut bytes = [0u8; 4];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(block, 0, 0, bytes.as_mut_ptr().cast()),
+                BAD_LENGTH
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"a".as_ptr().cast(), block, 0, 0),
+                BAD_LENGTH
+            );
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(block, 3, 2, bytes.as_mut_ptr().cast()),
+                BAD_LENGTH
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"ab".as_ptr().cast(), block, 3, 2),
+                BAD_LENGTH
+            );
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(block, 5, 1, bytes.as_mut_ptr().cast()),
+                BAD_OFFSET
+            );
+            corefoundation::api::CFRelease(block);
         }
     }
 
@@ -664,7 +846,7 @@ mod tests {
                     0,
                     &mut out
                 ),
-                BAD_OFFSET
+                BAD_LENGTH
             );
             let memory = [0u8; 4];
             assert_eq!(

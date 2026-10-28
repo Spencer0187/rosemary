@@ -3654,7 +3654,7 @@ pub static SIGNATURES: &[FunctionAbi] = &[
         P,
         P
     ),
-    sig!("CMSampleBufferMakeDataReady", I32, P),
+    rsig!("CMSampleBufferMakeDataReady", I32, P),
     sig!("CMSampleBufferSetDataReady", I32, P),
     sig!("CMSampleBufferGetSampleSize", U64, P, I64),
     sig!("CMSampleBufferDataIsReady", BOOL, P),
