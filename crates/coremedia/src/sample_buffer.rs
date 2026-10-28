@@ -194,9 +194,9 @@ pub unsafe extern "C" fn CMSampleBufferCreate(
                 .iter()
                 .try_fold(0usize, |sum, size| sum.checked_add(*size))
         };
-        if total
-            .is_none_or(|n| n > unsafe { crate::block_buffer::CMBlockBufferGetDataLength(data) })
-        {
+        // Sample size metadata can exceed the bytes currently present in the
+        // block. Bounds are checked when callers actually access block data.
+        if total.is_none() {
             return INVALID_SAMPLE_DATA;
         }
     }
@@ -403,12 +403,12 @@ pub unsafe extern "C" fn CMSampleBufferGetDuration(handle: *const c_void) -> CMT
         return CMTime::INVALID;
     };
     if contents.timing.len() == 1 {
-        return time::multiply_numeric(first.duration, contents.count);
+        return time::multiply_time(first.duration, contents.count);
     }
     let mut total = first.duration;
     for entry in contents.timing.iter().skip(1) {
-        total = time::add_numeric(total, entry.duration);
-        if !total.is_numeric() {
+        total = time::add_time(total, entry.duration);
+        if total.flags & time::VALID == 0 {
             return CMTime::INVALID;
         }
     }
@@ -819,6 +819,111 @@ mod tests {
     }
 
     #[test]
+    fn duration_preserves_native_coremedia_special_states() {
+        let block = unsafe { create_block() };
+        let numeric = CMTimeMake(2, 30);
+        let indefinite = CMTime {
+            flags: time::VALID | time::INDEFINITE,
+            ..CMTime::INVALID
+        };
+        let positive = CMTime {
+            flags: time::VALID | time::POSITIVE_INFINITY,
+            ..CMTime::INVALID
+        };
+        let negative = CMTime {
+            flags: time::VALID | time::NEGATIVE_INFINITY,
+            ..CMTime::INVALID
+        };
+        let cases = [
+            ("indefinite", indefinite, indefinite),
+            ("positive infinity", positive, positive),
+            ("negative infinity", negative, negative),
+            ("invalid", CMTime::INVALID, CMTime::INVALID),
+            ("numeric", numeric, numeric),
+        ];
+        for (label, duration, expected) in cases {
+            let timing = CMSampleTimingInfo {
+                duration,
+                presentation_time_stamp: CMTimeMake(0, 30),
+                decode_time_stamp: CMTime::INVALID,
+            };
+            let mut sample = core::ptr::null();
+            unsafe {
+                assert_eq!(
+                    CMSampleBufferCreateReady(
+                        core::ptr::null(),
+                        block,
+                        core::ptr::null(),
+                        1,
+                        1,
+                        &timing,
+                        0,
+                        core::ptr::null(),
+                        &mut sample,
+                    ),
+                    0,
+                    "{label}"
+                );
+                assert_eq!(CMSampleBufferGetDuration(sample), expected, "{label}");
+                corefoundation::api::CFRelease(sample);
+            }
+        }
+        let cases = [
+            ("indefinite + numeric", indefinite, numeric, indefinite),
+            ("numeric + indefinite", numeric, indefinite, indefinite),
+            ("positive + numeric", positive, numeric, positive),
+            ("negative + numeric", negative, numeric, negative),
+            ("opposite infinities", positive, negative, CMTime::INVALID),
+            (
+                "invalid + numeric",
+                CMTime::INVALID,
+                numeric,
+                CMTime::INVALID,
+            ),
+            (
+                "numeric + invalid",
+                numeric,
+                CMTime::INVALID,
+                CMTime::INVALID,
+            ),
+            ("indefinite + positive", indefinite, positive, positive),
+            ("positive + indefinite", positive, indefinite, positive),
+            ("indefinite + negative", indefinite, negative, negative),
+            ("positive + positive", positive, positive, positive),
+            ("negative + negative", negative, negative, negative),
+            ("two numeric", numeric, numeric, CMTimeMake(4, 30)),
+        ];
+        for (label, first, second, expected) in cases {
+            let timing = [first, second].map(|duration| CMSampleTimingInfo {
+                duration,
+                presentation_time_stamp: CMTimeMake(0, 30),
+                decode_time_stamp: CMTime::INVALID,
+            });
+            let mut sample = core::ptr::null();
+            unsafe {
+                assert_eq!(
+                    CMSampleBufferCreateReady(
+                        core::ptr::null(),
+                        block,
+                        core::ptr::null(),
+                        2,
+                        2,
+                        timing.as_ptr(),
+                        0,
+                        core::ptr::null(),
+                        &mut sample,
+                    ),
+                    0,
+                    "{label}"
+                );
+                assert_eq!(CMSampleBufferGetDuration(sample), expected, "{label}");
+                corefoundation::api::CFRelease(sample);
+            }
+        }
+        unsafe { corefoundation::api::CFRelease(block) };
+    }
+
+    #[test]
     fn refuses_unsupported_sample_structure_allocator() {
         let mut sample = core::ptr::dangling::<c_void>();
         unsafe {
@@ -932,14 +1037,12 @@ mod tests {
                 ),
                 REQUIRED_PARAMETER
             );
+            // Metadata may declare more bytes than the block currently holds.
             let oversize = [5usize];
             assert_eq!(
-                CMSampleBufferCreate(
+                CMSampleBufferCreateReady(
                     core::ptr::null(),
                     block,
-                    1,
-                    None,
-                    core::ptr::null_mut(),
                     core::ptr::null(),
                     1,
                     0,
@@ -948,8 +1051,37 @@ mod tests {
                     oversize.as_ptr(),
                     &mut result
                 ),
+                0
+            );
+            assert_eq!(CMSampleBufferGetSampleSize(result, 0), 5);
+            assert_eq!(CMSampleBufferGetDataBuffer(result), block);
+            let mut destination = [0u8; 5];
+            assert_ne!(
+                crate::block_buffer::CMBlockBufferCopyDataBytes(
+                    block,
+                    0,
+                    5,
+                    destination.as_mut_ptr().cast()
+                ),
+                0
+            );
+            corefoundation::api::CFRelease(result);
+            let overflowing = [usize::MAX, 1];
+            assert_eq!(
+                CMSampleBufferCreateReady(
+                    core::ptr::null(),
+                    block,
+                    core::ptr::null(),
+                    2,
+                    0,
+                    core::ptr::null(),
+                    2,
+                    overflowing.as_ptr(),
+                    &mut result
+                ),
                 INVALID_SAMPLE_DATA
             );
+            assert!(result.is_null());
             assert_eq!(
                 CMSampleBufferCreate(
                     core::ptr::null(),

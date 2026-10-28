@@ -168,7 +168,10 @@ pub unsafe extern "C" fn CMBlockBufferCreateWithMemoryBlock(
     }
     // Guest embedded CustomBlockSource callback pointers are not ABI-thunked.
     // Reject borrowed external memory rather than guessing who releases it.
-    if !memory.is_null() || !block_allocator.is_null() || !custom_source.is_null() {
+    if !memory.is_null()
+        || !corefoundation::api::supports_malloc_allocator(block_allocator)
+        || !custom_source.is_null()
+    {
         return BAD_CUSTOM_SOURCE;
     }
     let mut storage = Storage {
@@ -439,6 +442,95 @@ mod tests {
                 BAD_CUSTOM_SOURCE
             );
             assert!(out.is_null());
+        }
+    }
+
+    #[test]
+    fn uses_standard_backing_allocator_for_allocated_and_contiguous_blocks() {
+        use corefoundation::api::{StandardAllocator, standard_allocator};
+        for allocator in [
+            core::ptr::null(),
+            standard_allocator(StandardAllocator::Malloc),
+            standard_allocator(StandardAllocator::SystemDefault),
+            standard_allocator(StandardAllocator::MallocZone),
+        ] {
+            let mut source = core::ptr::null();
+            unsafe {
+                assert_eq!(
+                    CMBlockBufferCreateWithMemoryBlock(
+                        core::ptr::null(),
+                        core::ptr::null_mut(),
+                        4,
+                        allocator,
+                        core::ptr::null(),
+                        0,
+                        4,
+                        ASSURE_NOW,
+                        &mut source
+                    ),
+                    0
+                );
+                assert_eq!(CMBlockBufferGetDataLength(source), 4);
+                assert_eq!(
+                    CMBlockBufferReplaceDataBytes(b"abcd".as_ptr().cast(), source, 0, 4),
+                    0
+                );
+                let mut contiguous = core::ptr::null();
+                assert_eq!(
+                    CMBlockBufferCreateContiguous(
+                        core::ptr::null(),
+                        source,
+                        allocator,
+                        core::ptr::null(),
+                        0,
+                        4,
+                        0,
+                        &mut contiguous
+                    ),
+                    0
+                );
+                let mut copied = [0u8; 4];
+                assert_eq!(
+                    CMBlockBufferCopyDataBytes(contiguous, 0, 4, copied.as_mut_ptr().cast()),
+                    0
+                );
+                assert_eq!(&copied, b"abcd");
+                corefoundation::api::CFRelease(contiguous);
+                corefoundation::api::CFRelease(source);
+            }
+        }
+        let mut output = core::ptr::dangling::<c_void>();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    standard_allocator(StandardAllocator::Null),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ASSURE_NOW,
+                    &mut output
+                ),
+                BAD_CUSTOM_SOURCE
+            );
+            assert!(output.is_null());
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::dangling_mut(),
+                    4,
+                    standard_allocator(StandardAllocator::Malloc),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    0,
+                    &mut output
+                ),
+                BAD_CUSTOM_SOURCE
+            );
+            assert!(output.is_null());
         }
     }
 

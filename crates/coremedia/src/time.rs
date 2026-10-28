@@ -43,8 +43,33 @@ pub(crate) fn compare_numeric(a: CMTime, b: CMTime) -> Option<Ordering> {
     })
 }
 
-/// Return an exact sum, or invalid if it is not representable in CMTime.
-pub(crate) fn add_numeric(a: CMTime, b: CMTime) -> CMTime {
+/// Canonical nonnumeric times have zero value, scale and epoch.
+fn special(flags: u32) -> CMTime {
+    CMTime {
+        flags: VALID | flags,
+        ..CMTime::INVALID
+    }
+}
+
+/// CoreMedia treats infinity and indefinite as meaningful valid durations.
+/// Opposing infinities and any invalid time still yield kCMTimeInvalid.
+pub(crate) fn add_time(a: CMTime, b: CMTime) -> CMTime {
+    if (a.flags & VALID) == 0 || (b.flags & VALID) == 0 {
+        return CMTime::INVALID;
+    }
+    let flags = a.flags | b.flags;
+    if flags & POSITIVE_INFINITY != 0 && flags & NEGATIVE_INFINITY != 0 {
+        return CMTime::INVALID;
+    }
+    if flags & POSITIVE_INFINITY != 0 {
+        return special(POSITIVE_INFINITY);
+    }
+    if flags & NEGATIVE_INFINITY != 0 {
+        return special(NEGATIVE_INFINITY);
+    }
+    if flags & INDEFINITE != 0 {
+        return special(INDEFINITE);
+    }
     if !a.is_numeric() || !b.is_numeric() || a.epoch != b.epoch {
         return CMTime::INVALID;
     }
@@ -66,8 +91,20 @@ pub(crate) fn add_numeric(a: CMTime, b: CMTime) -> CMTime {
     }
 }
 
-pub(crate) fn multiply_numeric(time: CMTime, count: isize) -> CMTime {
-    if !time.is_numeric() || count < 0 {
+pub(crate) fn multiply_time(time: CMTime, count: isize) -> CMTime {
+    if time.flags & VALID == 0 || count < 0 {
+        return CMTime::INVALID;
+    }
+    if time.flags & POSITIVE_INFINITY != 0 {
+        return special(POSITIVE_INFINITY);
+    }
+    if time.flags & NEGATIVE_INFINITY != 0 {
+        return special(NEGATIVE_INFINITY);
+    }
+    if time.flags & INDEFINITE != 0 {
+        return special(INDEFINITE);
+    }
+    if !time.is_numeric() {
         return CMTime::INVALID;
     }
     let Ok(value) = i64::try_from(i128::from(time.value) * count as i128) else {
@@ -123,20 +160,17 @@ mod tests {
             Some(Ordering::Less)
         );
         assert_eq!(
-            add_numeric(CMTimeMake(1, 3), CMTimeMake(1, 6)),
+            add_time(CMTimeMake(1, 3), CMTimeMake(1, 6)),
             CMTimeMake(3, 6)
         );
-        assert_eq!(multiply_numeric(CMTimeMake(2, 3), 3), CMTimeMake(6, 3));
+        assert_eq!(multiply_time(CMTimeMake(2, 3), 3), CMTimeMake(6, 3));
+        assert_eq!(multiply_time(CMTimeMake(i64::MAX, 1), 2), CMTime::INVALID);
         assert_eq!(
-            multiply_numeric(CMTimeMake(i64::MAX, 1), 2),
+            add_time(CMTimeMake(i64::MAX, 1), CMTimeMake(1, 1)),
             CMTime::INVALID
         );
         assert_eq!(
-            add_numeric(CMTimeMake(i64::MAX, 1), CMTimeMake(1, 1)),
-            CMTime::INVALID
-        );
-        assert_eq!(
-            add_numeric(CMTimeMake(1, i32::MAX), CMTimeMake(1, i32::MAX - 1)),
+            add_time(CMTimeMake(1, i32::MAX), CMTimeMake(1, i32::MAX - 1)),
             CMTime::INVALID
         );
         let different_epoch = CMTime {
@@ -147,10 +181,7 @@ mod tests {
             compare_numeric(different_epoch, CMTimeMake(100, 1)),
             Some(Ordering::Greater)
         );
-        assert_eq!(
-            add_numeric(different_epoch, CMTimeMake(1, 2)),
-            CMTime::INVALID
-        );
+        assert_eq!(add_time(different_epoch, CMTimeMake(1, 2)), CMTime::INVALID);
         assert!(
             CMTimeGetSeconds(CMTime {
                 timescale: -1,
@@ -158,6 +189,37 @@ mod tests {
             })
             .is_nan()
         );
+    }
+
+    #[test]
+    fn special_durations_follow_native_video_timing_rules() {
+        let indefinite = special(INDEFINITE);
+        let positive = special(POSITIVE_INFINITY);
+        let negative = special(NEGATIVE_INFINITY);
+        let numeric = CMTimeMake(1, 30);
+        for (time, expected) in [
+            (indefinite, indefinite),
+            (positive, positive),
+            (negative, negative),
+            (CMTime::INVALID, CMTime::INVALID),
+        ] {
+            assert_eq!(multiply_time(time, 1), expected);
+            assert_eq!(multiply_time(time, 2), expected);
+        }
+        for (left, right, expected) in [
+            (indefinite, numeric, indefinite),
+            (numeric, indefinite, indefinite),
+            (positive, indefinite, positive),
+            (negative, indefinite, negative),
+            (positive, negative, CMTime::INVALID),
+            (negative, positive, CMTime::INVALID),
+            (CMTime::INVALID, positive, CMTime::INVALID),
+            (numeric, CMTime::INVALID, CMTime::INVALID),
+            (positive, numeric, positive),
+            (numeric, negative, negative),
+        ] {
+            assert_eq!(add_time(left, right), expected);
+        }
     }
 
     #[test]
