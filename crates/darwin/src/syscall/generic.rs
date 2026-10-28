@@ -57,6 +57,15 @@ fn handle_unix_syscall(number: u32, args: [u64; 6]) -> Result<u64, i32> {
         }
         numbers::bsd::SYS_getpid => Ok(crate::process::getpid() as _),
         numbers::bsd::SYS_getppid => Ok(crate::process::getppid() as _),
+        numbers::bsd::SYS_munmap => {
+            unix_call!(unsafe crate::vmmap::munmap(args[0], args[1]))
+        }
+        numbers::bsd::SYS_mprotect => {
+            unix_call!(unsafe crate::vmmap::mprotect(args[1], args[2], args[3]))
+        }
+        numbers::bsd::SYS_madvise => {
+            unix_call!(unsafe crate::vmmap::madvise(args[1], args[2], args[3]))
+        }
         _ => Err(DARWIN_ENOSYS),
     }
 }
