@@ -14,7 +14,7 @@ depends=(
     libxkbcommon
     zlib
 )
-makedepends=(cargo)
+makedepends=(cargo gcc git make)
 optdepends=(
     'openal: OpenAL support'
     'sdl3: For running GUI apps'
@@ -24,19 +24,29 @@ optdepends=(
     'webkitgtk-6.0: WebView support'
 )
 options=(!lto)
-source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('b95e9b8b86efe2a3c96246054a89dd212e85c7458d5e6c0499dd498fc72bf4c9')
+# FFmpeg source is an explicit, checksum-verified input. Its exact commit and
+# tree digest are independently verified by crates/videocodec/build.rs.
+_ffmpeg_commit=946fcce07b6dcd0331c8cc609192aeff5e1924f8
+source=(
+    "$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz"
+    "ffmpeg-$_ffmpeg_commit.tar.gz::https://codeload.github.com/FFmpeg/FFmpeg/tar.gz/$_ffmpeg_commit"
+)
+sha256sums=(
+    'b95e9b8b86efe2a3c96246054a89dd212e85c7458d5e6c0499dd498fc72bf4c9'
+    '0aa2b1de2a5698b20a23e93d539a9a8e82ca0117496c5bdf05d198805f42bb3b'
+)
 
 prepare() {
     cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
-    cargo fetch --locked --target host-tuple
+    cargo fetch --locked --target x86_64-unknown-linux-gnu
 }
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
+    export ROSEMARY_FFMPEG_SOURCE="$srcdir/FFmpeg-$_ffmpeg_commit"
     cargo build --frozen --release
 }
 

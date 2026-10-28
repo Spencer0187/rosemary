@@ -214,6 +214,9 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
         av_buffer_unref(&token->ref);
         free(token);
     }
+    // A refused malformed packet never entered the decoder. It can be
+    // rejected as input without poisoning a session that may later reach IDR.
+    if (result == AVERROR_INVALIDDATA) return 3;
     return result == AVERROR(EAGAIN) ? 1 : result;
 }
 
@@ -269,6 +272,10 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     // Ordinary 8-bit 4:2:0 frames keep their native memory layout.
     if (f->format != AV_PIX_FMT_YUV420P && f->format != AV_PIX_FMT_YUVJ420P &&
         f->format != AV_PIX_FMT_NV12) {
+        // swscale has non-constant-luminance BT.2020 coefficients only.
+        // Do not silently decode BT.2020 CL using the BT.601 matrix.
+        if (source->colorspace == AVCOL_SPC_BT2020_CL)
+            return AVERROR_INVALIDDATA;
         decoder->converter = sws_getCachedContext(
             decoder->converter, f->width, f->height, f->format,
             f->width, f->height, AV_PIX_FMT_YUV420P,

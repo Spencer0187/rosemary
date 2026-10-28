@@ -36,7 +36,10 @@ pub enum ChromaSiting {
 pub enum ColorMatrix {
     Bt601,
     Bt709,
+    /// BT.2020 non-constant-luminance YCbCr coefficients.
     Bt2020,
+    /// BT.2020 constant-luminance YCbCr (not equivalent to BT.2020 NCL).
+    Bt2020Cl,
     Rgb,
     Fcc,
     Smpte240m,

@@ -75,7 +75,11 @@ The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
 with automatically assigned IDs and plane-based `Frame` output. When the
 completion queue stalls, these methods and `finish()` return recoverable
 `videocodec::Error::Backpressure`; consume notifications using the inherent
-`Decoder::take_dropped()` and retry the same unaccepted input. The legacy
+`Decoder::take_dropped()` and retry the same unaccepted input.
+The legacy `finish()` resumes FFmpeg's terminal receive loop after
+notification backpressure; success requires a native EOF, not merely a
+full completion queue. Previously received frames remain buffered for the
+successful retry. The legacy
 automatic-ID counter never emits the reserved exhaustion value, but the
 `mediabackend` trait accepts the entire opaque `u64` identity domain.
 
@@ -92,6 +96,24 @@ FFmpeg `repeat_pict` represents frame doubling/tripling for progressive H.264
 picture-timing SEI. Only interlaced first-field repetition maps to
 `FrameLayout.repeat_first_field`; the shared layout does not represent
 progressive frame repetition, which is left unset rather than misrepresented.
+
+A compressed packet rejected with FFmpeg's `AVERROR_INVALIDDATA` is
+reported as `InvalidPacket` without latching decoder failure. Rejected
+packets do not consume an ID, and the same decoder can attempt recovery
+at a subsequent valid IDR. Other native failures that may invalidate
+identity accounting remain terminal.
+
+BT.2020 constant-luminance signals map to the distinct shared
+`ColorMatrix::Bt2020Cl` instead of non-constant-luminance `Bt2020`.
+Native I420/NV12 output retains its signaled metadata. Converting an
+unsupported bit depth/chroma format using BT.2020 constant-luminance
+coefficients fails for that specific picture, rather than silently
+applying BT.601 conversion coefficients.
+
+Arch packaging supplies checksum-verified, pinned FFmpeg source explicitly
+via `ROSEMARY_FFMPEG_SOURCE`. The build script independently verifies the
+source commit/tree and never needs to clone during the package build;
+Git, Make and a C compiler are declared as build dependencies.
 
 FFmpeg reserves `i64::MIN` for absent timestamps, so callers supplying that
 exact number receive `InvalidTimestamp` rather than silent corruption.

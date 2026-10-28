@@ -364,6 +364,9 @@ impl Decoder {
         if status == 1 {
             return Err(Error::Backpressure);
         }
+        if status == 3 {
+            return Err(Error::InvalidPacket);
+        }
         if status != 0 {
             return Err(self.latch(Error::Codec(status)));
         }
@@ -378,33 +381,41 @@ impl Decoder {
     /// Finish delayed/reordered frames. A drained decoder must be recreated.
     pub fn finish(&mut self) -> Result<Vec<Frame>, Error> {
         self.check_fatal()?;
-        if self.finished {
-            return Ok(std::mem::take(&mut self.legacy_ready));
+        if self.dropped.len() >= MAX_QUEUED_DROPS {
+            return Err(Error::Backpressure);
+        }
+        if !self.finished {
+            let mut status = self.send(None, None, None, 0);
+            if status == 1 {
+                let ready = self.receive_ready()?;
+                self.legacy_ready.extend(ready);
+                if self.dropped.len() >= MAX_QUEUED_DROPS {
+                    return Err(Error::Backpressure);
+                }
+                status = self.send(None, None, None, 0);
+            }
+            if status == 1 {
+                return Err(Error::Backpressure);
+            }
+            if status != 0 {
+                return Err(self.latch(Error::Codec(status)));
+            }
+            self.finished = true;
+        }
+        if !self.eof {
+            let ready = self.receive_ready()?;
+            self.legacy_ready.extend(ready);
         }
         if self.dropped.len() >= MAX_QUEUED_DROPS {
             return Err(Error::Backpressure);
         }
-        let mut result = self.send(None, None, None, 0);
-        if result == 1 {
-            let received = self.receive_ready()?;
-            self.legacy_ready.extend(received);
-            if self.dropped.len() >= MAX_QUEUED_DROPS {
-                return Err(Error::Backpressure);
-            }
-            result = self.send(None, None, None, 0);
-        }
-        if result == 1 {
+        if !self.eof {
+            // FFmpeg has not confirmed terminal EOF; keep all produced
+            // frames and resume after the caller drains completions.
             return Err(Error::Backpressure);
         }
-        if result != 0 {
-            return Err(self.latch(Error::Codec(result)));
-        }
-        self.finished = true;
-        let mut frames = std::mem::take(&mut self.legacy_ready);
-        frames.extend(self.receive_ready()?);
-        self.eof = true;
         self.reap_dropped()?;
-        Ok(frames)
+        Ok(std::mem::take(&mut self.legacy_ready))
     }
 
     /// Drain completion notifications when using the legacy Annex B/AVCC API.
@@ -794,7 +805,8 @@ fn copy_frame(view: &FrameView) -> Result<Frame, Error> {
             4 => ColorMatrix::Fcc,
             5 | 6 => ColorMatrix::Bt601,
             7 => ColorMatrix::Smpte240m,
-            9 | 10 => ColorMatrix::Bt2020,
+            9 => ColorMatrix::Bt2020,
+            10 => ColorMatrix::Bt2020Cl,
             2 => ColorMatrix::Unknown,
             other => ColorMatrix::Other(other),
         },
@@ -973,6 +985,7 @@ impl media::VideoDecoder for Decoder {
                 self.pump_queued().map_err(media_error)?;
                 return Err(media::Error::Backpressure);
             }
+            3 => return Err(media_error(Error::InvalidPacket)),
             err => return Err(media_error(self.latch(Error::Codec(err)))),
         }
         self.pump_queued().map_err(media_error)?;
@@ -1394,31 +1407,20 @@ mod tests {
             units.push(sample);
         }
         assert_eq!(units.len(), 60);
-        // The first packet is invalid at FFmpeg send time. It is rejected,
-        // not counted as an accepted-but-dropped input. The subsequent inputs
-        // are accepted even though no reference picture has arrived yet.
-        let mut rejected = Decoder::new(&sets, NalLength::Four).unwrap();
+        // A rejected malformed packet is not accepted or completed; keep the
+        // same native FFmpeg session for the next IDR recovery sequence.
         assert!(matches!(
-            rejected.submit(AccessUnit {
+            decoder.submit(AccessUnit {
                 id: 0,
                 bytes: &units[0],
                 pts_ns: None,
                 dts_ns: None,
                 duration_ns: None
             }),
-            Err(media::Error::Decode(_))
+            Err(media::Error::InvalidInput(_))
         ));
-        assert!(matches!(
-            rejected.submit(AccessUnit {
-                id: 1,
-                bytes: &units[1],
-                pts_ns: None,
-                dts_ns: None,
-                duration_ns: None
-            }),
-            Err(media::Error::Decode(_))
-        ));
-        drop(rejected);
+        assert!(decoder.fatal.is_none());
+        assert!(!decoder.id_in_flight(0));
         let mut decoded = Vec::new();
         let mut dropped = Vec::new();
         let mut had_live_drop = false;
@@ -1931,6 +1933,109 @@ mod tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..59).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn legacy_finish_retries_after_full_drop_queue_without_stranding_frames() {
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let mut units = Vec::new();
+        let mut unit = Vec::new();
+        for nal in nals_from_fixture(stream) {
+            if nal[0] & 31 == 9 && !unit.is_empty() {
+                units.push(std::mem::take(&mut unit));
+            }
+            unit.extend_from_slice(&[0, 0, 0, 1]);
+            unit.extend_from_slice(nal);
+        }
+        if !unit.is_empty() {
+            units.push(unit);
+        }
+        assert_eq!(units.len(), 8);
+        let mut ids = Vec::new();
+        for unit in &units {
+            ids.extend(
+                decoder
+                    .submit_annex_b(unit, None, None)
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| f.id),
+            );
+        }
+        assert!(ids.len() < 8, "fixture must have delayed reordered output");
+        // Send the native flush, but do not receive its remaining pictures.
+        // This is exactly the state after finish() successfully sent EOS but
+        // a frame-local failure filled the notification queue during receive.
+        assert_eq!(decoder.send(None, None, None, 0), 0);
+        decoder.finished = true;
+        for id in 10000..10000 + (MAX_QUEUED_DROPS - 1) as u64 {
+            decoder
+                .dropped
+                .push_back(media::DroppedSample { id, error: None });
+        }
+        decoder.pending.insert(
+            9000,
+            SourceTiming {
+                pts: None,
+                dts: None,
+                duration: None,
+            },
+        );
+        let y = [0_u8; 4];
+        let c = [0_u8; 1];
+        let malformed = FrameView {
+            id: 9000,
+            identity_valid: 1,
+            width: 2,
+            height: 2,
+            format: 0,
+            crop_left: 2,
+            planes: [y.as_ptr(), c.as_ptr(), c.as_ptr()],
+            strides: [2, 1, 1],
+            ..FrameView::default()
+        };
+        assert!(decoder.process_view(&malformed, None).unwrap().is_none());
+        assert_eq!(decoder.dropped.len(), MAX_QUEUED_DROPS);
+        assert!(!decoder.eof);
+        assert!(matches!(decoder.finish(), Err(Error::Backpressure)));
+        assert!(!decoder.eof);
+        let dropped = (0..MAX_QUEUED_DROPS)
+            .map(|_| decoder.take_dropped().unwrap())
+            .collect::<Vec<_>>();
+        assert!(
+            dropped
+                .iter()
+                .any(|sample| sample.id == 9000 && sample.error.is_some())
+        );
+        ids.extend(decoder.finish().unwrap().into_iter().map(|f| f.id));
+        assert!(decoder.eof);
+        assert!(decoder.finish().unwrap().is_empty());
+        ids.sort_unstable();
+        assert_eq!(ids, (0..8).collect::<Vec<_>>());
+        assert!(decoder.pending.is_empty());
+        assert!(decoder.fatal.is_none());
+    }
+
+    #[test]
+    fn bt2020_constant_luminance_is_preserved_or_explicitly_rejected() {
+        let direct = include_bytes!("../tests/fixtures/i420_bt2020cl_32x32.h264");
+        let mut decoder = decoder_for_fixture(direct);
+        let mut frames = decoder.submit_annex_b(direct, None, None).unwrap();
+        frames.extend(decoder.finish().unwrap());
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].layout.matrix, ColorMatrix::Bt2020Cl);
+        assert!(decoder.take_dropped().is_none());
+
+        let unsupported = include_bytes!("../tests/fixtures/high444_bt2020cl_32x32.h264");
+        let mut decoder = decoder_for_fixture(unsupported);
+        let mut frames = decoder.submit_annex_b(unsupported, None, None).unwrap();
+        frames.extend(decoder.finish().unwrap());
+        assert!(frames.is_empty());
+        let dropped = decoder.take_dropped().unwrap();
+        assert_eq!(dropped.id, 0);
+        assert!(matches!(dropped.error, Some(media::Error::Decode(_))));
+        assert!(decoder.fatal.is_none());
+        assert!(decoder.take_dropped().is_none());
     }
 
     #[test]
