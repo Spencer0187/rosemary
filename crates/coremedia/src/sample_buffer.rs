@@ -884,6 +884,92 @@ mod tests {
     }
 
     #[test]
+    fn sample_duration_uses_native_rounded_addition_and_multiplication() {
+        let cases = [
+            (
+                "coprime timescales",
+                [CMTimeMake(1, i32::MAX), CMTimeMake(1, i32::MAX - 1)],
+                2,
+                2,
+                CMTime {
+                    value: 0,
+                    timescale: 1_000_000_000,
+                    flags: time::VALID | time::HAS_BEEN_ROUNDED,
+                    epoch: 0,
+                },
+            ),
+            (
+                "large timescale numerator",
+                [
+                    CMTimeMake(i64::MAX, i32::MAX),
+                    CMTimeMake(i64::MAX, i32::MAX),
+                ],
+                2,
+                2,
+                CMTime {
+                    value: 9223372032559808508,
+                    timescale: 1073741823,
+                    flags: 3,
+                    epoch: 0,
+                },
+            ),
+            (
+                "one timing repeated overflows",
+                [CMTimeMake(i64::MAX, 1), CMTimeMake(0, 1)],
+                1,
+                2,
+                CMTime {
+                    value: 0,
+                    timescale: 0,
+                    flags: 5,
+                    epoch: 0,
+                },
+            ),
+            (
+                "one timing rescaled",
+                [CMTimeMake(i64::MAX, i32::MAX), CMTimeMake(0, 1)],
+                1,
+                2,
+                CMTime {
+                    value: 9223372032559808508,
+                    timescale: 1073741823,
+                    flags: 3,
+                    epoch: 0,
+                },
+            ),
+        ];
+        let block = unsafe { create_block() };
+        for (label, durations, timing_count, sample_count, expected) in cases {
+            let timing = durations.map(|duration| CMSampleTimingInfo {
+                duration,
+                presentation_time_stamp: CMTimeMake(0, 1),
+                decode_time_stamp: CMTime::INVALID,
+            });
+            let mut sample = core::ptr::null();
+            unsafe {
+                assert_eq!(
+                    CMSampleBufferCreateReady(
+                        core::ptr::null(),
+                        block,
+                        core::ptr::null(),
+                        sample_count,
+                        timing_count,
+                        timing.as_ptr(),
+                        0,
+                        core::ptr::null(),
+                        &mut sample,
+                    ),
+                    0,
+                    "{label}"
+                );
+                assert_eq!(CMSampleBufferGetDuration(sample), expected, "{label}");
+                corefoundation::api::CFRelease(sample);
+            }
+        }
+        unsafe { corefoundation::api::CFRelease(block) };
+    }
+
+    #[test]
     fn duration_preserves_native_coremedia_special_states() {
         let block = unsafe { create_block() };
         let numeric = CMTimeMake(2, 30);

@@ -15,6 +15,7 @@ const EMPTY_BUFFER: i32 = -12706;
 const ALLOC_FAILED: i32 = -12701;
 const STRUCT_ALLOC_FAILED: i32 = -12700;
 const ASSURE_NOW: u32 = 1;
+const ALWAYS_COPY_DATA: u32 = 1 << 1;
 
 unsafe extern "C" {
     fn malloc(size: usize) -> *mut c_void;
@@ -257,6 +258,48 @@ pub unsafe extern "C" fn CMBlockBufferCreateContiguous(
     if !corefoundation::api::supports_malloc_allocator(block_allocator) || !custom_source.is_null()
     {
         return BAD_CUSTOM_SOURCE;
+    }
+    // The force-copy flag explicitly overrides the aliasing fast path. This
+    // new owned allocation does not change if the original is later modified.
+    if flags & ALWAYS_COPY_DATA != 0 {
+        let mut copied = core::ptr::null();
+        let status = unsafe {
+            CMBlockBufferCreateWithMemoryBlock(
+                allocator,
+                core::ptr::null_mut(),
+                length,
+                block_allocator,
+                custom_source,
+                0,
+                length,
+                flags | ASSURE_NOW,
+                &mut copied,
+            )
+        };
+        if status != 0 {
+            return status;
+        }
+        let mut pointer = core::ptr::null_mut();
+        let status = unsafe {
+            CMBlockBufferGetDataPointer(
+                copied,
+                0,
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                &mut pointer,
+            )
+        };
+        let status = if status == 0 {
+            unsafe { CMBlockBufferCopyDataBytes(source, offset, length, pointer.cast()) }
+        } else {
+            status
+        };
+        if status != 0 {
+            unsafe { corefoundation::api::CFRelease(copied) };
+            return status;
+        }
+        unsafe { *out = copied };
+        return 0;
     }
     // Every represented block is already contiguous. A new view retains its
     // allocation; releasing the original cannot invalidate the view.
@@ -753,6 +796,87 @@ mod tests {
             );
             assert_eq!(&readback, b"yz");
             corefoundation::api::CFRelease(slice);
+        }
+    }
+
+    #[test]
+    fn always_copy_data_flag_prevents_aliases_and_keeps_independent_ownership() {
+        let mut source = core::ptr::null();
+        unsafe {
+            assert_eq!(
+                CMBlockBufferCreateWithMemoryBlock(
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                    4,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ASSURE_NOW,
+                    &mut source,
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"abcd".as_ptr().cast(), source, 0, 4),
+                0
+            );
+            let mut independent = core::ptr::null();
+            assert_eq!(
+                CMBlockBufferCreateContiguous(
+                    core::ptr::null(),
+                    source,
+                    core::ptr::null(),
+                    core::ptr::null(),
+                    0,
+                    4,
+                    ALWAYS_COPY_DATA,
+                    &mut independent,
+                ),
+                0
+            );
+            assert_ne!(source, independent);
+            let mut source_ptr = core::ptr::null_mut();
+            let mut independent_ptr = core::ptr::null_mut();
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    source,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut source_ptr
+                ),
+                0
+            );
+            assert_eq!(
+                CMBlockBufferGetDataPointer(
+                    independent,
+                    0,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                    &mut independent_ptr
+                ),
+                0
+            );
+            assert_ne!(source_ptr, independent_ptr);
+            assert_eq!(
+                CMBlockBufferReplaceDataBytes(b"xxxx".as_ptr().cast(), independent, 0, 4),
+                0
+            );
+            let mut original = [0u8; 4];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(source, 0, 4, original.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&original, b"abcd");
+            corefoundation::api::CFRelease(source);
+            let mut readback = [0u8; 4];
+            assert_eq!(
+                CMBlockBufferCopyDataBytes(independent, 0, 4, readback.as_mut_ptr().cast()),
+                0
+            );
+            assert_eq!(&readback, b"xxxx");
+            corefoundation::api::CFRelease(independent);
         }
     }
 
