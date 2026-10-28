@@ -20,6 +20,26 @@ copies it into Cargo's build output and applies the exact-version source patch
 modified. Redistributors must also provide this patch alongside the
 corresponding FFmpeg source and license information.
 
+## Release integration gate
+
+This crate is currently **standalone and unshipped**. The `rosemary` runtime
+binary does not depend on `videocodec`; the existing Nix package selects
+`--package rosemary --bin rosemary`, while the Arch recipe builds a prior
+release. Adding this crate to the workspace does not enable guest VideoToolbox
+or include a decoder in either release artifact.
+
+**Before any shipped Rosemary binary depends on this crate**, the release
+recipes must inject the checksum-verified pinned FFmpeg source, rather than
+allowing `build.rs` to clone a Git repository inside a sandboxed Cargo build.
+For Nix, make the pinned source a fixed-output derivation and export
+`ROSEMARY_FFMPEG_SOURCE` into the decoder build. For Arch, prefetch the same
+revision in `source=()`, verify it with `sha256sums`, and pass its unpacked path
+through `ROSEMARY_FFMPEG_SOURCE`. Both recipes must also distribute the
+corresponding modified FFmpeg source, checked-in source patch and required
+license notices, and be verified from a clean offline/sandboxed build.
+The local offline workspace test with a prepopulated FFmpeg source directory
+does not establish that release packaging gate.
+
 The current bundled-FFmpeg builder supports **native builds only**: it rejects
 `HOST != TARGET` explicitly rather than compiling FFmpeg for the host and the
 Rust shim for another architecture. Cross-compilation requires an independent,
@@ -123,8 +143,13 @@ callback reports `SourceFrameTooLarge` using the actual packet identity,
 including when decoding happens during deferred receive. A rejected SPS does
 not by itself imply that the packet's picture was rejected: FFmpeg can recover
 using later valid parameter sets or a previously decoded SPS. Native successful
-frame output takes precedence over a stale metadata-rejection flag, and
-accepted picture identity is completed exactly once. The source-format and bit depth determine these charges (not the
+frame output takes precedence over a stale metadata-rejection flag. If an
+oversized SPS for one pending access-unit ID is observed while a different
+reordered picture succeeds, the SPS ID retains a provisional
+`SourceFrameTooLarge` error. That error is reported only if FFmpeg releases the
+access unit without producing its frame; successful output for the same ID
+supersedes the provisional error. Each accepted identity is completed exactly
+once. The source-format and bit depth determine these charges (not the
 converted I420 bytes); single-frame decoding threads avoid multiplying the
 reference budget by frame-thread count. Converted buffers and Rust's bounded
 output FIFO are separate allocations. These safeguards limit decoded-picture

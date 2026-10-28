@@ -30,6 +30,7 @@ typedef struct RosemaryDecoder {
     size_t native_live_bytes;
     size_t native_peak_bytes;
     int source_budget_refused;
+    int source_picture_budget_refused;
     int native_allocation_error;
     int test_native_allocation_failure;
     int test_ffmpeg_allocation_stage;
@@ -119,6 +120,7 @@ static int rosemary_native_allocation_failed(RosemaryDecoder *decoder, int resul
 
 static int rosemary_refuse_source_budget(RosemaryDecoder *decoder, const AVFrame *frame) {
     decoder->source_budget_refused = 1;
+    decoder->source_picture_budget_refused = 1;
     if (frame->opaque_ref && frame->opaque_ref->size == sizeof(uint64_t)) {
         memcpy(&decoder->source_budget_id, frame->opaque_ref->data, sizeof(uint64_t));
         decoder->source_budget_identity_valid = 1;
@@ -201,8 +203,8 @@ static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame,
     // The early SPS check rejects metadata, not a decoded picture. If FFmpeg
     // falls back to valid SPS state and allocates a real picture for that same
     // sample, forget the stale metadata rejection even if output is delayed.
-    if (decoder->source_budget_refused && decoder->source_budget_identity_valid &&
-        frame->opaque_ref && frame->opaque_ref->size == sizeof(uint64_t)) {
+    if (decoder->source_budget_refused && !decoder->source_picture_budget_refused &&
+        decoder->source_budget_identity_valid && frame->opaque_ref && frame->opaque_ref->size == sizeof(uint64_t)) {
         uint64_t decoded_id;
         memcpy(&decoded_id, frame->opaque_ref->data, sizeof(decoded_id));
         if (decoded_id == decoder->source_budget_id) {
@@ -244,7 +246,9 @@ void rosemary_h264_test_fail_converter_allocation(RosemaryDecoder *decoder, int 
 }
 
 int rosemary_h264_last_budget_id(RosemaryDecoder *decoder, uint64_t *id) {
-    if (!decoder || !id || !decoder->source_budget_identity_valid) return 0;
+    if (!decoder || !id) return -1;
+    if (!decoder->source_budget_refused) return 0;
+    if (!decoder->source_budget_identity_valid) return -1;
     *id = decoder->source_budget_id;
     return 1;
 }
@@ -361,6 +365,7 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     }
     token->id = id;
     decoder->source_budget_refused = 0;
+    decoder->source_picture_budget_refused = 0;
     decoder->source_budget_identity_valid = 0;
     decoder->native_allocation_error = 0;
     decoder->decoding_packet_identity_valid = 0;
@@ -397,6 +402,9 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     // itself recorded it; unrelated errors remain fatal.
     // An SPS rejected earlier in this packet may be replaced by a valid SPS
     // before FFmpeg decodes a picture. Do not override native success.
+    // A decoder error with a known source-budget rejection cannot yield a
+    // picture from this call. Native success may instead contain an older
+    // reordered frame; Rust tracks that rejection as a provisional ID hint.
     if (decoder->source_budget_refused &&
         (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA))
         return 4; // Consumed packet, decoder source-frame budget exceeded.
@@ -438,6 +446,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     if (!decoder || !out) return AVERROR(EINVAL);
     av_frame_unref(decoder->frame);
     decoder->source_budget_refused = 0;
+    decoder->source_picture_budget_refused = 0;
     decoder->source_budget_identity_valid = 0;
     decoder->native_allocation_error = 0;
     decoder->decoding_packet_identity_valid = 0;
@@ -453,8 +462,7 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     // A rejected SPS may precede a successful picture in the same packet;
     // success belongs to that picture, not the rejected metadata.
     if (decoder->source_budget_refused &&
-        (result == AVERROR(EAGAIN) || result == AVERROR(ENOMEM) ||
-         result == AVERROR_INVALIDDATA)) {
+        (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA)) {
         memset(out, 0, sizeof(*out));
         if (decoder->source_budget_identity_valid) {
             out->identity_valid = 1;

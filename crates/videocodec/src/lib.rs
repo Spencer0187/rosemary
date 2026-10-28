@@ -192,9 +192,31 @@ fn annex_b_nal_count(sample: &[u8]) -> usize {
 }
 
 fn check_annex_b_nals(sample: &[u8], prepended_headers: &[u8]) -> Result<(), Error> {
-    let count = annex_b_nal_count(sample);
-    let header_count = annex_b_nal_count(prepended_headers);
-    if count > MAX_NAL_UNITS_PER_ACCESS_UNIT.saturating_sub(header_count) {
+    let mut count = annex_b_nal_count(prepended_headers);
+    let mut saw_start = false;
+    for (offset, bytes) in sample.windows(3).enumerate() {
+        if bytes != [0, 0, 1] {
+            continue;
+        }
+        if !saw_start {
+            // Annex B permits leading zero_byte padding, not arbitrary data.
+            if sample[..offset].iter().any(|byte| *byte != 0) {
+                return Err(Error::InvalidPacket);
+            }
+            saw_start = true;
+        }
+        let Some(&header) = sample.get(offset + 3) else {
+            return Err(Error::InvalidPacket);
+        };
+        if header & 0x80 != 0 || header & 0x1f == 0 {
+            return Err(Error::InvalidPacket);
+        }
+        count += 1;
+        if count > MAX_NAL_UNITS_PER_ACCESS_UNIT {
+            return Err(Error::InvalidPacket);
+        }
+    }
+    if !saw_start {
         return Err(Error::InvalidPacket);
     }
     Ok(())
@@ -509,6 +531,9 @@ impl Decoder {
         if status == 5 {
             return Err(self.latch(self.accepted_send_error()));
         }
+        if status != 4 {
+            self.record_budget_hint()?;
+        }
         let mut ready = std::mem::take(&mut self.legacy_ready);
         ready.extend(self.receive_ready()?);
         Ok(ready)
@@ -591,6 +616,26 @@ impl Decoder {
             error: Some(media_error(Error::SourceFrameTooLarge)),
         });
         Ok(())
+    }
+
+    // A rejected SPS is metadata, not necessarily a rejected picture. Record
+    // its true packet ID as a provisional error; if FFmpeg later emits that
+    // frame, process_view completes it normally. Otherwise reap_dropped uses
+    // this error only after FFmpeg releases the last packet reference.
+    fn record_budget_hint(&mut self) -> Result<(), Error> {
+        let mut id = 0;
+        // SAFETY: the native call has finished and this decoder owns its handle.
+        match unsafe { rosemary_h264_last_budget_id(self.handle.as_ptr(), &mut id) } {
+            0 => Ok(()),
+            1 => {
+                let Some(timing) = self.pending.get_mut(&id) else {
+                    return Err(self.latch(Error::MissingIdentity));
+                };
+                timing.decode_error = Some(Error::SourceFrameTooLarge);
+                Ok(())
+            }
+            _ => Err(self.latch(Error::MissingIdentity)),
+        }
     }
 
     fn accepted_send_error(&self) -> Error {
@@ -726,7 +771,13 @@ impl Decoder {
             }
             let mut view = FrameView::default();
             // SAFETY: decoder handle and output view remain valid for this call.
-            match unsafe { rosemary_h264_receive(self.handle.as_ptr(), &mut view) } {
+            let status = unsafe { rosemary_h264_receive(self.handle.as_ptr(), &mut view) };
+            // The current native call may output an older reordered frame
+            // and reject SPS metadata for another pending ID simultaneously.
+            if matches!(status, 0 | 1 | 2 | NATIVE_PICTURE_REJECTED) {
+                self.record_budget_hint()?;
+            }
+            match status {
                 0 => {
                     if let Some(frame) = self.process_view(&view, None)? {
                         return Ok(Some(frame));
@@ -1207,6 +1258,9 @@ impl media::VideoDecoder for Decoder {
                     let error = self.accepted_send_error();
                     return Err(media_error(self.latch(error)));
                 }
+                if status != 4 {
+                    self.record_budget_hint().map_err(media_error)?;
+                }
             }
             1 => {
                 self.pump_queued().map_err(media_error)?;
@@ -1513,6 +1567,44 @@ mod tests {
     }
 
     #[test]
+    fn annex_b_rejects_missing_truncated_and_invalid_nal_headers() {
+        let valid = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(valid);
+        for bad in [
+            &[0x65, 0x88][..],
+            &[0x01, 0x02, 0x03][..],
+            &[0, 0][..],
+            &[0, 0, 1][..],
+            &[0, 0, 0, 1][..],
+            &[0, 0, 1, 0x80][..],
+            &[0, 0, 1, 0][..],
+            &[0, 0, 1, 0x65, 0, 0, 1][..],
+            &[0x56, 0, 0, 1, 0x65][..],
+        ] {
+            assert_eq!(
+                check_annex_b_nals(bad, &[]),
+                Err(Error::InvalidPacket),
+                "{bad:?}"
+            );
+            assert_eq!(
+                decoder.submit_annex_b(bad, None, None).unwrap_err(),
+                Error::InvalidPacket,
+                "{bad:?}"
+            );
+            assert!(decoder.pending.is_empty());
+            assert_eq!(decoder.next_id, 0);
+            assert_eq!(
+                unsafe { rosemary_h264_table_allocation_attempts(decoder.handle.as_ptr()) },
+                0
+            );
+        }
+        assert!(check_annex_b_nals(&[0, 0, 0, 1, 0x65], &[]).is_ok());
+        assert!(check_annex_b_nals(&[0, 0, 1, 0x65], &[]).is_ok());
+        assert!(check_annex_b_nals(&[0, 0, 0, 0, 1, 0x65], &[]).is_ok());
+        assert!(decoder.submit_annex_b(valid, None, None).is_ok());
+    }
+
+    #[test]
     fn start_code_nal_limit_counts_both_prefix_lengths() {
         let mut sample = [0, 0, 0, 1, 0x09].repeat(MAX_NAL_UNITS_PER_ACCESS_UNIT / 2);
         sample.extend([0, 0, 1, 0x09].repeat(MAX_NAL_UNITS_PER_ACCESS_UNIT / 2));
@@ -1797,6 +1889,93 @@ mod tests {
         let packet = prepend_headers(&headers, &sample).unwrap();
         assert!(packet.starts_with(&headers));
         assert!(packet.ends_with(&sample));
+    }
+
+    #[test]
+    fn reordered_frame_keeps_another_samples_sps_budget_hint_until_completion() {
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
+        let huge_sps = nals_from_fixture(huge)
+            .into_iter()
+            .find(|nal| nal[0] & 0x1f == 7)
+            .unwrap();
+        let mut units = bframe_avcc_access_units()
+            .iter()
+            .map(|packet| avcc_to_annex_b(packet, NalLength::Four).unwrap())
+            .collect::<Vec<_>>();
+        units[2].extend_from_slice(&[0, 0, 0, 1]);
+        units[2].extend_from_slice(huge_sps);
+
+        let mut decoder = decoder_for_fixture(stream);
+        let mut frames = Vec::new();
+        for (index, unit) in units.iter().enumerate() {
+            let next = decoder
+                .submit_with_id(unit, 500 + index as u64, None, None, None)
+                .unwrap();
+            if index == 2 {
+                // FFmpeg outputs older B-frame ID 500 while refusing an
+                // oversized SPS belonging to the current packet ID 502.
+                assert_eq!(next.iter().map(|f| f.id).collect::<Vec<_>>(), [500]);
+                assert!(matches!(
+                    decoder.pending.get(&502).map(|t| &t.decode_error),
+                    Some(Some(Error::SourceFrameTooLarge))
+                ));
+            }
+            frames.extend(next);
+        }
+        frames.extend(decoder.finish().unwrap());
+        frames.sort_by_key(|f| f.id);
+        assert_eq!(
+            frames.iter().map(|f| f.id).collect::<Vec<_>>(),
+            (500..508).collect::<Vec<_>>()
+        );
+        // A later frame for ID 502 supersedes its provisional SPS rejection.
+        assert!(decoder.pending.is_empty());
+        assert!(decoder.take_dropped().is_none());
+        assert!(decoder.fatal.is_none());
+    }
+
+    #[test]
+    fn reordered_frames_and_oversized_sps_only_complete_exact_dropped_id() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
+        let huge_sps = nals_from_fixture(huge)
+            .into_iter()
+            .find(|nal| nal[0] & 0x1f == 7)
+            .unwrap();
+        let mut units = bframe_avcc_access_units();
+        let mut metadata = vec![0, 0, 0, 2, 9, 0xf0];
+        metadata.extend_from_slice(&(huge_sps.len() as u32).to_be_bytes());
+        metadata.extend_from_slice(huge_sps);
+        units[2] = metadata;
+        let mut decoder = decoder_for_fixture(stream);
+        for (index, unit) in units.iter().enumerate() {
+            decoder
+                .submit(AccessUnit {
+                    id: 600 + index as u64,
+                    bytes: unit,
+                    pts_ns: None,
+                    dts_ns: None,
+                    duration_ns: None,
+                })
+                .unwrap();
+        }
+        decoder.end_stream().unwrap();
+        let mut ids = Vec::new();
+        while let Some(frame) = decoder.pull(Duration::ZERO).unwrap() {
+            ids.push(frame.id);
+        }
+        ids.sort_unstable();
+        assert_eq!(ids, [600, 601, 603, 604, 605, 606, 607]);
+        let dropped = decoder.take_dropped().unwrap();
+        assert_eq!(dropped.id, 602);
+        assert!(
+            matches!(dropped.error, Some(media::Error::Decode(ref message))
+            if message.contains("SourceFrameTooLarge"))
+        );
+        assert!(decoder.take_dropped().is_none());
+        assert!(decoder.is_drained().unwrap());
     }
 
     #[test]
