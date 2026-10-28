@@ -116,8 +116,79 @@ fn main() {
     let install = out.join("ffmpeg-install");
     let archive = install.join("lib/libavcodec.a");
     let stamp = out.join("ffmpeg-source-recipe.sha256");
+    let shim_compiler = cc::Build::new().file("src/ffmpeg_shim.c").get_compiler();
+    let compiler_path = shim_compiler.path().to_string_lossy().into_owned();
+    let compiler_version = Command::new(shim_compiler.path())
+        .arg("--version")
+        .output()
+        .expect("cannot identify native C compiler");
+    assert!(
+        compiler_version.status.success(),
+        "native C compiler cannot report its version"
+    );
+    let nasm_version = Command::new("nasm")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
     let mut recipe = Sha256::new();
     recipe.update(include_bytes!("build.rs"));
+    recipe.update(compiler_path.as_bytes());
+    recipe.update(&compiler_version.stdout);
+    recipe.update(&compiler_version.stderr);
+    for arg in shim_compiler.args() {
+        recipe.update(arg.to_string_lossy().as_bytes());
+        recipe.update([0]);
+    }
+    if let Some(nasm) = &nasm_version {
+        recipe.update(&nasm.stdout);
+        recipe.update(&nasm.stderr);
+    } else {
+        recipe.update(b"no-nasm");
+    }
+    for key in [
+        "CC",
+        "CFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "AS",
+        "ASFLAGS",
+        "AR",
+        "ARFLAGS",
+        "NASM",
+        "NASMFLAGS",
+        "PATH",
+        "PKG_CONFIG",
+        "OPT_LEVEL",
+        "DEBUG",
+        "CARGO_CFG_TARGET_ARCH",
+        "CARGO_CFG_TARGET_OS",
+        "CARGO_ENCODED_RUSTFLAGS",
+    ] {
+        println!("cargo:rerun-if-env-changed={key}");
+        recipe.update(key.as_bytes());
+        recipe.update(
+            env::var_os(key)
+                .unwrap_or_default()
+                .to_string_lossy()
+                .as_bytes(),
+        );
+        recipe.update([0]);
+    }
+    for prefix in ["CC", "CFLAGS", "AR", "AS"] {
+        for suffix in [target.as_str(), &target.replace('-', "_")] {
+            let key = format!("{prefix}_{suffix}");
+            println!("cargo:rerun-if-env-changed={key}");
+            recipe.update(key.as_bytes());
+            recipe.update(
+                env::var_os(&key)
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            recipe.update([0]);
+        }
+    }
     recipe.update(target.as_bytes());
     recipe.update(
         source
@@ -141,6 +212,7 @@ fn main() {
         configure
             .current_dir(&build)
             .arg(format!("--prefix={}", install.display()))
+            .arg(format!("--cc={compiler_path}"))
             .args([
                 "--disable-programs",
                 "--disable-doc",
@@ -160,9 +232,7 @@ fn main() {
             ]);
         // The reference decoder has C fallbacks where the optional external assembler
         // is unavailable. These builds are slower, but still portable.
-        if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64")
-            && Command::new("nasm").arg("--version").output().is_err()
-        {
+        if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86_64") && nasm_version.is_none() {
             configure.arg("--disable-x86asm");
         }
         command(&mut configure);

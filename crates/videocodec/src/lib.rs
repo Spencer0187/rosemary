@@ -8,7 +8,11 @@ use mediabackend::{
     self as media, AccessUnit, ChromaSiting, ColorMatrix, ColorPrimaries, ColorTransfer, FrameCrop,
     FrameFieldOrder, FrameInterlaceMode, FrameLayout,
 };
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
+
+const MAX_QUEUED_FRAMES: usize = 32;
+const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+const MAX_QUEUED_DROPS: usize = 1024;
 use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
@@ -49,7 +53,7 @@ pub struct Frame {
     pub planes: Vec<Plane>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Error {
     InvalidLengthSize,
     InvalidParameterSet,
@@ -110,6 +114,8 @@ unsafe extern "C" {
         id: u64,
     ) -> i32;
     fn rosemary_h264_receive(handle: *mut c_void, out: *mut FrameView) -> i32;
+    fn rosemary_h264_token_released(handle: *mut c_void, id: u64) -> i32;
+    fn rosemary_h264_forget_token(handle: *mut c_void, id: u64);
 }
 
 /// AVCC sample NAL widths in bytes. Apple supports 1, 2, and 4.
@@ -225,7 +231,11 @@ pub struct Decoder {
     pending: HashMap<u64, SourceTiming>,
     dropped: VecDeque<media::DroppedSample>,
     available: VecDeque<CodecFrame>,
-    seen: HashSet<u64>,
+    last_accepted_id: Option<u64>,
+    queued_bytes: usize,
+    last_frame_bytes: usize,
+    fatal: Option<Error>,
+    eof: bool,
 }
 
 impl Decoder {
@@ -267,7 +277,11 @@ impl Decoder {
             pending: HashMap::new(),
             dropped: VecDeque::new(),
             available: VecDeque::new(),
-            seen: HashSet::new(),
+            last_accepted_id: None,
+            queued_bytes: 0,
+            last_frame_bytes: 0,
+            fatal: None,
+            eof: false,
         })
     }
 
@@ -292,10 +306,6 @@ impl Decoder {
     ) -> Result<Vec<Frame>, Error> {
         let id = self.next_id;
         let frames = self.submit_with_id(sample, id, pts, dts, None)?;
-        self.next_id = self
-            .next_id
-            .checked_add(1)
-            .ok_or(Error::DuplicateIdentity)?;
         Ok(frames)
     }
 
@@ -307,10 +317,11 @@ impl Decoder {
         dts: Option<i64>,
         duration: Option<u64>,
     ) -> Result<Vec<Frame>, Error> {
+        self.check_fatal()?;
         if self.finished {
             return Err(Error::Drained);
         }
-        if id == u64::MAX || self.seen.contains(&id) {
+        if id == u64::MAX || self.last_accepted_id.is_some_and(|last| id <= last) {
             return Err(Error::DuplicateIdentity);
         }
         if pts == Some(i64::MIN) || dts == Some(i64::MIN) {
@@ -333,17 +344,19 @@ impl Decoder {
             status = self.send(Some(packet), pts, dts, id);
         }
         if status != 0 {
-            return Err(Error::Codec(status));
+            return Err(self.latch(Error::Codec(status)));
         }
         self.needs_headers = false;
         self.pending.insert(id, SourceTiming { pts, dts, duration });
-        self.seen.insert(id);
+        self.last_accepted_id = Some(id);
+        self.next_id = id.saturating_add(1);
         ready.extend(self.receive_ready()?);
         Ok(ready)
     }
 
     /// Finish delayed/reordered frames. A drained decoder must be recreated.
     pub fn finish(&mut self) -> Result<Vec<Frame>, Error> {
+        self.check_fatal()?;
         if self.finished {
             return Ok(Vec::new());
         }
@@ -354,13 +367,15 @@ impl Decoder {
             result = self.send(None, None, None, 0);
         }
         if result != 0 {
-            return Err(Error::Codec(result));
+            return Err(self.latch(Error::Codec(result)));
         }
         self.finished = true;
         frames.extend(self.receive_ready()?);
+        self.eof = true;
         let mut dropped = self.pending.drain().map(|(id, _)| id).collect::<Vec<_>>();
         dropped.sort_unstable();
         for id in dropped {
+            self.forget_token(id);
             self.dropped
                 .push_back(media::DroppedSample { id, error: None });
         }
@@ -382,31 +397,128 @@ impl Decoder {
         }
     }
 
-    fn receive_ready(&mut self) -> Result<Vec<Frame>, Error> {
-        let mut frames = Vec::new();
-        loop {
-            let mut view = FrameView::default();
-            // SAFETY: decoder handle and local output remain valid for the call.
-            match unsafe { rosemary_h264_receive(self.handle.as_ptr(), &mut view) } {
-                0 => {
-                    if view.identity_valid == 0 {
-                        return Err(Error::MissingIdentity);
-                    }
-                    let mut frame = copy_frame(&view)?;
-                    let timing = self
-                        .pending
-                        .remove(&view.id)
-                        .ok_or(Error::MissingIdentity)?;
-                    frame.source_pts = timing.pts;
-                    frame.source_dts = timing.dts;
-                    frame.duration = timing.duration;
-                    frames.push(frame);
-                }
-                1 | 2 => break,
-                negative => return Err(Error::Codec(negative)),
+    fn check_fatal(&self) -> Result<(), Error> {
+        self.fatal.map_or(Ok(()), Err)
+    }
+
+    fn latch(&mut self, error: Error) -> Error {
+        *self.fatal.get_or_insert(error)
+    }
+
+    fn forget_token(&mut self, id: u64) {
+        // SAFETY: the decoder remains alive while its observer is removed.
+        unsafe { rosemary_h264_forget_token(self.handle.as_ptr(), id) };
+    }
+
+    fn reap_dropped(&mut self) -> Result<(), Error> {
+        let mut dropped = Vec::new();
+        for &id in self.pending.keys() {
+            // SAFETY: each pending ID has a token owned by this decoder.
+            match unsafe { rosemary_h264_token_released(self.handle.as_ptr(), id) } {
+                1 => dropped.push(id),
+                0 => (),
+                _ => return Err(self.latch(Error::MissingIdentity)),
             }
         }
+        dropped.sort_unstable();
+        let room = MAX_QUEUED_DROPS.saturating_sub(self.dropped.len());
+        for id in dropped.into_iter().take(room) {
+            self.pending.remove(&id);
+            self.forget_token(id);
+            self.dropped
+                .push_back(media::DroppedSample { id, error: None });
+        }
+        Ok(())
+    }
+
+    fn receive_one(&mut self) -> Result<Option<Frame>, Error> {
+        self.check_fatal()?;
+        let mut view = FrameView::default();
+        // SAFETY: the output view and decoder are valid for the call.
+        match unsafe { rosemary_h264_receive(self.handle.as_ptr(), &mut view) } {
+            0 => {
+                if view.identity_valid == 0 {
+                    return Err(self.latch(Error::MissingIdentity));
+                }
+                let mut frame = copy_frame(&view).map_err(|e| self.latch(e))?;
+                let timing = self
+                    .pending
+                    .remove(&view.id)
+                    .ok_or_else(|| self.latch(Error::MissingIdentity))?;
+                self.forget_token(view.id);
+                frame.source_pts = timing.pts;
+                frame.source_dts = timing.dts;
+                frame.duration = timing.duration;
+                Ok(Some(frame))
+            }
+            1 => {
+                self.reap_dropped()?;
+                Ok(None)
+            }
+            2 => {
+                self.eof = true;
+                self.reap_dropped()?;
+                Ok(None)
+            }
+            negative => Err(self.latch(Error::Codec(negative))),
+        }
+    }
+
+    fn receive_ready(&mut self) -> Result<Vec<Frame>, Error> {
+        let mut frames = Vec::new();
+        while let Some(frame) = self.receive_one()? {
+            frames.push(frame);
+        }
         Ok(frames)
+    }
+
+    fn queue_has_room(&self) -> bool {
+        self.available.len() < MAX_QUEUED_FRAMES
+            && self.dropped.len() < MAX_QUEUED_DROPS
+            && self
+                .queued_bytes
+                .saturating_add(self.last_frame_bytes.max(1))
+                <= MAX_QUEUED_BYTES
+    }
+
+    fn queue_frame(&mut self, frame: Frame) -> Result<(), Error> {
+        let size = frame
+            .planes
+            .iter()
+            .try_fold(0usize, |sum, plane| sum.checked_add(plane.data.len()))
+            .ok_or_else(|| self.latch(Error::InvalidImageLayout))?;
+        if size > MAX_QUEUED_BYTES
+            || self.available.len() >= MAX_QUEUED_FRAMES
+            || self
+                .queued_bytes
+                .checked_add(size)
+                .is_none_or(|total| total > MAX_QUEUED_BYTES)
+        {
+            return Err(self.latch(Error::InvalidImageLayout));
+        }
+        self.last_frame_bytes = size;
+        self.queued_bytes += size;
+        self.available.push_back(CodecFrame::from(frame));
+        Ok(())
+    }
+
+    fn pump_queued(&mut self) -> Result<(), Error> {
+        while self.queue_has_room() {
+            let Some(frame) = self.receive_one()? else {
+                break;
+            };
+            self.queue_frame(frame)?;
+        }
+        Ok(())
+    }
+
+    fn pull_queued(&mut self) -> Result<Option<CodecFrame>, Error> {
+        self.check_fatal()?;
+        if let Some(frame) = self.available.pop_front() {
+            self.queued_bytes -= frame.bytes.len();
+            return Ok(Some(frame));
+        }
+        Ok(self.receive_one()?.map(CodecFrame::from))
     }
 }
 
@@ -476,8 +588,12 @@ fn copy_frame(view: &FrameView) -> Result<Frame, Error> {
             Some(FrameCrop {
                 x: view.crop_left,
                 y: view.crop_top,
-                width: width.checked_sub(view.crop_left.checked_add(view.crop_right)?)?,
-                height: height.checked_sub(view.crop_top.checked_add(view.crop_bottom)?)?,
+                width: width
+                    .checked_sub(view.crop_left.checked_add(view.crop_right)?)
+                    .filter(|&n| n > 0)?,
+                height: height
+                    .checked_sub(view.crop_top.checked_add(view.crop_bottom)?)
+                    .filter(|&n| n > 0)?,
             })
         })
         .flatten();
@@ -666,10 +782,19 @@ fn media_error(error: Error) -> media::Error {
 
 impl media::VideoDecoder for Decoder {
     type Frame = CodecFrame;
+
     fn codec(&self) -> media::VideoCodec {
         media::VideoCodec::H264
     }
+
     fn submit(&mut self, packet: AccessUnit<'_>) -> Result<(), media::Error> {
+        self.check_fatal().map_err(media_error)?;
+        if self.finished {
+            return Err(media::Error::EndOfStream);
+        }
+        if !self.queue_has_room() {
+            return Err(media::Error::Backpressure);
+        }
         let bytes = avcc_to_annex_b(packet.bytes, self.length).map_err(media_error)?;
         let frames = self
             .submit_with_id(
@@ -680,26 +805,55 @@ impl media::VideoDecoder for Decoder {
                 packet.duration_ns,
             )
             .map_err(media_error)?;
-        self.available
-            .extend(frames.into_iter().map(CodecFrame::from));
-        Ok(())
-    }
-    fn pull(&mut self, _timeout: Duration) -> Result<Option<Self::Frame>, media::Error> {
-        Ok(self.available.pop_front())
-    }
-    fn take_dropped(&mut self) -> Option<media::DroppedSample> {
-        self.dropped.pop_front()
-    }
-    fn end_stream(&mut self) -> Result<(), media::Error> {
-        if !self.finished {
-            let frames = self.finish().map_err(media_error)?;
-            self.available
-                .extend(frames.into_iter().map(CodecFrame::from));
+        for frame in frames {
+            self.queue_frame(frame).map_err(media_error)?;
         }
+        self.pump_queued().map_err(media_error)?;
         Ok(())
     }
+
+    fn pull(&mut self, _timeout: Duration) -> Result<Option<Self::Frame>, media::Error> {
+        self.pull_queued().map_err(media_error)
+    }
+
+    fn take_dropped(&mut self) -> Option<media::DroppedSample> {
+        let reported = self.dropped.pop_front();
+        if reported.is_some() && self.fatal.is_none() {
+            let _ = self.reap_dropped();
+        }
+        reported
+    }
+
+    fn end_stream(&mut self) -> Result<(), media::Error> {
+        self.check_fatal().map_err(media_error)?;
+        if self.finished {
+            return Ok(());
+        }
+        if !self.queue_has_room() {
+            return Err(media::Error::Backpressure);
+        }
+        match self.send(None, None, None, 0) {
+            0 => {
+                self.finished = true;
+                Ok(())
+            }
+            1 => Err(media::Error::Backpressure),
+            error => Err(media_error(self.latch(Error::Codec(error)))),
+        }
+    }
+
     fn is_drained(&mut self) -> Result<bool, media::Error> {
-        Ok(self.finished && self.available.is_empty())
+        self.check_fatal().map_err(media_error)?;
+        if !self.finished || !self.available.is_empty() {
+            return Ok(false);
+        }
+        if !self.eof
+            && let Some(frame) = self.receive_one().map_err(media_error)?
+        {
+            self.queue_frame(frame).map_err(media_error)?;
+            return Ok(false);
+        }
+        Ok(self.eof && self.available.is_empty())
     }
 }
 
@@ -975,22 +1129,248 @@ mod tests {
         assert_eq!(ids, (400..408).collect::<Vec<_>>());
     }
 
+    fn bframe_avcc_access_units() -> Vec<Vec<u8>> {
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let mut units = Vec::new();
+        let mut sample = Vec::new();
+        for nal in nals_from_fixture(stream) {
+            if nal[0] & 0x1f == 9 && !sample.is_empty() {
+                units.push(std::mem::take(&mut sample));
+            }
+            sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            sample.extend_from_slice(nal);
+        }
+        if !sample.is_empty() {
+            units.push(sample);
+        }
+        assert_eq!(units.len(), 8);
+        units
+    }
+
     #[test]
-    fn eos_reports_pending_samples_without_a_picture() {
+    fn queue_backpressure_preserves_input_and_recovers_through_eos() {
+        use mediabackend::{VideoDecoder, VideoFrame};
+        let stream = include_bytes!("../tests/fixtures/bframes_8_64x64.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        let units = bframe_avcc_access_units();
+        let mut decoded = Vec::new();
+        let mut blocked = false;
+        for id in 0..96_u64 {
+            let au = AccessUnit {
+                id,
+                bytes: &units[id as usize % units.len()],
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            };
+            loop {
+                match decoder.submit(au) {
+                    Ok(()) => break,
+                    Err(media::Error::Backpressure) => {
+                        blocked = true;
+                        assert_eq!(decoder.last_accepted_id, Some(id - 1));
+                        assert!(decoder.available.len() <= MAX_QUEUED_FRAMES);
+                        assert!(decoder.queued_bytes <= MAX_QUEUED_BYTES);
+                        decoded.push(decoder.pull(Duration::ZERO).unwrap().unwrap().id());
+                    }
+                    Err(e) => panic!("unexpected submission error {e}"),
+                }
+            }
+        }
+        assert!(blocked, "producer never encountered backpressure");
+        loop {
+            match decoder.end_stream() {
+                Ok(()) => break,
+                Err(media::Error::Backpressure) => {
+                    decoded.push(decoder.pull(Duration::ZERO).unwrap().unwrap().id());
+                }
+                Err(e) => panic!("unexpected EOS error {e}"),
+            }
+        }
+        while let Some(frame) = decoder.pull(Duration::ZERO).unwrap() {
+            decoded.push(frame.id());
+        }
+        assert!(decoder.is_drained().unwrap());
+        assert!(decoder.take_dropped().is_none());
+        decoded.sort_unstable();
+        assert_eq!(decoded, (0..96).collect::<Vec<_>>());
+        assert!(decoder.pending.is_empty());
+        assert_eq!(decoder.available.len(), 0);
+        assert_eq!(decoder.queued_bytes, 0);
+    }
+
+    #[test]
+    fn missing_initial_idr_reports_live_drops_and_recovers_at_next_gop() {
+        use mediabackend::{VideoDecoder, VideoFrame};
+        let stream = include_bytes!("../tests/fixtures/missing_initial_idr_64x64.h264");
+        let nals = nals_from_fixture(stream);
+        let sets = nals
+            .iter()
+            .copied()
+            .filter(|nal| matches!(nal[0] & 31, 7 | 8))
+            .take(2)
+            .collect::<Vec<_>>();
+        let mut decoder = Decoder::new(&sets, NalLength::Four).unwrap();
+        let mut units = Vec::new();
+        let mut sample = Vec::new();
+        for nal in nals {
+            if nal[0] & 31 == 9 && !sample.is_empty() {
+                units.push(std::mem::take(&mut sample));
+            }
+            sample.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            sample.extend_from_slice(nal);
+        }
+        if !sample.is_empty() {
+            units.push(sample);
+        }
+        assert_eq!(units.len(), 60);
+        // The first packet is invalid at FFmpeg send time. It is rejected,
+        // not counted as an accepted-but-dropped input. The subsequent inputs
+        // are accepted even though no reference picture has arrived yet.
+        let mut rejected = Decoder::new(&sets, NalLength::Four).unwrap();
+        assert!(matches!(
+            rejected.submit(AccessUnit {
+                id: 0,
+                bytes: &units[0],
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None
+            }),
+            Err(media::Error::Decode(_))
+        ));
+        assert!(matches!(
+            rejected.submit(AccessUnit {
+                id: 1,
+                bytes: &units[1],
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None
+            }),
+            Err(media::Error::Decode(_))
+        ));
+        drop(rejected);
+        let mut decoded = Vec::new();
+        let mut dropped = Vec::new();
+        let mut had_live_drop = false;
+        for id in 1..60_u64 {
+            decoder
+                .submit(AccessUnit {
+                    id,
+                    bytes: &units[id as usize],
+                    pts_ns: None,
+                    dts_ns: None,
+                    duration_ns: None,
+                })
+                .unwrap();
+            while let Some(frame) = decoder.pull(Duration::ZERO).unwrap() {
+                decoded.push(frame.id());
+            }
+            while let Some(sample) = decoder.take_dropped() {
+                had_live_drop = true;
+                dropped.push(sample.id);
+            }
+        }
+        assert!(
+            had_live_drop,
+            "pre-recovery input was never completed while streaming"
+        );
+        decoder.end_stream().unwrap();
+        while let Some(frame) = decoder.pull(Duration::ZERO).unwrap() {
+            decoded.push(frame.id());
+        }
+        while let Some(sample) = decoder.take_dropped() {
+            dropped.push(sample.id);
+        }
+        assert!(decoder.is_drained().unwrap());
+        assert_eq!(decoded.len(), 40);
+        assert_eq!(dropped.len(), 19);
+        assert!(decoded.iter().all(|&id| id >= 20));
+        assert!(dropped.iter().all(|&id| id < 20));
+        decoded.extend(dropped);
+        decoded.sort_unstable();
+        assert_eq!(decoded, (1..60).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn output_budget_and_crop_validation() {
         let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
         let mut decoder = decoder_for_fixture(stream);
-        // Simulate a decoder that accepted an access unit but emitted no image.
-        decoder.pending.insert(
-            501,
-            SourceTiming {
-                pts: None,
-                dts: None,
-                duration: None,
-            },
+        assert!(decoder.queue_has_room());
+        decoder.queued_bytes = MAX_QUEUED_BYTES;
+        assert!(!decoder.queue_has_room());
+        decoder.queued_bytes = 0;
+        for id in 0..MAX_QUEUED_DROPS {
+            decoder.dropped.push_back(media::DroppedSample {
+                id: id as u64,
+                error: None,
+            });
+        }
+        assert!(!decoder.queue_has_room());
+        assert!(decoder.dropped.pop_front().is_some());
+        assert!(decoder.queue_has_room());
+        decoder.dropped.clear();
+        let y = [0_u8; 4];
+        let u = [0_u8; 1];
+        let v = [0_u8; 1];
+        let mut view = FrameView {
+            width: 2,
+            height: 2,
+            format: 0,
+            planes: [y.as_ptr(), u.as_ptr(), v.as_ptr()],
+            strides: [2, 1, 1],
+            ..FrameView::default()
+        };
+        view.crop_left = 2;
+        assert!(matches!(copy_frame(&view), Err(Error::InvalidImageLayout)));
+        view.crop_left = 0;
+        view.crop_top = 2;
+        assert!(matches!(copy_frame(&view), Err(Error::InvalidImageLayout)));
+        view.crop_top = 0;
+        view.crop_right = 3;
+        assert!(matches!(copy_frame(&view), Err(Error::InvalidImageLayout)));
+    }
+
+    #[test]
+    fn fatal_decoder_state_rejects_recovery_and_drain() {
+        use mediabackend::VideoDecoder;
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        assert_eq!(
+            decoder.latch(Error::MissingIdentity),
+            Error::MissingIdentity
         );
-        assert!(decoder.finish().unwrap().is_empty());
-        assert_eq!(decoder.dropped.pop_front().unwrap().id, 501);
-        assert!(decoder.dropped.is_empty());
+        assert_eq!(decoder.latch(Error::Codec(-5)), Error::MissingIdentity);
+        assert!(matches!(
+            decoder.submit_annex_b(stream, None, None),
+            Err(Error::MissingIdentity)
+        ));
+        assert!(matches!(
+            decoder.pull(Duration::ZERO),
+            Err(media::Error::Decode(_))
+        ));
+        assert!(matches!(decoder.end_stream(), Err(media::Error::Decode(_))));
+        assert!(matches!(decoder.is_drained(), Err(media::Error::Decode(_))));
+    }
+
+    #[test]
+    fn old_ids_are_not_kept_in_a_growing_set() {
+        let stream = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(stream);
+        decoder.last_accepted_id = Some(1_000_000);
+        assert!(matches!(
+            decoder.submit_with_id(stream, 999_999, None, None, None),
+            Err(Error::DuplicateIdentity)
+        ));
+        assert!(matches!(
+            decoder.submit_with_id(stream, 1_000_000, None, None, None),
+            Err(Error::DuplicateIdentity)
+        ));
+        assert!(
+            decoder
+                .submit_with_id(stream, 1_000_001, None, None, None)
+                .is_ok()
+        );
+        assert_eq!(decoder.last_accepted_id, Some(1_000_001));
     }
 
     #[test]

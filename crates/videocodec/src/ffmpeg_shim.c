@@ -9,7 +9,14 @@
 #include <libavutil/pixfmt.h>
 #include <libswscale/swscale.h>
 
+typedef struct RosemaryOpaqueToken {
+    uint64_t id;
+    AVBufferRef *ref;
+    struct RosemaryOpaqueToken *next;
+} RosemaryOpaqueToken;
+
 typedef struct {
+    RosemaryOpaqueToken *tokens;
     AVCodecContext *context;
     AVPacket *packet;
     AVFrame *frame;
@@ -67,6 +74,12 @@ void rosemary_h264_free(RosemaryDecoder *decoder) {
     av_frame_free(&decoder->frame);
     av_frame_free(&decoder->converted);
     sws_freeContext(decoder->converter);
+    while (decoder->tokens) {
+        RosemaryOpaqueToken *token = decoder->tokens;
+        decoder->tokens = token->next;
+        av_buffer_unref(&token->ref);
+        free(token);
+    }
     free(decoder);
 }
 
@@ -90,9 +103,53 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
         return AVERROR(ENOMEM);
     }
     memcpy(decoder->packet->opaque_ref->data, &id, sizeof(id));
+    RosemaryOpaqueToken *token = calloc(1, sizeof(*token));
+    if (!token) {
+        av_packet_unref(decoder->packet);
+        return AVERROR(ENOMEM);
+    }
+    token->ref = av_buffer_ref(decoder->packet->opaque_ref);
+    if (!token->ref) {
+        free(token);
+        av_packet_unref(decoder->packet);
+        return AVERROR(ENOMEM);
+    }
+    token->id = id;
     result = avcodec_send_packet(decoder->context, decoder->packet);
     av_packet_unref(decoder->packet);
+    if (result == 0) {
+        token->next = decoder->tokens;
+        decoder->tokens = token;
+    } else {
+        av_buffer_unref(&token->ref);
+        free(token);
+    }
     return result == AVERROR(EAGAIN) ? 1 : result;
+}
+
+// After the last decoder-held reference disappears this sample cannot
+// produce a future frame, regardless of the frame's presentation timestamp.
+int rosemary_h264_token_released(RosemaryDecoder *decoder, uint64_t id) {
+    if (!decoder) return -1;
+    for (RosemaryOpaqueToken *t = decoder->tokens; t; t = t->next) {
+        if (t->id == id) return av_buffer_get_ref_count(t->ref) == 1;
+    }
+    return -1;
+}
+
+void rosemary_h264_forget_token(RosemaryDecoder *decoder, uint64_t id) {
+    if (!decoder) return;
+    RosemaryOpaqueToken **link = &decoder->tokens;
+    while (*link) {
+        RosemaryOpaqueToken *token = *link;
+        if (token->id == id) {
+            *link = token->next;
+            av_buffer_unref(&token->ref);
+            free(token);
+            return;
+        }
+        link = &token->next;
+    }
 }
 
 // 0=frame available, 1=more input needed, 2=drained, negative=decode error.

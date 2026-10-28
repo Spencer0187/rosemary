@@ -44,11 +44,30 @@ The `mediabackend::VideoDecoder` implementation consumes AVCC access units
 with stable `AccessUnit.id` values, emits owned contiguous `CodecFrame` buffers,
 and exposes per-frame color matrix, primaries, transfer, chroma siting and range.
 FFmpeg's packet opaque-reference propagation carries the ID even across
-B-frame reordering and missing/duplicate timestamps. Unreturned accepted
-IDs are reported by `take_dropped` on terminal EOS; no premature drop is
-inferred from output order. `pull` is synchronous and ignores its timeout.
-The legacy `Decoder::submit_annex_b` and `submit_avcc` methods remain available
-with automatically assigned IDs and plane-based `Frame` output.
+B-frame reordering and missing/duplicate timestamps. A retained observer
+reference allows the decoder to report accepted access units through
+`take_dropped` as soon as FFmpeg releases their identity, including during
+normal streaming and missing-IDR recovery, without relying on PTS/order.
+Terminal EOS reports any remaining unreturned IDs.
+
+The trait implementation has an output limit of 32 owned frames and a 64 MiB
+frame-byte budget. Once full, `submit` returns recoverable `Backpressure`
+without consuming the caller's access unit; after `pull`, retry that same ID.
+The dropped-completion queue is separately bounded to 1024 entries; poll
+`take_dropped` alongside `pull`. Delayed EOS output is pulled incrementally.
+`pull` is synchronous and ignores its timeout. A fatal decoder/frame-layout
+error remains latched for the session.
+
+Accepted `AccessUnit.id` values must be strictly increasing within a session;
+this avoids an unbounded historical identity set. Rejected input and
+`Backpressure` do not advance the accepted identity. The legacy
+`Decoder::submit_annex_b` and `submit_avcc` methods remain available with
+automatically assigned IDs and plane-based `Frame` output.
 
 FFmpeg reserves `i64::MIN` for absent timestamps, so callers supplying that
 exact number receive `InvalidTimestamp` rather than silent corruption.
+
+The FFmpeg build-recipe fingerprint includes the resolved C compiler and
+version, compiler arguments, detected assembler version, source provenance,
+target, and native-build environment variables. Toolchain changes therefore
+invalidate cached native FFmpeg archives before the shim is rebuilt.
