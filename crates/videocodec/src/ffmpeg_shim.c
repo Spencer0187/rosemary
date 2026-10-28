@@ -30,6 +30,8 @@ typedef struct RosemaryDecoder {
     size_t native_live_bytes;
     size_t native_peak_bytes;
     int source_budget_refused;
+    int native_allocation_error;
+    int test_native_allocation_failure;
     int source_budget_identity_valid;
     uint64_t source_budget_id;
     int last_send_error;
@@ -55,6 +57,11 @@ static void rosemary_release_native_buffer(void *opaque, uint8_t *data) {
     tracked->decoder->native_live_bytes -= tracked->bytes;
     av_buffer_unref(&tracked->original);
     free(tracked);
+}
+
+static int rosemary_native_allocation_failed(RosemaryDecoder *decoder, int result) {
+    decoder->native_allocation_error = result;
+    return result;
 }
 
 static int rosemary_refuse_source_budget(RosemaryDecoder *decoder, const AVFrame *frame) {
@@ -86,8 +93,12 @@ static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame,
         (size_t)predicted > ROSEMARY_MAX_NATIVE_LIVE_BYTES - decoder->native_live_bytes) {
         return rosemary_refuse_source_budget(decoder, frame);
     }
+    if (decoder->test_native_allocation_failure == 1) {
+        decoder->test_native_allocation_failure = 0;
+        return rosemary_native_allocation_failed(decoder, AVERROR(ENOMEM));
+    }
     int result = avcodec_default_get_buffer2(context, frame, flags);
-    if (result < 0) return result;
+    if (result < 0) return rosemary_native_allocation_failed(decoder, result);
     // A default FFmpeg H.264 software frame uses at most four plane buffers.
     // Wrap their AVBufferRefs, retaining the original allocation and charging
     // it until the very last decoder reference is released.
@@ -101,17 +112,32 @@ static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame,
             av_frame_unref(frame);
             return error;
         }
-        RosemaryTrackedBuffer *tracked = calloc(1, sizeof(*tracked));
-        if (!tracked) { av_frame_unref(frame); return AVERROR(ENOMEM); }
+        RosemaryTrackedBuffer *tracked = NULL;
+        if (decoder->test_native_allocation_failure == 2) {
+            decoder->test_native_allocation_failure = 0;
+        } else {
+            tracked = calloc(1, sizeof(*tracked));
+        }
+        if (!tracked) {
+            int error = rosemary_native_allocation_failed(decoder, AVERROR(ENOMEM));
+            av_frame_unref(frame);
+            return error;
+        }
         tracked->decoder = decoder;
         tracked->original = original;
         tracked->bytes = bytes;
-        AVBufferRef *wrapped = av_buffer_create(original->data, original->size,
-            rosemary_release_native_buffer, tracked, 0);
+        AVBufferRef *wrapped = NULL;
+        if (decoder->test_native_allocation_failure == 3) {
+            decoder->test_native_allocation_failure = 0;
+        } else {
+            wrapped = av_buffer_create(original->data, original->size,
+                rosemary_release_native_buffer, tracked, 0);
+        }
         if (!wrapped) {
+            int error = rosemary_native_allocation_failed(decoder, AVERROR(ENOMEM));
             free(tracked);
             av_frame_unref(frame);
-            return AVERROR(ENOMEM);
+            return error;
         }
         frame->buf[i] = wrapped;
         decoder->native_live_bytes += bytes;
@@ -124,6 +150,12 @@ static int rosemary_guarded_get_buffer2(AVCodecContext *context, AVFrame *frame,
 
 int rosemary_h264_last_send_error(RosemaryDecoder *decoder) {
     return decoder ? decoder->last_send_error : AVERROR(EINVAL);
+}
+
+// Test-only one-shot failures at the native H.264 get_buffer2 callback.
+// 1: default allocator; 2: tracked wrapper allocation; 3: AVBufferRef wrapper.
+void rosemary_h264_test_fail_native_allocation(RosemaryDecoder *decoder, int stage) {
+    if (decoder) decoder->test_native_allocation_failure = stage;
 }
 
 // Enabled only by a test-only Rust FFI declaration; the fault occurs after
@@ -182,7 +214,10 @@ RosemaryDecoder *rosemary_h264_new(void) {
     decoder->context = avcodec_alloc_context3(codec);
     if (decoder->context) {
         decoder->context->flags |= AV_CODEC_FLAG_COPY_OPAQUE;
-        decoder->context->max_pixels = ROSEMARY_MAX_NATIVE_PIXELS;
+        // FFmpeg's pre-get_buffer2 max_pixels check has no packet opaque ID.
+        // Retain its global image-size/overflow checks, but apply the stricter
+        // 4096^2 picture policy in our identity-aware get_buffer2 callback.
+        decoder->context->max_pixels = INT64_MAX;
         // Avoid multiplying live decoder references by frame-thread count.
         decoder->context->thread_count = 1;
         decoder->context->thread_type = 0;
@@ -254,12 +289,14 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
     token->id = id;
     decoder->source_budget_refused = 0;
     decoder->source_budget_identity_valid = 0;
+    decoder->native_allocation_error = 0;
     result = avcodec_send_packet(decoder->context, decoder->packet);
     if (decoder->test_send_enomem_after_accept && result == 0) {
         decoder->test_send_enomem_after_accept = 0;
         result = AVERROR(ENOMEM);
     }
-    decoder->last_send_error = result;
+    decoder->last_send_error = decoder->native_allocation_error
+        ? decoder->native_allocation_error : result;
     av_packet_unref(decoder->packet);
     // EAGAIN is guaranteed not to consume input. Other errors can occur
     // after libavcodec takes the opaque reference into buffer_pkt; keep the
@@ -272,6 +309,7 @@ int rosemary_h264_send(RosemaryDecoder *decoder, const uint8_t *data,
         free(token);
     }
     if (result == AVERROR(EAGAIN)) return 1;
+    if (decoder->native_allocation_error) return 5;
     // H.264 maps a failed get_buffer2(ENOMEM) to INVALIDDATA in decode.c.
     // This is a known guarded allocation refusal only when the callback
     // itself recorded it; unrelated errors remain fatal.
@@ -317,7 +355,10 @@ int rosemary_h264_receive(RosemaryDecoder *decoder, RosemaryFrameView *out) {
     av_frame_unref(decoder->frame);
     decoder->source_budget_refused = 0;
     decoder->source_budget_identity_valid = 0;
+    decoder->native_allocation_error = 0;
     int result = avcodec_receive_frame(decoder->context, decoder->frame);
+    if (decoder->native_allocation_error)
+        return decoder->native_allocation_error;
     if (decoder->source_budget_refused &&
         (result == AVERROR(ENOMEM) || result == AVERROR_INVALIDDATA)) {
         memset(out, 0, sizeof(*out));

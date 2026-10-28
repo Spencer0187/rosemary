@@ -94,10 +94,16 @@ successful retry. The legacy
 automatic-ID counter never emits the reserved exhaustion value, but the
 `mediabackend` trait accepts the entire opaque `u64` identity domain.
 
-The pinned FFmpeg H.264 decoder rejects SPS dimensions above 4096² pixels
-before a picture allocation, and its guarded `get_buffer2` enforces a 64 MiB
-source-frame request limit with a 256 MiB budget for live native reference
-buffers. The source-format and bit depth determine these charges (not the
+The guarded `get_buffer2` rejects pictures exceeding 4096² pixels before
+FFmpeg allocates decoded frame storage, alongside its 64 MiB source-frame
+request limit and 256 MiB budget for live native reference buffers. FFmpeg's
+`max_pixels` is not used as the 4096² guard because it rejects frames before
+the callback receives their opaque source IDs. FFmpeg's independent generic
+image-size and overflow validity checks remain enabled; inputs so extreme
+that FFmpeg rejects them before invoking `get_buffer2` fail as native decoder
+errors rather than receiving an invented picture identity. For attributable
+oversize H.264 pictures, the guarded callback reports `SourceFrameTooLarge`,
+including when the allocation happens during deferred receive. The source-format and bit depth determine these charges (not the
 converted I420 bytes); single-frame decoding threads avoid multiplying the
 reference budget by frame-thread count. Converted buffers and Rust's bounded
 output FIFO are separate allocations. These safeguards limit decoded-picture
@@ -117,7 +123,10 @@ error if no output picture arrives. Clients must not resubmit it. This
 allows the same session to recover at the next IDR without losing ownership
 of a corrupted access unit. Other negative results from the native send
 call (including non-budget `ENOMEM` and unexpected decoder-state errors)
-remain **fatal**, even when FFmpeg may have consumed the packet. Their
+remain **fatal**, even when FFmpeg may have consumed the packet. Native
+`get_buffer2` allocation errors are captured at the callback before H.264
+can rewrite them to `AVERROR_INVALIDDATA`; a real host allocator failure
+always latches the original fatal error, never a recoverable bitstream drop. Their
 sample identity is retained for session teardown; they are never represented
 as a successful recoverable submission.
 

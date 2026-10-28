@@ -133,6 +133,8 @@ unsafe extern "C" {
     #[cfg(test)]
     fn rosemary_h264_test_send_enomem_after_accept(handle: *mut c_void);
     #[cfg(test)]
+    fn rosemary_h264_test_fail_native_allocation(handle: *mut c_void, stage: i32);
+    #[cfg(test)]
     fn rosemary_h264_test_fail_converter_allocation(handle: *mut c_void, stage: i32);
     fn rosemary_h264_token_released(handle: *mut c_void, id: u64) -> i32;
     fn rosemary_h264_forget_token(handle: *mut c_void, id: u64);
@@ -1977,16 +1979,229 @@ mod tests {
     }
 
     #[test]
-    fn oversized_sps_is_rejected_before_native_frame_allocation() {
-        let stream = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
-        let mut decoder = decoder_for_fixture(stream);
-        // H.264 SPS advertises a valid macroblock-aligned 8192² picture,
-        // whose single I420 allocation would require 96 MiB.
-        let result = decoder.submit_annex_b(stream, None, None);
-        assert!(result.is_err() || result.as_ref().is_ok_and(Vec::is_empty));
-        // SAFETY: the native decoder is live and owned by this test.
+    fn oversized_sps_drops_exact_origin_and_recovers_at_next_idr() {
+        let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(huge);
+        // 8192² I420 would require 96 MiB: the picture must never reach the
+        // default allocator, yet its token and drop reason must remain exact.
+        assert!(decoder.submit_annex_b(huge, None, None).unwrap().is_empty());
+        let drops = std::iter::from_fn(|| decoder.take_dropped()).collect::<Vec<_>>();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].id, 0);
+        assert!(
+            matches!(drops[0].error, Some(media::Error::Decode(ref message))
+            if message.contains("SourceFrameTooLarge"))
+        );
+        assert_eq!(
+            unsafe { rosemary_h264_native_peak_bytes(decoder.handle.as_ptr()) },
+            0
+        );
+        assert!(decoder.fatal.is_none());
+        let mut recovered = decoder.submit_annex_b(small, None, None).unwrap();
+        recovered.extend(decoder.finish().unwrap());
+        assert_eq!(
+            recovered.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert!(decoder.take_dropped().is_none());
+        assert!(decoder.pending.is_empty());
+    }
+
+    #[test]
+    fn oversized_sps_trait_completes_one_budget_error_and_recovers() {
+        use mediabackend::VideoDecoder;
+        let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(huge);
+        let to_avcc = |bytes: &[u8]| {
+            let mut packet = Vec::new();
+            for nal in nals_from_fixture(bytes) {
+                packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+                packet.extend_from_slice(nal);
+            }
+            packet
+        };
+        let huge_packet = to_avcc(huge);
+        decoder
+            .submit(AccessUnit {
+                id: 700,
+                bytes: &huge_packet,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        assert!(decoder.pull(Duration::ZERO).unwrap().is_none());
+        let budget = decoder.take_dropped().unwrap();
+        assert_eq!(budget.id, 700);
+        assert!(
+            matches!(budget.error, Some(media::Error::Decode(ref message))
+            if message.contains("SourceFrameTooLarge"))
+        );
+        let small_packet = to_avcc(small);
+        decoder
+            .submit(AccessUnit {
+                id: 701,
+                bytes: &small_packet,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap();
+        decoder.end_stream().unwrap();
+        let frame = decoder.pull(Duration::ZERO).unwrap().unwrap();
+        assert_eq!(frame.id, 701);
+        assert!(decoder.pull(Duration::ZERO).unwrap().is_none());
+        assert!(decoder.take_dropped().is_none());
+        assert!(decoder.is_drained().unwrap());
+    }
+
+    #[test]
+    fn oversized_sps_deferred_receive_attributes_drop_and_recovers() {
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let huge = include_bytes!("../tests/fixtures/oversize_sps_8192.h264");
+        let mut decoder = decoder_for_fixture(small);
+        // Leave a valid picture buffered in FFmpeg. The 8192² AU is accepted
+        // but the native allocation happens only after the older picture is
+        // pulled, not when that oversized AU is submitted.
+        assert_eq!(decoder.send(Some(small), None, None, 101), 0);
+        decoder.pending.insert(
+            101,
+            SourceTiming {
+                pts: None,
+                dts: None,
+                duration: None,
+                decode_error: None,
+            },
+        );
+        assert_eq!(decoder.send(Some(huge), None, None, 202), 0);
+        decoder.pending.insert(
+            202,
+            SourceTiming {
+                pts: None,
+                dts: None,
+                duration: None,
+                decode_error: None,
+            },
+        );
+        assert_eq!(decoder.receive_one().unwrap().unwrap().id, 101);
+        assert!(decoder.receive_one().unwrap().is_none());
+        let drops = std::iter::from_fn(|| decoder.take_dropped()).collect::<Vec<_>>();
+        assert_eq!(drops.len(), 1);
+        assert_eq!(drops[0].id, 202);
+        assert!(
+            matches!(drops[0].error, Some(media::Error::Decode(ref message))
+            if message.contains("SourceFrameTooLarge"))
+        );
+        assert!(decoder.pending.is_empty());
+        assert!(decoder.fatal.is_none());
         let peak = unsafe { rosemary_h264_native_peak_bytes(decoder.handle.as_ptr()) };
-        assert_eq!(peak, 0, "oversized SPS allocated native decoded storage");
+        assert!(peak < 64 * 1024 * 1024);
+        let mut recovered = decoder
+            .submit_with_id(small, 303, None, None, None)
+            .unwrap();
+        recovered.extend(decoder.finish().unwrap());
+        assert_eq!(
+            recovered.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+            vec![303]
+        );
+        assert!(decoder.take_dropped().is_none());
+    }
+
+    #[test]
+    fn native_get_buffer_allocation_failure_during_send_is_fatal() {
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        for stage in 1..=3 {
+            let mut decoder = decoder_for_fixture(small);
+            // SAFETY: the fault is local to this decoder and is triggered from
+            // inside the get_buffer2 callback, before H.264 masks ENOMEM.
+            unsafe { rosemary_h264_test_fail_native_allocation(decoder.handle.as_ptr(), stage) };
+            assert_eq!(
+                decoder.submit_annex_b(small, None, None).unwrap_err(),
+                Error::Codec(-12),
+                "allocator stage {stage}"
+            );
+            assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+            assert!(decoder.pending.contains_key(&0));
+            assert!(decoder.take_dropped().is_none());
+            assert_eq!(
+                decoder.submit_annex_b(small, None, None).unwrap_err(),
+                Error::Codec(-12)
+            );
+        }
+    }
+
+    #[test]
+    fn native_get_buffer_allocation_failure_in_trait_is_fatal() {
+        use mediabackend::VideoDecoder;
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        let mut decoder = decoder_for_fixture(small);
+        let mut packet = Vec::new();
+        for nal in nals_from_fixture(small) {
+            packet.extend_from_slice(&(nal.len() as u32).to_be_bytes());
+            packet.extend_from_slice(nal);
+        }
+        // SAFETY: injected ENOMEM occurs in native callback, not after send.
+        unsafe { rosemary_h264_test_fail_native_allocation(decoder.handle.as_ptr(), 1) };
+        let error = decoder
+            .submit(AccessUnit {
+                id: 707,
+                bytes: &packet,
+                pts_ns: None,
+                dts_ns: None,
+                duration_ns: None,
+            })
+            .unwrap_err();
+        assert!(
+            matches!(error, media::Error::Decode(ref message) if message.contains("Codec(-12)"))
+        );
+        assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+        assert!(decoder.pending.contains_key(&707));
+        assert!(decoder.take_dropped().is_none());
+        assert!(matches!(decoder.is_drained(), Err(media::Error::Decode(_))));
+    }
+
+    #[test]
+    fn native_get_buffer_allocation_failure_during_receive_is_fatal() {
+        let small = include_bytes!("../tests/fixtures/red_32x32.h264");
+        for stage in 1..=3 {
+            let mut decoder = decoder_for_fixture(small);
+            assert_eq!(decoder.send(Some(small), None, None, 101), 0);
+            decoder.pending.insert(
+                101,
+                SourceTiming {
+                    pts: None,
+                    dts: None,
+                    duration: None,
+                    decode_error: None,
+                },
+            );
+            assert_eq!(decoder.send(Some(small), None, None, 202), 0);
+            decoder.pending.insert(
+                202,
+                SourceTiming {
+                    pts: None,
+                    dts: None,
+                    duration: None,
+                    decode_error: None,
+                },
+            );
+            assert_eq!(decoder.receive_one().unwrap().unwrap().id, 101);
+            // SAFETY: callback failure occurs when FFmpeg later decodes ID
+            // 202, not while its compressed packet was accepted.
+            unsafe { rosemary_h264_test_fail_native_allocation(decoder.handle.as_ptr(), stage) };
+            assert_eq!(
+                decoder.receive_one().unwrap_err(),
+                Error::Codec(-12),
+                "allocator stage {stage}"
+            );
+            assert_eq!(decoder.fatal, Some(Error::Codec(-12)));
+            assert!(decoder.pending.contains_key(&202));
+            assert!(!decoder.pending.contains_key(&101));
+            assert!(decoder.take_dropped().is_none());
+            assert_eq!(decoder.finish().unwrap_err(), Error::Codec(-12));
+        }
     }
 
     #[test]
