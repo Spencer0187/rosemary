@@ -4425,6 +4425,18 @@ unsafe extern "C" fn set_current_context(_class: Id, _sel: Sel, context: Id) {
 }
 
 unsafe extern "C" fn current_context(_class: Id, _sel: Sel) -> Id {
+    current_graphics_context()
+}
+
+/// The `CGContext` the current `NSGraphicsContext` was made over with
+/// `+graphicsContextWithGraphicsPort:flipped:` (or a bitmap rep), and whether
+/// it is flipped; `None` while drawing goes to the focused view.
+pub(crate) fn current_port() -> Option<(*const c_void, bool)> {
+    let (port, flipped) = wrapped(current_graphics_context())?;
+    Some((port as *const c_void, flipped))
+}
+
+fn current_graphics_context() -> Id {
     let depth = focus_depth();
     match CURRENT_GRAPHICS_CONTEXT.try_with(|current| current.0.get()) {
         Ok(Some(held)) if held.depth == depth => return held.context,
