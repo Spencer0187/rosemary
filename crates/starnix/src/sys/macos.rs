@@ -10,14 +10,14 @@ pub mod memory {
     pub use crate::memory::named::object;
 
     pub fn exclude_from_fork(address: usize, len: usize) -> std::io::Result<()> {
+        unsafe extern "C" {
+            fn minherit(address: *mut core::ffi::c_void, len: usize, flags: u32) -> i32;
+        }
+
+        const VM_INHERIT_NONE: u32 = 2;
+
         // SAFETY: changes only what a child inherits of the range.
-        match unsafe {
-            libc::minherit(
-                address as *mut core::ffi::c_void,
-                len,
-                libc::VM_INHERIT_NONE,
-            )
-        } {
+        match unsafe { minherit(address as *mut core::ffi::c_void, len, VM_INHERIT_NONE) } {
             0 => Ok(()),
             _ => Err(std::io::Error::last_os_error()),
         }
