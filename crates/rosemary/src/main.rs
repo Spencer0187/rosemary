@@ -13,6 +13,8 @@ use microlift::core::lift_to_function;
 
 use mimalloc::MiMalloc;
 
+#[cfg(target_os = "macos")]
+mod fleasion_ipc;
 mod prefix_cli;
 mod server_cli;
 
@@ -75,6 +77,9 @@ fn run(
     if darwin::libc_backend::using_builtin() {
         server_cli::join(guest, &argv);
     }
+
+    #[cfg(target_os = "macos")]
+    fleasion_ipc::start();
 
     match startup::run(exec) {
         // `exit` rather than returning the status. Returning goes back through
