@@ -90,10 +90,25 @@ unsafe extern "C" fn checked_realloc(p: *mut c_void, size: usize, ra: u64) -> *m
     }
 }
 
+// Mach-O external symbols have a leading underscore; ELF symbols do not.
+#[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+macro_rules! heapcheck_label {
+    ($label:literal) => {
+        concat!("_", $label)
+    };
+}
+
+#[cfg(all(target_arch = "x86_64", not(target_os = "macos")))]
+macro_rules! heapcheck_label {
+    ($label:literal) => {
+        $label
+    };
+}
+
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
-    ".globl rosemary_checked_free",
-    "rosemary_checked_free:",
+    concat!(".globl ", heapcheck_label!("rosemary_checked_free")),
+    concat!(heapcheck_label!("rosemary_checked_free"), ":"),
     // The return address is still at the top of the stack, so it becomes the
     // second argument and the tail jump leaves the frame exactly as `free`
     // would have left it.
@@ -104,8 +119,8 @@ core::arch::global_asm!(
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
-    ".globl rosemary_checked_realloc",
-    "rosemary_checked_realloc:",
+    concat!(".globl ", heapcheck_label!("rosemary_checked_realloc")),
+    concat!(heapcheck_label!("rosemary_checked_realloc"), ":"),
     "mov rdx, [rsp]",
     "jmp {inner}",
     inner = sym checked_realloc,
