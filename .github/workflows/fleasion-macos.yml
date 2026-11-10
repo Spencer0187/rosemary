@@ -91,7 +91,7 @@ jobs:
           tar -xOf "$moltenvk_tar" MoltenVK/LICENSE \
             > dist/staging/Rosemary/LICENSE-MoltenVK
           chmod 755 dist/staging/Rosemary/lib/libMoltenVK.dylib
-          lipo -verify_arch "${ARCH}" dist/staging/Rosemary/lib/libMoltenVK.dylib
+          lipo dist/staging/Rosemary/lib/libMoltenVK.dylib -verify_arch "${ARCH}"
           codesign --verify --verbose=2 dist/staging/Rosemary/lib/libMoltenVK.dylib
           python3 - <<'PY'
           import hashlib
