@@ -71,10 +71,28 @@ jobs:
           UPSTREAM_SHA: 04cc76cd4c73e492ac3e780903c078d3b6115a63
         run: |
           set -euo pipefail
-          mkdir -p dist/staging/Rosemary/bin
+          mkdir -p dist/staging/Rosemary/bin dist/staging/Rosemary/lib
           cp target/release/rosemary dist/staging/Rosemary/bin/rosemary
           cp LICENSE dist/staging/Rosemary/LICENSE
           cp docs/usage.md dist/staging/Rosemary/usage.md
+
+          # Bundle MoltenVK instead of requiring users to install Homebrew.
+          # The official macOS dylib is universal (arm64 and x86_64).
+          moltenvk_tar="$RUNNER_TEMP/MoltenVK-macos-v1.4.2.tar"
+          curl -fL --retry 2 --connect-timeout 10 \
+            https://github.com/KhronosGroup/MoltenVK/releases/download/v1.4.2/MoltenVK-macos.tar \
+            -o "$moltenvk_tar"
+          printf '%s  %s\n' \
+            'f95765a6229cb7b915990a2890ce12ebe36a730b021545d3d52ae69ce4c4024e' \
+            "$moltenvk_tar" | shasum -a 256 -c
+          tar -xOf "$moltenvk_tar" \
+            MoltenVK/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib \
+            > dist/staging/Rosemary/lib/libMoltenVK.dylib
+          tar -xOf "$moltenvk_tar" MoltenVK/LICENSE \
+            > dist/staging/Rosemary/LICENSE-MoltenVK
+          chmod 755 dist/staging/Rosemary/lib/libMoltenVK.dylib
+          lipo -verify_arch "${ARCH}" dist/staging/Rosemary/lib/libMoltenVK.dylib
+          codesign --verify --verbose=2 dist/staging/Rosemary/lib/libMoltenVK.dylib
           python3 - <<'PY'
           import hashlib
           import json
@@ -83,6 +101,7 @@ jobs:
           from pathlib import Path
 
           binary = Path('dist/staging/Rosemary/bin/rosemary')
+          vulkan = Path('dist/staging/Rosemary/lib/libMoltenVK.dylib')
           data = {
               'schema_version': 1,
               'package': 'Fleasion pinned Rosemary',
@@ -94,6 +113,9 @@ jobs:
                   [str(binary.resolve()), '--version'], text=True
               ).splitlines()[0].split()[1],
               'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+              'vulkan_library': 'MoltenVK',
+              'vulkan_version': '1.4.2',
+              'vulkan_library_sha256': hashlib.sha256(vulkan.read_bytes()).hexdigest(),
           }
           Path('dist/staging/Rosemary/source.json').write_text(
               json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8'
