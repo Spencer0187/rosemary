@@ -381,6 +381,21 @@ fn launch(path: OsString, options: &RunOptions, args: Vec<OsString>) -> ExitCode
     prefix_cli::settle_prefix();
     #[cfg(target_os = "macos")]
     imply_builtin_runtime();
+    #[cfg(target_os = "macos")]
+    if std::env::var("FLEASION_MANAGED_ROSEMARY").as_deref() == Ok("1") {
+        // Normal Rosemary may fall back to identity mode when prefix creation
+        // fails. A managed Fleasion launch must never make that transition.
+        let valid = prefix::ns::current().is_some()
+            && std::env::var("ROSEMARY_LIBC").as_deref() == Ok("builtin")
+            && std::env::var("ROSEMARY_OBJC").as_deref() == Ok("builtin")
+            && std::env::var_os("FLEASION_ROSEMARY_IPC_FD").is_some();
+        if !valid {
+            eprintln!(
+                "rosemary: managed Fleasion launch requires a prefix, builtin runtimes and IPC"
+            );
+            return ExitCode::FAILURE;
+        }
+    }
     // `--slow` turns every import into a VM exit; `--native`/`--emulated`
     // force a backend the file's own slices would not have chosen.
     let policy = match options.slow {
