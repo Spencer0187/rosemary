@@ -1,0 +1,149 @@
+name: Fleasion pinned macOS Rosemary
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['chore/fleasion-macos-pinned-build']
+    tags: ['fleasion-rosemary-*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fleasion-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-26
+          - arch: x86_64
+            runner: macos-26-intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verify pinned upstream ancestry
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor 04cc76cd4c73e492ac3e780903c078d3b6115a63 HEAD
+          test "$(uname -m)" = '${{ matrix.arch }}'
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.99.0 --profile minimal
+          rustc +1.99.0 --version
+
+      - name: Build macOS Rosemary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo +1.99.0 build --locked --release -p rosemary --bin rosemary
+
+      - name: Verify native executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          file target/release/rosemary
+          file target/release/rosemary | grep -F '${{ matrix.arch }}'
+          codesign --force --sign - target/release/rosemary
+          codesign --verify --verbose=2 target/release/rosemary
+          otool -L target/release/rosemary
+          target/release/rosemary --version
+
+      - name: Package and checksum
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+          SOURCE_SHA: ${{ github.sha }}
+          UPSTREAM_SHA: 04cc76cd4c73e492ac3e780903c078d3b6115a63
+        run: |
+          set -euo pipefail
+          mkdir -p dist/staging/Rosemary/bin
+          cp target/release/rosemary dist/staging/Rosemary/bin/rosemary
+          cp LICENSE dist/staging/Rosemary/LICENSE
+          cp docs/usage.md dist/staging/Rosemary/usage.md
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          binary = Path('dist/staging/Rosemary/bin/rosemary')
+          data = {
+              'schema_version': 1,
+              'package': 'Fleasion pinned Rosemary',
+              'platform': 'macos',
+              'arch': os.environ['ARCH'],
+              'source_commit': os.environ['SOURCE_SHA'],
+              'upstream_base': os.environ['UPSTREAM_SHA'],
+              'rosemary_version': subprocess.check_output(
+                  [str(binary.resolve()), '--version'], text=True
+              ).splitlines()[0].split()[1],
+              'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+          }
+          Path('dist/staging/Rosemary/source.json').write_text(
+              json.dumps(data, indent=2, sort_keys=True) + '\n', encoding='utf-8'
+          )
+          PY
+          short_sha="${SOURCE_SHA:0:12}"
+          name="Rosemary-Fleasion-${short_sha}-macos-${ARCH}"
+          tar -czf "dist/${name}.tar.gz" -C dist/staging Rosemary
+          cp dist/staging/Rosemary/source.json "dist/${name}.json"
+          rm -rf dist/staging
+          (
+            cd dist
+            shasum -a 256 "${name}.tar.gz" "${name}.json" > "SHA256SUMS.${ARCH}"
+            shasum -a 256 -c "SHA256SUMS.${ARCH}"
+          )
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: fleasion-macos-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish pinned Rosemary release
+    if: startsWith(github.ref, 'refs/tags/fleasion-rosemary-')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: fleasion-macos-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify both architecture packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          for arch in arm64 x86_64; do
+            sha256sum --check "SHA256SUMS.${arch}"
+          done
+          cat SHA256SUMS.arm64 SHA256SUMS.x86_64 | sort -k2 > SHA256SUMS
+          rm SHA256SUMS.arm64 SHA256SUMS.x86_64
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          prerelease: true
+          generate_release_notes: false
+          files: dist/*
+          fail_on_unmatched_files: true
